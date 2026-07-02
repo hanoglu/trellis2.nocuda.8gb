@@ -797,6 +797,519 @@ strellis_status strellis_run_inference_compute(
     return STRELLIS_STATUS_OK;
 }
 
+static int dit_flow_weights_valid(const strellis_dit_flow_weights * w) {
+    if (w == NULL || w->in_channels <= 0 || w->out_channels <= 0 || w->model_channels <= 0 ||
+        w->cond_channels <= 0 || w->time_frequency_dim <= 0 || w->heads <= 0 || w->head_dim <= 0 ||
+        w->mlp_channels <= 0 || w->mod_channels != 6 * w->model_channels || w->n_blocks < 0 ||
+        w->heads * w->head_dim != w->model_channels || w->input_w == NULL || w->input_b == NULL ||
+        w->t_embedder_0_w == NULL || w->t_embedder_0_b == NULL ||
+        w->t_embedder_2_w == NULL || w->t_embedder_2_b == NULL ||
+        w->adaln_w == NULL || w->adaln_b == NULL || w->out_w == NULL || w->out_b == NULL) {
+        return 0;
+    }
+    if (w->n_blocks > 0 && w->blocks == NULL) {
+        return 0;
+    }
+    for (int i = 0; i < w->n_blocks; ++i) {
+        const strellis_dit_flow_block_weights * b = &w->blocks[i];
+        if (b->modulation == NULL || b->norm2_gamma == NULL || b->norm2_beta == NULL ||
+            b->self_qkv_w == NULL || b->self_qkv_b == NULL ||
+            b->self_q_rms_gamma == NULL || b->self_k_rms_gamma == NULL ||
+            b->self_out_w == NULL || b->self_out_b == NULL ||
+            b->cross_q_w == NULL || b->cross_q_b == NULL ||
+            b->cross_kv_w == NULL || b->cross_kv_b == NULL ||
+            b->cross_q_rms_gamma == NULL || b->cross_k_rms_gamma == NULL ||
+            b->cross_out_w == NULL || b->cross_out_b == NULL ||
+            b->mlp_fc1_w == NULL || b->mlp_fc1_b == NULL ||
+            b->mlp_fc2_w == NULL || b->mlp_fc2_b == NULL) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void dit_split_heads(
+    const float * src,
+    float * dst,
+    int batch,
+    int tokens,
+    int total_channels,
+    int offset,
+    int heads,
+    int head_dim) {
+    for (int b = 0; b < batch; ++b) {
+        for (int t = 0; t < tokens; ++t) {
+            const float * row = src + ((size_t) b * (size_t) tokens + (size_t) t) * (size_t) total_channels + (size_t) offset;
+            for (int h = 0; h < heads; ++h) {
+                for (int d = 0; d < head_dim; ++d) {
+                    dst[(((size_t) b * (size_t) tokens + (size_t) t) * (size_t) heads + (size_t) h) * (size_t) head_dim + (size_t) d] =
+                        row[(size_t) h * (size_t) head_dim + (size_t) d];
+                }
+            }
+        }
+    }
+}
+
+static void dit_heads_to_tokens(
+    const float * src,
+    float * dst,
+    int batch,
+    int tokens,
+    int heads,
+    int head_dim) {
+    const int channels = heads * head_dim;
+    for (int b = 0; b < batch; ++b) {
+        for (int t = 0; t < tokens; ++t) {
+            float * row = dst + ((size_t) b * (size_t) tokens + (size_t) t) * (size_t) channels;
+            for (int h = 0; h < heads; ++h) {
+                for (int d = 0; d < head_dim; ++d) {
+                    row[(size_t) h * (size_t) head_dim + (size_t) d] =
+                        src[(((size_t) b * (size_t) tokens + (size_t) t) * (size_t) heads + (size_t) h) * (size_t) head_dim + (size_t) d];
+                }
+            }
+        }
+    }
+}
+
+static strellis_status dit_modulated_norm_f32(
+    const float * x,
+    const float * mod,
+    int shift_index,
+    int scale_index,
+    float * y,
+    int batch,
+    int tokens,
+    int channels) {
+    strellis_status status = strellis_layer_norm_f32(x, NULL, NULL, y, (int64_t) batch * (int64_t) tokens, channels, 1e-6f);
+    if (status != STRELLIS_STATUS_OK) {
+        return status;
+    }
+    for (int b = 0; b < batch; ++b) {
+        const float * shift = mod + ((size_t) b * 6u + (size_t) shift_index) * (size_t) channels;
+        const float * scale = mod + ((size_t) b * 6u + (size_t) scale_index) * (size_t) channels;
+        for (int t = 0; t < tokens; ++t) {
+            float * row = y + ((size_t) b * (size_t) tokens + (size_t) t) * (size_t) channels;
+            for (int c = 0; c < channels; ++c) {
+                row[c] = row[c] * (1.0f + scale[c]) + shift[c];
+            }
+        }
+    }
+    return STRELLIS_STATUS_OK;
+}
+
+static void dit_add_gated_residual_f32(
+    float * x,
+    const float * residual,
+    const float * mod,
+    int gate_index,
+    int batch,
+    int tokens,
+    int channels) {
+    for (int b = 0; b < batch; ++b) {
+        const float * gate = mod + ((size_t) b * 6u + (size_t) gate_index) * (size_t) channels;
+        for (int t = 0; t < tokens; ++t) {
+            const size_t base = ((size_t) b * (size_t) tokens + (size_t) t) * (size_t) channels;
+            for (int c = 0; c < channels; ++c) {
+                x[base + (size_t) c] += residual[base + (size_t) c] * gate[c];
+            }
+        }
+    }
+}
+
+static void dit_add_residual_f32(float * x, const float * residual, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        x[i] += residual[i];
+    }
+}
+
+static strellis_status dit_self_attention_f32(
+    const float * x,
+    const strellis_dit_flow_block_weights * block,
+    const float * cos_phase,
+    const float * sin_phase,
+    int disable_rope,
+    float * y,
+    int batch,
+    int tokens,
+    int channels,
+    int heads,
+    int head_dim) {
+    const size_t rows = (size_t) batch * (size_t) tokens;
+    const size_t qkv_n = rows * 3u * (size_t) channels;
+    const size_t head_n = rows * (size_t) channels;
+    float * qkv = (float *) calloc_array(qkv_n, sizeof(float));
+    float * q = (float *) calloc_array(head_n, sizeof(float));
+    float * k = (float *) calloc_array(head_n, sizeof(float));
+    float * v = (float *) calloc_array(head_n, sizeof(float));
+    float * qn = (float *) calloc_array(head_n, sizeof(float));
+    float * kn = (float *) calloc_array(head_n, sizeof(float));
+    float * qr = (float *) calloc_array(head_n, sizeof(float));
+    float * kr = (float *) calloc_array(head_n, sizeof(float));
+    float * attn = (float *) calloc_array(head_n, sizeof(float));
+    float * tokens_out = (float *) calloc_array(head_n, sizeof(float));
+    if (qkv == NULL || q == NULL || k == NULL || v == NULL || qn == NULL || kn == NULL ||
+        qr == NULL || kr == NULL || attn == NULL || tokens_out == NULL) {
+        free(qkv); free(q); free(k); free(v); free(qn); free(kn); free(qr); free(kr); free(attn); free(tokens_out);
+        return STRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+
+    strellis_status status = strellis_linear_f32(x, block->self_qkv_w, block->self_qkv_b, qkv, (int64_t) rows, channels, 3 * channels);
+    if (status == STRELLIS_STATUS_OK) {
+        dit_split_heads(qkv, q, batch, tokens, 3 * channels, 0, heads, head_dim);
+        dit_split_heads(qkv, k, batch, tokens, 3 * channels, channels, heads, head_dim);
+        dit_split_heads(qkv, v, batch, tokens, 3 * channels, 2 * channels, heads, head_dim);
+        status = strellis_multihead_rms_norm_f32(q, block->self_q_rms_gamma, qn, batch, tokens, heads, head_dim, 0.0f);
+    }
+    if (status == STRELLIS_STATUS_OK) {
+        status = strellis_multihead_rms_norm_f32(k, block->self_k_rms_gamma, kn, batch, tokens, heads, head_dim, 0.0f);
+    }
+    const float * q_attn = qn;
+    const float * k_attn = kn;
+    if (status == STRELLIS_STATUS_OK && !disable_rope && cos_phase != NULL && sin_phase != NULL) {
+        status = strellis_apply_rope_adjacent_f32(qn, cos_phase, sin_phase, qr, batch, tokens, heads, head_dim);
+        if (status == STRELLIS_STATUS_OK) {
+            status = strellis_apply_rope_adjacent_f32(kn, cos_phase, sin_phase, kr, batch, tokens, heads, head_dim);
+        }
+        q_attn = qr;
+        k_attn = kr;
+    }
+    if (status == STRELLIS_STATUS_OK) {
+        status = strellis_sdpa_f32(q_attn, k_attn, v, attn, batch, tokens, tokens, heads, head_dim, 1.0f / sqrtf((float) head_dim));
+    }
+    if (status == STRELLIS_STATUS_OK) {
+        dit_heads_to_tokens(attn, tokens_out, batch, tokens, heads, head_dim);
+        status = strellis_linear_f32(tokens_out, block->self_out_w, block->self_out_b, y, (int64_t) rows, channels, channels);
+    }
+
+    free(qkv); free(q); free(k); free(v); free(qn); free(kn); free(qr); free(kr); free(attn); free(tokens_out);
+    return status;
+}
+
+static strellis_status dit_cross_attention_f32(
+    const float * x,
+    const float * context,
+    const strellis_dit_flow_block_weights * block,
+    float * y,
+    int batch,
+    int tokens,
+    int cond_tokens,
+    int channels,
+    int cond_channels,
+    int heads,
+    int head_dim) {
+    const size_t rows = (size_t) batch * (size_t) tokens;
+    const size_t ctx_rows = (size_t) batch * (size_t) cond_tokens;
+    const size_t q_linear_n = rows * (size_t) channels;
+    const size_t kv_linear_n = ctx_rows * 2u * (size_t) channels;
+    const size_t q_head_n = rows * (size_t) channels;
+    const size_t kv_head_n = ctx_rows * (size_t) channels;
+    float * q_linear = (float *) calloc_array(q_linear_n, sizeof(float));
+    float * kv_linear = (float *) calloc_array(kv_linear_n, sizeof(float));
+    float * q = (float *) calloc_array(q_head_n, sizeof(float));
+    float * k = (float *) calloc_array(kv_head_n, sizeof(float));
+    float * v = (float *) calloc_array(kv_head_n, sizeof(float));
+    float * qn = (float *) calloc_array(q_head_n, sizeof(float));
+    float * kn = (float *) calloc_array(kv_head_n, sizeof(float));
+    float * attn = (float *) calloc_array(q_head_n, sizeof(float));
+    float * tokens_out = (float *) calloc_array(q_head_n, sizeof(float));
+    if (q_linear == NULL || kv_linear == NULL || q == NULL || k == NULL || v == NULL ||
+        qn == NULL || kn == NULL || attn == NULL || tokens_out == NULL) {
+        free(q_linear); free(kv_linear); free(q); free(k); free(v); free(qn); free(kn); free(attn); free(tokens_out);
+        return STRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+
+    strellis_status status = strellis_linear_f32(x, block->cross_q_w, block->cross_q_b, q_linear, (int64_t) rows, channels, channels);
+    if (status == STRELLIS_STATUS_OK) {
+        status = strellis_linear_f32(context, block->cross_kv_w, block->cross_kv_b, kv_linear, (int64_t) ctx_rows, cond_channels, 2 * channels);
+    }
+    if (status == STRELLIS_STATUS_OK) {
+        dit_split_heads(q_linear, q, batch, tokens, channels, 0, heads, head_dim);
+        dit_split_heads(kv_linear, k, batch, cond_tokens, 2 * channels, 0, heads, head_dim);
+        dit_split_heads(kv_linear, v, batch, cond_tokens, 2 * channels, channels, heads, head_dim);
+        status = strellis_multihead_rms_norm_f32(q, block->cross_q_rms_gamma, qn, batch, tokens, heads, head_dim, 0.0f);
+    }
+    if (status == STRELLIS_STATUS_OK) {
+        status = strellis_multihead_rms_norm_f32(k, block->cross_k_rms_gamma, kn, batch, cond_tokens, heads, head_dim, 0.0f);
+    }
+    if (status == STRELLIS_STATUS_OK) {
+        status = strellis_sdpa_f32(qn, kn, v, attn, batch, tokens, cond_tokens, heads, head_dim, 1.0f / sqrtf((float) head_dim));
+    }
+    if (status == STRELLIS_STATUS_OK) {
+        dit_heads_to_tokens(attn, tokens_out, batch, tokens, heads, head_dim);
+        status = strellis_linear_f32(tokens_out, block->cross_out_w, block->cross_out_b, y, (int64_t) rows, channels, channels);
+    }
+
+    free(q_linear); free(kv_linear); free(q); free(k); free(v); free(qn); free(kn); free(attn); free(tokens_out);
+    return status;
+}
+
+static strellis_status dit_block_forward_f32(
+    float * x,
+    const float * mod6,
+    const float * context,
+    const strellis_dit_flow_block_weights * block,
+    const float * cos_phase,
+    const float * sin_phase,
+    int batch,
+    int tokens,
+    int cond_tokens,
+    const strellis_dit_flow_weights * weights) {
+    const int channels = weights->model_channels;
+    const size_t n = (size_t) batch * (size_t) tokens * (size_t) channels;
+    const size_t mod_n = (size_t) batch * 6u * (size_t) channels;
+    float * mod = (float *) calloc_array(mod_n, sizeof(float));
+    float * h = (float *) calloc_array(n, sizeof(float));
+    float * residual = (float *) calloc_array(n, sizeof(float));
+    float * mlp_workspace = (float *) calloc_array((size_t) batch * (size_t) tokens * (size_t) weights->mlp_channels, sizeof(float));
+    if (mod == NULL || h == NULL || residual == NULL || mlp_workspace == NULL) {
+        free(mod); free(h); free(residual); free(mlp_workspace);
+        return STRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+
+    for (int b = 0; b < batch; ++b) {
+        for (int c = 0; c < 6 * channels; ++c) {
+            mod[(size_t) b * 6u * (size_t) channels + (size_t) c] =
+                mod6[(size_t) b * 6u * (size_t) channels + (size_t) c] + block->modulation[c];
+        }
+    }
+    if (weights->emulate_bf16_blocks) {
+        strellis_status bf_status = strellis_bf16_roundtrip_f32(mod, mod, mod_n);
+        if (bf_status != STRELLIS_STATUS_OK) {
+            free(mod); free(h); free(residual); free(mlp_workspace);
+            return bf_status;
+        }
+    }
+
+    const int debug_parts = weights->debug_block_parts < 0 ? 3 : weights->debug_block_parts;
+    strellis_status status = STRELLIS_STATUS_OK;
+    if (debug_parts <= 0) {
+        goto cleanup;
+    }
+
+    status = dit_modulated_norm_f32(x, mod, 0, 1, h, batch, tokens, channels);
+    if (status == STRELLIS_STATUS_OK && weights->emulate_bf16_blocks) {
+        status = strellis_bf16_roundtrip_f32(h, h, n);
+    }
+    if (status == STRELLIS_STATUS_OK) {
+        status = dit_self_attention_f32(
+            h,
+            block,
+            cos_phase,
+            sin_phase,
+            weights->debug_disable_rope,
+            residual,
+            batch,
+            tokens,
+            channels,
+            weights->heads,
+            weights->head_dim);
+    }
+    if (status == STRELLIS_STATUS_OK && weights->emulate_bf16_blocks) {
+        status = strellis_bf16_roundtrip_f32(residual, residual, n);
+    }
+    if (status != STRELLIS_STATUS_OK) {
+        goto cleanup;
+    }
+    dit_add_gated_residual_f32(x, residual, mod, 2, batch, tokens, channels);
+    if (weights->emulate_bf16_blocks) {
+        status = strellis_bf16_roundtrip_f32(x, x, n);
+        if (status != STRELLIS_STATUS_OK) goto cleanup;
+    }
+    if (debug_parts <= 1) {
+        goto cleanup;
+    }
+
+    status = strellis_layer_norm_f32(x, block->norm2_gamma, block->norm2_beta, h, (int64_t) batch * (int64_t) tokens, channels, 1e-6f);
+    if (status == STRELLIS_STATUS_OK && weights->emulate_bf16_blocks) {
+        status = strellis_bf16_roundtrip_f32(h, h, n);
+    }
+    if (status == STRELLIS_STATUS_OK) {
+        status = dit_cross_attention_f32(
+            h,
+            context,
+            block,
+            residual,
+            batch,
+            tokens,
+            cond_tokens,
+            channels,
+            weights->cond_channels,
+            weights->heads,
+            weights->head_dim);
+    }
+    if (status == STRELLIS_STATUS_OK && weights->emulate_bf16_blocks) {
+        status = strellis_bf16_roundtrip_f32(residual, residual, n);
+    }
+    if (status != STRELLIS_STATUS_OK) {
+        goto cleanup;
+    }
+    dit_add_residual_f32(x, residual, n);
+    if (weights->emulate_bf16_blocks) {
+        status = strellis_bf16_roundtrip_f32(x, x, n);
+        if (status != STRELLIS_STATUS_OK) goto cleanup;
+    }
+    if (debug_parts <= 2) {
+        goto cleanup;
+    }
+
+    status = dit_modulated_norm_f32(x, mod, 3, 4, h, batch, tokens, channels);
+    if (status == STRELLIS_STATUS_OK && weights->emulate_bf16_blocks) {
+        status = strellis_bf16_roundtrip_f32(h, h, n);
+    }
+    if (status == STRELLIS_STATUS_OK) {
+        status = strellis_feed_forward_f32(
+            h,
+            block->mlp_fc1_w,
+            block->mlp_fc1_b,
+            block->mlp_fc2_w,
+            block->mlp_fc2_b,
+            mlp_workspace,
+            residual,
+            (int64_t) batch * (int64_t) tokens,
+            channels,
+            weights->mlp_channels,
+            channels);
+    }
+    if (status == STRELLIS_STATUS_OK && weights->emulate_bf16_blocks) {
+        status = strellis_bf16_roundtrip_f32(residual, residual, n);
+    }
+    if (status != STRELLIS_STATUS_OK) {
+        goto cleanup;
+    }
+    dit_add_gated_residual_f32(x, residual, mod, 5, batch, tokens, channels);
+    if (weights->emulate_bf16_blocks) {
+        status = strellis_bf16_roundtrip_f32(x, x, n);
+    }
+
+cleanup:
+    free(mod);
+    free(h);
+    free(residual);
+    free(mlp_workspace);
+    return status;
+}
+
+strellis_status strellis_dit_flow_forward_f32(
+    const float * x,
+    const float * timesteps,
+    const float * context,
+    const float * cos_phase,
+    const float * sin_phase,
+    const strellis_dit_flow_weights * weights,
+    float * y,
+    int batch,
+    int tokens,
+    int cond_tokens) {
+    if (x == NULL || timesteps == NULL || context == NULL || weights == NULL || y == NULL ||
+        batch <= 0 || tokens <= 0 || cond_tokens <= 0 || !dit_flow_weights_valid(weights) ||
+        (cos_phase == NULL) != (sin_phase == NULL)) {
+        return STRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (!weights->debug_disable_rope && (cos_phase == NULL || sin_phase == NULL)) {
+        return STRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+
+    const int c = weights->model_channels;
+    const int rows_i = batch * tokens;
+    const size_t rows = (size_t) rows_i;
+    const size_t h_n = rows * (size_t) c;
+    const size_t mod_n = (size_t) batch * (size_t) weights->mod_channels;
+    const size_t ctx_n = (size_t) batch * (size_t) cond_tokens * (size_t) weights->cond_channels;
+    float * h = (float *) calloc_array(h_n, sizeof(float));
+    float * t_emb_workspace = (float *) calloc_array((size_t) batch * (size_t) weights->time_frequency_dim, sizeof(float));
+    float * t_hidden = (float *) calloc_array((size_t) batch * (size_t) c, sizeof(float));
+    float * t_emb = (float *) calloc_array((size_t) batch * (size_t) c, sizeof(float));
+    float * t_act = (float *) calloc_array((size_t) batch * (size_t) c, sizeof(float));
+    float * mod6 = (float *) calloc_array(mod_n, sizeof(float));
+    float * final_norm = (float *) calloc_array(h_n, sizeof(float));
+    float * context_used = NULL;
+    if (h == NULL || t_emb_workspace == NULL || t_hidden == NULL || t_emb == NULL ||
+        t_act == NULL || mod6 == NULL || final_norm == NULL) {
+        free(h); free(t_emb_workspace); free(t_hidden); free(t_emb); free(t_act); free(mod6); free(final_norm);
+        return STRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+
+    const float * context_for_blocks = context;
+    if (weights->emulate_bf16_blocks) {
+        context_used = (float *) calloc_array(ctx_n, sizeof(float));
+        if (context_used == NULL) {
+            free(h); free(t_emb_workspace); free(t_hidden); free(t_emb); free(t_act); free(mod6); free(final_norm);
+            return STRELLIS_STATUS_OUT_OF_MEMORY;
+        }
+        strellis_status status_copy = strellis_bf16_roundtrip_f32(context, context_used, ctx_n);
+        if (status_copy != STRELLIS_STATUS_OK) {
+            free(h); free(t_emb_workspace); free(t_hidden); free(t_emb); free(t_act); free(mod6); free(final_norm); free(context_used);
+            return status_copy;
+        }
+        context_for_blocks = context_used;
+    }
+
+    strellis_status status = strellis_linear_f32(x, weights->input_w, weights->input_b, h, (int64_t) rows, weights->in_channels, c);
+    if (status == STRELLIS_STATUS_OK) {
+        status = strellis_timestep_mlp_f32(
+            timesteps,
+            (size_t) batch,
+            weights->time_frequency_dim,
+            weights->t_embedder_0_w,
+            weights->t_embedder_0_b,
+            weights->t_embedder_2_w,
+            weights->t_embedder_2_b,
+            t_emb_workspace,
+            t_hidden,
+            t_emb,
+            c,
+            c);
+    }
+    if (status == STRELLIS_STATUS_OK) {
+        status = strellis_silu_f32(t_emb, t_act, (size_t) batch * (size_t) c);
+    }
+    if (status == STRELLIS_STATUS_OK) {
+        status = strellis_linear_f32(t_act, weights->adaln_w, weights->adaln_b, mod6, batch, c, weights->mod_channels);
+    }
+    if (status == STRELLIS_STATUS_OK && weights->emulate_bf16_blocks) {
+        status = strellis_bf16_roundtrip_f32(h, h, h_n);
+        if (status == STRELLIS_STATUS_OK) {
+            status = strellis_bf16_roundtrip_f32(mod6, mod6, mod_n);
+        }
+    }
+    for (int i = 0; status == STRELLIS_STATUS_OK && i < weights->n_blocks; ++i) {
+        status = dit_block_forward_f32(
+            h,
+            mod6,
+            context_for_blocks,
+            &weights->blocks[i],
+            cos_phase,
+            sin_phase,
+            batch,
+            tokens,
+            cond_tokens,
+            weights);
+    }
+    if (status == STRELLIS_STATUS_OK) {
+        status = strellis_layer_norm_f32(
+            h,
+            NULL,
+            NULL,
+            final_norm,
+            (int64_t) rows,
+            c,
+            weights->final_norm_eps > 0.0f ? weights->final_norm_eps : 1e-5f);
+    }
+    if (status == STRELLIS_STATUS_OK) {
+        status = strellis_linear_f32(final_norm, weights->out_w, weights->out_b, y, (int64_t) rows, c, weights->out_channels);
+    }
+
+    free(h);
+    free(t_emb_workspace);
+    free(t_hidden);
+    free(t_emb);
+    free(t_act);
+    free(mod6);
+    free(final_norm);
+    free(context_used);
+    return status;
+}
+
 strellis_status strellis_toy_dit_block_forward_f32(
     const float * x,
     const float * context,

@@ -4,6 +4,7 @@ import math
 import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 
 import numpy as np
@@ -12,6 +13,7 @@ import torch.nn.functional as F
 
 
 ROOT = pathlib.Path(__file__).resolve().parent
+TRELLIS2_ROOT = pathlib.Path(os.environ.get("TRELLIS2_PYTHON_ROOT", "/home/wimaxs/Documents/TRELLIS.2"))
 F32P = ctypes.POINTER(ctypes.c_float)
 I32P = ctypes.POINTER(ctypes.c_int32)
 U8P = ctypes.POINTER(ctypes.c_uint8)
@@ -59,6 +61,62 @@ class InferResult(ctypes.Structure):
         ("slat_feats", F32P),
         ("slat_channels", ctypes.c_int),
         ("mesh", Mesh),
+    ]
+
+
+class DitFlowBlockWeights(ctypes.Structure):
+    _fields_ = [
+        ("modulation", F32P),
+        ("norm2_gamma", F32P),
+        ("norm2_beta", F32P),
+        ("self_qkv_w", F32P),
+        ("self_qkv_b", F32P),
+        ("self_q_rms_gamma", F32P),
+        ("self_k_rms_gamma", F32P),
+        ("self_out_w", F32P),
+        ("self_out_b", F32P),
+        ("cross_q_w", F32P),
+        ("cross_q_b", F32P),
+        ("cross_kv_w", F32P),
+        ("cross_kv_b", F32P),
+        ("cross_q_rms_gamma", F32P),
+        ("cross_k_rms_gamma", F32P),
+        ("cross_out_w", F32P),
+        ("cross_out_b", F32P),
+        ("mlp_fc1_w", F32P),
+        ("mlp_fc1_b", F32P),
+        ("mlp_fc2_w", F32P),
+        ("mlp_fc2_b", F32P),
+    ]
+
+
+class DitFlowWeights(ctypes.Structure):
+    _fields_ = [
+        ("in_channels", ctypes.c_int),
+        ("out_channels", ctypes.c_int),
+        ("model_channels", ctypes.c_int),
+        ("cond_channels", ctypes.c_int),
+        ("time_frequency_dim", ctypes.c_int),
+        ("heads", ctypes.c_int),
+        ("head_dim", ctypes.c_int),
+        ("mlp_channels", ctypes.c_int),
+        ("mod_channels", ctypes.c_int),
+        ("n_blocks", ctypes.c_int),
+        ("debug_block_parts", ctypes.c_int),
+        ("debug_disable_rope", ctypes.c_int),
+        ("emulate_bf16_blocks", ctypes.c_int),
+        ("final_norm_eps", ctypes.c_float),
+        ("input_w", F32P),
+        ("input_b", F32P),
+        ("t_embedder_0_w", F32P),
+        ("t_embedder_0_b", F32P),
+        ("t_embedder_2_w", F32P),
+        ("t_embedder_2_b", F32P),
+        ("adaln_w", F32P),
+        ("adaln_b", F32P),
+        ("out_w", F32P),
+        ("out_b", F32P),
+        ("blocks", ctypes.POINTER(DitFlowBlockWeights)),
     ]
 
 
@@ -131,6 +189,8 @@ def configure(lib):
     lib.strellis_timestep_mlp_f32.argtypes = [F32P, c_sz, c_i, F32P, F32P, F32P, F32P, F32P, F32P, F32P, c_i, c_i]
     lib.strellis_sdpa_f32.argtypes = [F32P, F32P, F32P, F32P, c_i, c_i, c_i, c_i, c_i, c_f]
     lib.strellis_apply_rope_adjacent_f32.argtypes = [F32P, F32P, F32P, F32P, c_i, c_i, c_i, c_i]
+    lib.strellis_rope_3d_phases_f32.argtypes = [c_i, c_i, c_f, c_f, F32P, F32P, c_sz]
+    lib.strellis_rope_3d_sparse_phases_f32.argtypes = [I32P, c_ll, c_i, c_f, c_f, F32P, F32P, c_sz]
     lib.strellis_flow_euler_step_f32.argtypes = [F32P, F32P, c_sz, c_f, c_f, c_f, F32P, F32P]
     lib.strellis_conv3d_ncdhw_f32.argtypes = [
         F32P, F32P, F32P, F32P,
@@ -146,6 +206,18 @@ def configure(lib):
     lib.strellis_sparse_spatial2channel_f32.argtypes = [ctypes.POINTER(SparseTensor), c_i, ctypes.POINTER(SparseTensor)]
     lib.strellis_sparse_channel2spatial_f32.argtypes = [ctypes.POINTER(SparseTensor), U8P, c_i, ctypes.POINTER(SparseTensor)]
     lib.strellis_sparse_tensor_free.argtypes = [ctypes.POINTER(SparseTensor)]
+    lib.strellis_dit_flow_forward_f32.argtypes = [
+        F32P,
+        F32P,
+        F32P,
+        F32P,
+        F32P,
+        ctypes.POINTER(DitFlowWeights),
+        F32P,
+        c_i,
+        c_i,
+        c_i,
+    ]
     lib.strellis_toy_dit_block_forward_f32.argtypes = [F32P, F32P, F32P, F32P, F32P, F32P, F32P, c_i, c_i, c_i, c_i]
     lib.strellis_infer_options_default.argtypes = [ctypes.POINTER(InferOptions)]
     lib.strellis_infer_result_free.argtypes = [ctypes.POINTER(InferResult)]
@@ -362,6 +434,313 @@ def run_random_sparse_cases(lib):
         check(f"sparse_subm_random_{i}", sparse_y, sparse_ref_subm(coords_t, feats, sw, sb), atol=6e-5, rtol=6e-5)
 
 
+def load_trellis2_reference_modules():
+    if not TRELLIS2_ROOT.exists():
+        raise RuntimeError(f"TRELLIS2_PYTHON_ROOT does not exist: {TRELLIS2_ROOT}")
+    root_s = str(TRELLIS2_ROOT)
+    if root_s not in sys.path:
+        sys.path.insert(0, root_s)
+    from trellis2.models.sparse_structure_flow import TimestepEmbedder
+    from trellis2.modules.attention.rope import RotaryPositionEmbedder
+    from trellis2.modules.spatial import pixel_shuffle_3d as trellis2_pixel_shuffle_3d
+    from trellis2.modules import sparse as trellis2_sparse
+
+    return TimestepEmbedder, RotaryPositionEmbedder, trellis2_pixel_shuffle_3d, trellis2_sparse
+
+
+def run_trellis2_reference_cases(lib):
+    TimestepEmbedder, RotaryPositionEmbedder, trellis2_pixel_shuffle_3d, trellis2_sparse = load_trellis2_reference_modules()
+    print(f"trellis2_reference_root          {TRELLIS2_ROOT}")
+
+    timesteps = torch.tensor([1.0, 0.75, 0.33, 0.05, 0.0], dtype=torch.float32)
+    for dim in [16, 33, 256]:
+        got = torch.empty(timesteps.numel(), dim, dtype=torch.float32)
+        expect_ok(lib.strellis_timestep_embedding_f32(ptr_f32(timesteps)[0], timesteps.numel(), dim, 10000.0, ptr_f32(got)[0]), f"trellis2_timestep_{dim}")
+        ref = TimestepEmbedder.timestep_embedding(timesteps, dim)
+        check(f"trellis2_timestep_{dim}", got, ref, atol=1e-6, rtol=1e-6)
+
+    resolution = 5
+    head_dim = 24
+    dense_tokens = resolution ** 3
+    cos_out = torch.empty(dense_tokens, head_dim // 2, dtype=torch.float32)
+    sin_out = torch.empty_like(cos_out)
+    expect_ok(
+        lib.strellis_rope_3d_phases_f32(resolution, head_dim, 1.0, 10000.0, ptr_f32(cos_out)[0], ptr_f32(sin_out)[0], cos_out.numel()),
+        "trellis2_rope_dense",
+    )
+    grid = torch.meshgrid(*[torch.arange(resolution, dtype=torch.float32) for _ in range(3)], indexing="ij")
+    xyz = torch.stack(grid, dim=-1).reshape(-1, 3)
+    phases = RotaryPositionEmbedder(head_dim, 3, rope_freq=(1.0, 10000.0))(xyz)
+    check("trellis2_rope_dense_cos", cos_out, phases.real, atol=1e-6, rtol=1e-6)
+    check("trellis2_rope_dense_sin", sin_out, phases.imag, atol=1e-6, rtol=1e-6)
+
+    coords = make_sparse_coords(9, 96, 70700)
+    sparse_cos = torch.empty(coords.shape[0], head_dim // 2, dtype=torch.float32)
+    sparse_sin = torch.empty_like(sparse_cos)
+    coords_ptr, _ = ptr_i32(coords.numpy())
+    expect_ok(
+        lib.strellis_rope_3d_sparse_phases_f32(coords_ptr, coords.shape[0], head_dim, 1.0, 10000.0, ptr_f32(sparse_cos)[0], ptr_f32(sparse_sin)[0], sparse_cos.numel()),
+        "trellis2_rope_sparse",
+    )
+    sparse_phases = RotaryPositionEmbedder(head_dim, 3, rope_freq=(1.0, 10000.0))(coords[:, 1:].float())
+    check("trellis2_rope_sparse_cos", sparse_cos, sparse_phases.real, atol=1e-6, rtol=1e-6)
+    check("trellis2_rope_sparse_sin", sparse_sin, sparse_phases.imag, atol=1e-6, rtol=1e-6)
+
+    x = realistic_activation((2, coords.shape[0], 3, head_dim), 70701, 0.55)
+    y = torch.empty_like(x)
+    expect_ok(lib.strellis_apply_rope_adjacent_f32(ptr_f32(x)[0], ptr_f32(sparse_cos)[0], ptr_f32(sparse_sin)[0], ptr_f32(y)[0], 2, coords.shape[0], 3, head_dim), "trellis2_apply_rope")
+    ref = RotaryPositionEmbedder.apply_rotary_embedding(x, sparse_phases)
+    check("trellis2_apply_rope", y, ref, atol=2e-5, rtol=2e-5)
+
+    ps_x = realistic_activation((1, 32, 3, 4, 5), 70702, 0.5)
+    ps_y = torch.empty(1, 4, 6, 8, 10, dtype=torch.float32)
+    expect_ok(lib.strellis_pixel_shuffle_3d_ncdhw_f32(ptr_f32(ps_x)[0], ptr_f32(ps_y)[0], 1, 32, 3, 4, 5, 2), "trellis2_pixel_shuffle")
+    check("trellis2_pixel_shuffle", ps_y, trellis2_pixel_shuffle_3d(ps_x, 2), atol=1e-6, rtol=1e-6)
+
+    sparse_feats = realistic_activation((coords.shape[0], 16), 70703, 0.45)
+    linear = trellis2_sparse.SparseLinear(16, 20, bias=True).float()
+    with torch.no_grad():
+        linear.weight.copy_(fanin_weight((20, 16), 70704))
+        linear.bias.copy_(randn((20,), 70705, 0.02))
+    vl = trellis2_sparse.VarLenTensor(sparse_feats, layout=[slice(0, sparse_feats.shape[0])])
+    sparse_linear_y = torch.empty(sparse_feats.shape[0], 20, dtype=torch.float32)
+    expect_ok(
+        lib.strellis_sparse_linear_f32(ptr_f32(sparse_feats)[0], ptr_f32(linear.weight)[0], ptr_f32(linear.bias)[0], ptr_f32(sparse_linear_y)[0], sparse_feats.shape[0], 16, 20),
+        "trellis2_sparse_linear",
+    )
+    check("trellis2_sparse_linear", sparse_linear_y, linear(vl).feats, atol=4e-5, rtol=4e-5)
+
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        conv = trellis2_sparse.SparseConv3d(16, 12, 3).to(device).float()
+        sw = fanin_weight((12, 3, 3, 3, 16), 70706)
+        sb = randn((12,), 70707, 0.02)
+        with torch.no_grad():
+            conv.weight.copy_(sw.to(device))
+            conv.bias.copy_(sb.to(device))
+        sparse_x = trellis2_sparse.SparseTensor(sparse_feats.to(device), coords.to(device))
+        ref_sparse = conv(sparse_x).feats.detach().cpu()
+        c_sparse = torch.empty(coords.shape[0], 12, dtype=torch.float32)
+        expect_ok(
+            lib.strellis_sparse_subm_conv3d_f32(coords_ptr, ptr_f32(sparse_feats)[0], ptr_f32(sw)[0], ptr_f32(sb)[0], ptr_f32(c_sparse)[0], coords.shape[0], 16, 12, 3, 3, 3, 1, 1, 1),
+            "trellis2_sparse_conv3d",
+        )
+        # TRELLIS2's flex_gemm sparse conv may use GPU-kernel accumulation that is
+        # looser than the pure PyTorch reference; the C op is also checked above
+        # against a deterministic Python sparse-conv reference at 1e-6 scale.
+        check("trellis2_sparse_conv3d", c_sparse, ref_sparse, atol=2e-3, rtol=2e-3)
+    else:
+        print(f"{'trellis2_sparse_conv3d':32s} skipped cuda_unavailable")
+
+
+def timestep_embedding_ref(timesteps, dim, max_period=10000.0):
+    half = dim // 2
+    if half == 0:
+        return torch.zeros(timesteps.shape[0], dim, dtype=torch.float32)
+    freqs = torch.exp(-math.log(max_period) * torch.arange(half, dtype=torch.float32) / half)
+    emb = torch.cat([torch.cos(timesteps[:, None] * freqs), torch.sin(timesteps[:, None] * freqs)], dim=1)
+    if dim % 2:
+        emb = torch.cat([emb, torch.zeros(timesteps.shape[0], 1, dtype=torch.float32)], dim=1)
+    return emb
+
+
+def rms_heads_ref(x, gamma, eps=0.0):
+    return x * torch.rsqrt((x * x).mean(dim=-1, keepdim=True) + eps) * gamma[None, None, :, :]
+
+
+def rope_adjacent_ref(x, cos, sin):
+    y = torch.empty_like(x)
+    y[..., 0::2] = x[..., 0::2] * cos[None, :, None, :] - x[..., 1::2] * sin[None, :, None, :]
+    y[..., 1::2] = x[..., 0::2] * sin[None, :, None, :] + x[..., 1::2] * cos[None, :, None, :]
+    return y
+
+
+def sdpa_ref(q, k, v, head_dim):
+    scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * (1.0 / math.sqrt(head_dim))
+    return torch.einsum("bhqk,bkhd->bqhd", torch.softmax(scores, dim=-1), v)
+
+
+def linear_ref(x, w, b):
+    return x @ w.t() + b
+
+
+def dit_flow_ref(x, timesteps, context, cos_phase, sin_phase, weights, blocks):
+    batch, tokens, _ = x.shape
+    channels = weights["model_channels"]
+    heads = weights["heads"]
+    head_dim = weights["head_dim"]
+
+    h = linear_ref(x.reshape(-1, weights["in_channels"]), weights["input_w"], weights["input_b"]).reshape(batch, tokens, channels)
+    t = timestep_embedding_ref(timesteps, weights["time_frequency_dim"])
+    t = linear_ref(t, weights["t_embedder_0_w"], weights["t_embedder_0_b"])
+    t = F.silu(t)
+    t = linear_ref(t, weights["t_embedder_2_w"], weights["t_embedder_2_b"])
+    mod6 = linear_ref(F.silu(t), weights["adaln_w"], weights["adaln_b"]).reshape(batch, 6, channels)
+
+    for block in blocks:
+        mod = mod6 + block["modulation"].reshape(1, 6, channels)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = [mod[:, i, :] for i in range(6)]
+
+        x_msa = F.layer_norm(h, (channels,), eps=1e-6)
+        x_msa = x_msa * (1.0 + scale_msa[:, None, :]) + shift_msa[:, None, :]
+        qkv = linear_ref(x_msa.reshape(-1, channels), block["self_qkv_w"], block["self_qkv_b"]).reshape(batch, tokens, 3, channels)
+        q = qkv[:, :, 0, :].reshape(batch, tokens, heads, head_dim)
+        k = qkv[:, :, 1, :].reshape(batch, tokens, heads, head_dim)
+        v = qkv[:, :, 2, :].reshape(batch, tokens, heads, head_dim)
+        q = rms_heads_ref(q, block["self_q_rms_gamma"], eps=0.0)
+        k = rms_heads_ref(k, block["self_k_rms_gamma"], eps=0.0)
+        q = rope_adjacent_ref(q, cos_phase, sin_phase)
+        k = rope_adjacent_ref(k, cos_phase, sin_phase)
+        a = sdpa_ref(q, k, v, head_dim).reshape(batch, tokens, channels)
+        a = linear_ref(a.reshape(-1, channels), block["self_out_w"], block["self_out_b"]).reshape(batch, tokens, channels)
+        h = h + a * gate_msa[:, None, :]
+
+        x_cross = F.layer_norm(h, (channels,), block["norm2_gamma"], block["norm2_beta"], eps=1e-6)
+        q = linear_ref(x_cross.reshape(-1, channels), block["cross_q_w"], block["cross_q_b"]).reshape(batch, tokens, heads, head_dim)
+        kv = linear_ref(context.reshape(-1, weights["cond_channels"]), block["cross_kv_w"], block["cross_kv_b"]).reshape(batch, context.shape[1], 2, channels)
+        k = kv[:, :, 0, :].reshape(batch, context.shape[1], heads, head_dim)
+        v = kv[:, :, 1, :].reshape(batch, context.shape[1], heads, head_dim)
+        q = rms_heads_ref(q, block["cross_q_rms_gamma"], eps=0.0)
+        k = rms_heads_ref(k, block["cross_k_rms_gamma"], eps=0.0)
+        a = sdpa_ref(q, k, v, head_dim).reshape(batch, tokens, channels)
+        a = linear_ref(a.reshape(-1, channels), block["cross_out_w"], block["cross_out_b"]).reshape(batch, tokens, channels)
+        h = h + a
+
+        x_mlp = F.layer_norm(h, (channels,), eps=1e-6)
+        x_mlp = x_mlp * (1.0 + scale_mlp[:, None, :]) + shift_mlp[:, None, :]
+        m = linear_ref(x_mlp.reshape(-1, channels), block["mlp_fc1_w"], block["mlp_fc1_b"])
+        m = F.gelu(m, approximate="tanh")
+        m = linear_ref(m, block["mlp_fc2_w"], block["mlp_fc2_b"]).reshape(batch, tokens, channels)
+        h = h + m * gate_mlp[:, None, :]
+
+    h = F.layer_norm(h, (channels,), eps=weights["final_norm_eps"])
+    return linear_ref(h.reshape(-1, channels), weights["out_w"], weights["out_b"]).reshape(batch, tokens, weights["out_channels"])
+
+
+def run_dit_flow_forward_cases(lib):
+    cases = [
+        (80800, 1, 4, 3, 4, 4, 8, 2, 16, 6, 1),
+        (80801, 2, 5, 4, 6, 5, 12, 3, 24, 8, 2),
+        (80802, 2, 7, 5, 8, 6, 16, 4, 32, 10, 2),
+    ]
+    for case_i, (seed, batch, tokens, cond_tokens, in_c, out_c, channels, heads, mlp, tdim, n_blocks) in enumerate(cases):
+        head_dim = channels // heads
+        cond_c = 10
+        x = realistic_activation((batch, tokens, in_c), seed, 0.35)
+        context = realistic_activation((batch, cond_tokens, cond_c), seed + 1, 0.30)
+        timesteps = torch.linspace(1000.0, 250.0, batch, dtype=torch.float32)
+        cos = torch.cos(realistic_activation((tokens, head_dim // 2), seed + 2, 0.08))
+        sin = torch.sin(realistic_activation((tokens, head_dim // 2), seed + 3, 0.08))
+
+        weights = {
+            "in_channels": in_c,
+            "out_channels": out_c,
+            "model_channels": channels,
+            "cond_channels": cond_c,
+            "time_frequency_dim": tdim,
+            "heads": heads,
+            "head_dim": head_dim,
+            "mlp_channels": mlp,
+            "mod_channels": 6 * channels,
+            "n_blocks": n_blocks,
+            "final_norm_eps": 1e-5,
+            "input_w": fanin_weight((channels, in_c), seed + 10, 0.65),
+            "input_b": randn((channels,), seed + 11, 0.025),
+            "t_embedder_0_w": fanin_weight((channels, tdim), seed + 12, 0.55),
+            "t_embedder_0_b": randn((channels,), seed + 13, 0.02),
+            "t_embedder_2_w": fanin_weight((channels, channels), seed + 14, 0.45),
+            "t_embedder_2_b": randn((channels,), seed + 15, 0.02),
+            "adaln_w": fanin_weight((6 * channels, channels), seed + 16, 0.18),
+            "adaln_b": randn((6 * channels,), seed + 17, 0.015),
+            "out_w": fanin_weight((out_c, channels), seed + 18, 0.55),
+            "out_b": randn((out_c,), seed + 19, 0.02),
+        }
+        blocks = []
+        for b in range(n_blocks):
+            tag = seed + 100 + b * 40
+            blocks.append({
+                "modulation": randn((6 * channels,), tag + 0, 0.018),
+                "norm2_gamma": randn((channels,), tag + 1, 0.035, 1.0),
+                "norm2_beta": randn((channels,), tag + 2, 0.018),
+                "self_qkv_w": fanin_weight((3 * channels, channels), tag + 3, 0.35),
+                "self_qkv_b": randn((3 * channels,), tag + 4, 0.015),
+                "self_q_rms_gamma": randn((heads, head_dim), tag + 5, 0.025, 1.0),
+                "self_k_rms_gamma": randn((heads, head_dim), tag + 6, 0.025, 1.0),
+                "self_out_w": fanin_weight((channels, channels), tag + 7, 0.35),
+                "self_out_b": randn((channels,), tag + 8, 0.015),
+                "cross_q_w": fanin_weight((channels, channels), tag + 9, 0.35),
+                "cross_q_b": randn((channels,), tag + 10, 0.015),
+                "cross_kv_w": fanin_weight((2 * channels, cond_c), tag + 11, 0.35),
+                "cross_kv_b": randn((2 * channels,), tag + 12, 0.015),
+                "cross_q_rms_gamma": randn((heads, head_dim), tag + 13, 0.025, 1.0),
+                "cross_k_rms_gamma": randn((heads, head_dim), tag + 14, 0.025, 1.0),
+                "cross_out_w": fanin_weight((channels, channels), tag + 15, 0.35),
+                "cross_out_b": randn((channels,), tag + 16, 0.015),
+                "mlp_fc1_w": fanin_weight((mlp, channels), tag + 17, 0.40),
+                "mlp_fc1_b": randn((mlp,), tag + 18, 0.015),
+                "mlp_fc2_w": fanin_weight((channels, mlp), tag + 19, 0.40),
+                "mlp_fc2_b": randn((channels,), tag + 20, 0.015),
+            })
+
+        keepalive = []
+
+        def cptr(t):
+            p, arr = ptr_f32(t)
+            keepalive.append(arr)
+            return p
+
+        c_blocks = (DitFlowBlockWeights * n_blocks)()
+        for i, b in enumerate(blocks):
+            for field, _ in DitFlowBlockWeights._fields_:
+                setattr(c_blocks[i], field, cptr(b[field]))
+
+        c_weights = DitFlowWeights(
+            in_c,
+            out_c,
+            channels,
+            cond_c,
+            tdim,
+            heads,
+            head_dim,
+            mlp,
+            6 * channels,
+            n_blocks,
+            -1,
+            0,
+            0,
+            ctypes.c_float(1e-5),
+            cptr(weights["input_w"]),
+            cptr(weights["input_b"]),
+            cptr(weights["t_embedder_0_w"]),
+            cptr(weights["t_embedder_0_b"]),
+            cptr(weights["t_embedder_2_w"]),
+            cptr(weights["t_embedder_2_b"]),
+            cptr(weights["adaln_w"]),
+            cptr(weights["adaln_b"]),
+            cptr(weights["out_w"]),
+            cptr(weights["out_b"]),
+            c_blocks,
+        )
+        y = torch.empty(batch, tokens, out_c, dtype=torch.float32)
+        expect_ok(
+            lib.strellis_dit_flow_forward_f32(
+                cptr(x),
+                cptr(timesteps),
+                cptr(context),
+                cptr(cos),
+                cptr(sin),
+                ctypes.byref(c_weights),
+                cptr(y),
+                batch,
+                tokens,
+                cond_tokens,
+            ),
+            f"dit_flow_forward_{case_i}",
+        )
+        ref = dit_flow_ref(x, timesteps, context, cos, sin, weights, blocks)
+        check(f"dit_flow_forward_{case_i}", y, ref, atol=4e-4, rtol=4e-4)
+
+
 def run_inference_smoke_cases(lib):
     cases = [
         (60600, 6, 2, 2, 16, 32, 8, 32, 0.00),
@@ -534,6 +913,8 @@ def main():
     run_random_attention_cases(lib)
     run_random_volume_cases(lib)
     run_random_sparse_cases(lib)
+    run_trellis2_reference_cases(lib)
+    run_dit_flow_forward_cases(lib)
     run_inference_smoke_cases(lib)
 
     print("all standalone TRELLIS tensor comparisons passed")

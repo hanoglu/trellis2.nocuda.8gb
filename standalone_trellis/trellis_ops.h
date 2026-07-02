@@ -77,6 +77,62 @@ typedef struct strellis_infer_result {
     strellis_mesh mesh;
 } strellis_infer_result;
 
+typedef struct strellis_dit_flow_block_weights {
+    const float * modulation;       /* [6 * model_channels] */
+    const float * norm2_gamma;      /* [model_channels] */
+    const float * norm2_beta;       /* [model_channels] */
+
+    const float * self_qkv_w;       /* [3 * model_channels, model_channels] */
+    const float * self_qkv_b;       /* [3 * model_channels] */
+    const float * self_q_rms_gamma; /* [heads, head_dim] */
+    const float * self_k_rms_gamma; /* [heads, head_dim] */
+    const float * self_out_w;       /* [model_channels, model_channels] */
+    const float * self_out_b;       /* [model_channels] */
+
+    const float * cross_q_w;        /* [model_channels, model_channels] */
+    const float * cross_q_b;        /* [model_channels] */
+    const float * cross_kv_w;       /* [2 * model_channels, cond_channels] */
+    const float * cross_kv_b;       /* [2 * model_channels] */
+    const float * cross_q_rms_gamma;/* [heads, head_dim] */
+    const float * cross_k_rms_gamma;/* [heads, head_dim] */
+    const float * cross_out_w;      /* [model_channels, model_channels] */
+    const float * cross_out_b;      /* [model_channels] */
+
+    const float * mlp_fc1_w;        /* [mlp_channels, model_channels] */
+    const float * mlp_fc1_b;        /* [mlp_channels] */
+    const float * mlp_fc2_w;        /* [model_channels, mlp_channels] */
+    const float * mlp_fc2_b;        /* [model_channels] */
+} strellis_dit_flow_block_weights;
+
+typedef struct strellis_dit_flow_weights {
+    int in_channels;
+    int out_channels;
+    int model_channels;
+    int cond_channels;
+    int time_frequency_dim;
+    int heads;
+    int head_dim;
+    int mlp_channels;
+    int mod_channels;
+    int n_blocks;
+    int debug_block_parts;  /* -1 runs full block, otherwise 0..3 like the ggml debug path. */
+    int debug_disable_rope;
+    int emulate_bf16_blocks;
+    float final_norm_eps;
+
+    const float * input_w;       /* [model_channels, in_channels] */
+    const float * input_b;       /* [model_channels] */
+    const float * t_embedder_0_w;/* [model_channels, time_frequency_dim] */
+    const float * t_embedder_0_b;/* [model_channels] */
+    const float * t_embedder_2_w;/* [model_channels, model_channels] */
+    const float * t_embedder_2_b;/* [model_channels] */
+    const float * adaln_w;       /* [6 * model_channels, model_channels] */
+    const float * adaln_b;       /* [6 * model_channels] */
+    const float * out_w;         /* [out_channels, model_channels] */
+    const float * out_b;         /* [out_channels] */
+    const strellis_dit_flow_block_weights * blocks;
+} strellis_dit_flow_weights;
+
 const char * strellis_status_name(strellis_status status);
 size_t strellis_operator_plan_count(void);
 const strellis_op_plan * strellis_operator_plan_at(size_t index);
@@ -93,6 +149,19 @@ void strellis_infer_result_free(strellis_infer_result * result);
 strellis_status strellis_run_inference_compute(
     const strellis_infer_options * options,
     strellis_infer_result * result);
+
+/* TRELLIS DiT flow forward without ggml: x/context are [batch,tokens,channels]. */
+strellis_status strellis_dit_flow_forward_f32(
+    const float * x,
+    const float * timesteps,
+    const float * context,
+    const float * cos_phase,
+    const float * sin_phase,
+    const strellis_dit_flow_weights * weights,
+    float * y,
+    int batch,
+    int tokens,
+    int cond_tokens);
 
 /* Dense affine projection: y[row,out] = bias[out] + sum_i x[row,i] * weight[out,i]. */
 strellis_status strellis_linear_f32(
