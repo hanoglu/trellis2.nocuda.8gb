@@ -8,15 +8,17 @@
 static void usage(const char * argv0) {
     fprintf(stderr,
         "Usage:\n"
-        "  %s --model DIR --dino DIR --image FILE --obj FILE [options]\n"
+        "  %s --model DIR --dino DIR --image FILE (--obj FILE | --gltf FILE) [options]\n"
         "\n"
-        "Runs image -> sparse structure -> shape SLat -> mesh/subs -> texture SLat -> colored OBJ.\n"
+        "Runs image -> sparse structure -> shape SLat -> mesh/subs -> texture SLat -> OBJ vertex colors and/or glTF textures.\n"
         "\n"
         "Options:\n"
         "  --model DIR             TRELLIS.2 model directory containing ckpts/\n"
         "  --dino DIR              DINOv3 image encoder directory containing model.safetensors\n"
         "  --image FILE            Input image. PNG/JPEG load directly; WebP is converted with ffmpeg first.\n"
-        "  --obj FILE              Output OBJ path\n"
+        "  --obj FILE              Output OBJ path with vertex colors; no UV texture files\n"
+        "  --gltf FILE             Output glTF 2.0 path; writes .gltf + .bin + PBR PNG textures\n"
+        "  --texture-size N        glTF texture size, default 1024\n"
         "  --device N              CUDA device, default 0\n"
         "  --steps N               Sparse-structure and structured-latent Euler steps, default 12\n"
         "  --sparse-structure-steps N Override sparse-structure steps\n"
@@ -117,6 +119,7 @@ int main(int argc, char ** argv) {
     options.sparse_resolution = 32;
     options.seed = 1u;
     options.noise_seed = 18u;
+    options.texture_size = 1024;
     options.rescale_t = 3.0f;
     options.guidance_strength = 7.5f;
     options.guidance_rescale = 0.5f;
@@ -134,6 +137,8 @@ int main(int argc, char ** argv) {
             options.image_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--obj") == 0) {
             options.obj_path = arg_value(argc, argv, &i);
+        } else if (strcmp(argv[i], "--gltf") == 0) {
+            options.gltf_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--flow") == 0) {
             options.flow_override_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--decoder") == 0) {
@@ -161,6 +166,8 @@ int main(int argc, char ** argv) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.cond_resolution)) goto bad_args;
         } else if (strcmp(argv[i], "--sparse-resolution") == 0) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.sparse_resolution)) goto bad_args;
+        } else if (strcmp(argv[i], "--texture-size") == 0) {
+            if (!parse_int_arg(arg_value(argc, argv, &i), &options.texture_size)) goto bad_args;
         } else if (strcmp(argv[i], "--rescale-t") == 0) {
             if (!parse_float_arg(arg_value(argc, argv, &i), &options.rescale_t)) goto bad_args;
         } else if (strcmp(argv[i], "--guidance-strength") == 0) {
@@ -197,10 +204,12 @@ int main(int argc, char ** argv) {
     }
 
     if (options.model_dir == NULL || options.dino_dir == NULL ||
-        options.image_path == NULL || options.obj_path == NULL ||
+        options.image_path == NULL ||
+        (options.obj_path == NULL && options.gltf_path == NULL) ||
         options.sparse_structure_steps <= 0 || options.structured_latent_steps <= 0 ||
         options.latent_size <= 0 || options.cond_resolution <= 0 ||
-        options.sparse_resolution <= 0 || (options.resolution != 512 && options.resolution != 1024)) {
+        options.sparse_resolution <= 0 || options.texture_size <= 0 ||
+        (options.resolution != 512 && options.resolution != 1024)) {
         goto bad_args;
     }
 

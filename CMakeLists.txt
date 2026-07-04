@@ -26,6 +26,14 @@ set(GGML_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
 
 add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/3rd/ggml" "${CMAKE_CURRENT_BINARY_DIR}/ggml")
 
+add_library(xatlas STATIC
+    3rd/xatlas/source/xatlas/xatlas.cpp
+)
+target_include_directories(xatlas PUBLIC
+    "${CMAKE_CURRENT_LIST_DIR}/3rd/xatlas/source/xatlas"
+)
+target_compile_definitions(xatlas PRIVATE XATLAS_C_API=1)
+
 if (TRELLIS2_C_BUILD_RAYLIB_VIEWER AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/3rd/raylib/CMakeLists.txt")
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
@@ -46,6 +54,7 @@ add_library(trellis2_c
     src/pipeline/trellis_flow_sampler.c
     src/pipeline/trellis_sparse_structure_pipeline.c
     src/pipeline/trellis_structured_latent_pipeline.c
+    src/export/trellis_gltf_export.c
     src/io/trellis_safetensors.c
     src/model/trellis_sparse_unet_vae_decoder.c
     src/io/trellis_weights.c
@@ -54,10 +63,14 @@ add_library(trellis2_c
 target_include_directories(trellis2_c
     PUBLIC
         "${CMAKE_CURRENT_LIST_DIR}/include"
+    PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/3rd/cgltf"
+        "${CMAKE_CURRENT_LIST_DIR}/3rd/stb"
+        "${CMAKE_CURRENT_LIST_DIR}/3rd/xatlas/source/xatlas"
 )
 
 find_package(CUDAToolkit REQUIRED)
-target_link_libraries(trellis2_c PUBLIC ggml CUDA::cudart CUDA::cublas)
+target_link_libraries(trellis2_c PUBLIC ggml xatlas CUDA::cudart CUDA::cublas)
 if (UNIX)
     target_link_libraries(trellis2_c PUBLIC m)
 endif()

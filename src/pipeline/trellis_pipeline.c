@@ -446,6 +446,126 @@ static int next_pow2_size(size_t n, size_t * out) {
     return 1;
 }
 
+static int32_t pbr_hash_lookup(
+    const uint64_t * keys,
+    const int32_t * values,
+    size_t table_size,
+    int32_t x,
+    int32_t y,
+    int32_t z) {
+    uint64_t key = pbr_coord_key(x, y, z);
+    if (key == 0) {
+        key = 1;
+    }
+    size_t slot = (size_t) hash_u64(key) & (table_size - 1u);
+    while (values[slot] >= 0) {
+        if (keys[slot] == key) {
+            return values[slot];
+        }
+        slot = (slot + 1u) & (table_size - 1u);
+    }
+    return -1;
+}
+
+static int pbr_sample_color_trilinear(
+    const trellis_pbr_voxels * voxels,
+    const uint64_t * keys,
+    const int32_t * values,
+    size_t table_size,
+    const float vertex[3],
+    float color[3]) {
+    const int resolution = voxels->resolution > 0 ? voxels->resolution : 512;
+    float gx = (vertex[0] + 0.5f) * (float) resolution;
+    float gy = (vertex[1] + 0.5f) * (float) resolution;
+    float gz = (vertex[2] + 0.5f) * (float) resolution;
+    if (gx < 0.0f) gx = 0.0f;
+    if (gy < 0.0f) gy = 0.0f;
+    if (gz < 0.0f) gz = 0.0f;
+    if (gx > (float) (resolution - 1)) gx = (float) (resolution - 1);
+    if (gy > (float) (resolution - 1)) gy = (float) (resolution - 1);
+    if (gz > (float) (resolution - 1)) gz = (float) (resolution - 1);
+
+    const int32_t x0 = (int32_t) floorf(gx);
+    const int32_t y0 = (int32_t) floorf(gy);
+    const int32_t z0 = (int32_t) floorf(gz);
+    const int32_t x1 = x0 + 1 < resolution ? x0 + 1 : x0;
+    const int32_t y1 = y0 + 1 < resolution ? y0 + 1 : y0;
+    const int32_t z1 = z0 + 1 < resolution ? z0 + 1 : z0;
+    const float tx = gx - (float) x0;
+    const float ty = gy - (float) y0;
+    const float tz = gz - (float) z0;
+
+    float acc[3] = {0.0f, 0.0f, 0.0f};
+    float weight_sum = 0.0f;
+    for (int dz = 0; dz < 2; ++dz) {
+        const int32_t z = dz == 0 ? z0 : z1;
+        const float wz = dz == 0 ? 1.0f - tz : tz;
+        for (int dy = 0; dy < 2; ++dy) {
+            const int32_t y = dy == 0 ? y0 : y1;
+            const float wy = dy == 0 ? 1.0f - ty : ty;
+            for (int dx = 0; dx < 2; ++dx) {
+                const int32_t x = dx == 0 ? x0 : x1;
+                const float wx = dx == 0 ? 1.0f - tx : tx;
+                const float w = wx * wy * wz;
+                if (w <= 0.0f) {
+                    continue;
+                }
+                const int32_t idx = pbr_hash_lookup(keys, values, table_size, x, y, z);
+                if (idx < 0) {
+                    continue;
+                }
+                const float * src = voxels->attrs + (size_t) idx * (size_t) voxels->channels;
+                acc[0] += w * clamp01(src[0]);
+                acc[1] += w * clamp01(src[1]);
+                acc[2] += w * clamp01(src[2]);
+                weight_sum += w;
+            }
+        }
+    }
+    if (weight_sum > 1e-8f) {
+        color[0] = acc[0] / weight_sum;
+        color[1] = acc[1] / weight_sum;
+        color[2] = acc[2] / weight_sum;
+        return 1;
+    }
+
+    const int32_t cx = (int32_t) floorf(gx + 0.5f);
+    const int32_t cy = (int32_t) floorf(gy + 0.5f);
+    const int32_t cz = (int32_t) floorf(gz + 0.5f);
+    int32_t best = -1;
+    for (int radius = 0; best < 0 && radius <= 2; ++radius) {
+        for (int dz = -radius; best < 0 && dz <= radius; ++dz) {
+            for (int dy = -radius; best < 0 && dy <= radius; ++dy) {
+                for (int dx = -radius; dx <= radius; ++dx) {
+                    if (radius > 0 &&
+                        abs(dx) != radius && abs(dy) != radius && abs(dz) != radius) {
+                        continue;
+                    }
+                    const int32_t x = cx + dx;
+                    const int32_t y = cy + dy;
+                    const int32_t z = cz + dz;
+                    if (x < 0 || y < 0 || z < 0 ||
+                        x >= resolution || y >= resolution || z >= resolution) {
+                        continue;
+                    }
+                    best = pbr_hash_lookup(keys, values, table_size, x, y, z);
+                }
+            }
+        }
+    }
+    if (best >= 0) {
+        const float * src = voxels->attrs + (size_t) best * (size_t) voxels->channels;
+        color[0] = clamp01(src[0]);
+        color[1] = clamp01(src[1]);
+        color[2] = clamp01(src[2]);
+        return 1;
+    }
+    color[0] = 0.8f;
+    color[1] = 0.8f;
+    color[2] = 0.8f;
+    return 0;
+}
+
 trellis_status trellis_pipeline_apply_pbr_voxels_to_mesh(
     const trellis_pbr_voxels * voxels,
     trellis_mesh_host * mesh) {
@@ -490,64 +610,34 @@ trellis_status trellis_pipeline_apply_pbr_voxels_to_mesh(
         return TRELLIS_STATUS_OUT_OF_MEMORY;
     }
 
-    const int resolution = voxels->resolution > 0 ? voxels->resolution : 512;
+    const int progress_steps = mesh->n_vertices >= 100000 ? 20 : 0;
+    int progress_step = 1;
+    int64_t chunk_start_us = ggml_time_us();
+    int64_t misses = 0;
     for (int64_t vi = 0; vi < mesh->n_vertices; ++vi) {
         const float * v = mesh->vertices + (size_t) vi * 3u;
-        int32_t gx = (int32_t) floorf((v[0] + 0.5f) * (float) resolution + 0.5f);
-        int32_t gy = (int32_t) floorf((v[1] + 0.5f) * (float) resolution + 0.5f);
-        int32_t gz = (int32_t) floorf((v[2] + 0.5f) * (float) resolution + 0.5f);
-        if (gx < 0) gx = 0;
-        if (gy < 0) gy = 0;
-        if (gz < 0) gz = 0;
-        if (gx >= resolution) gx = resolution - 1;
-        if (gy >= resolution) gy = resolution - 1;
-        if (gz >= resolution) gz = resolution - 1;
-
-        int32_t best = -1;
-        for (int radius = 0; best < 0 && radius <= 3; ++radius) {
-            for (int dz = -radius; best < 0 && dz <= radius; ++dz) {
-                for (int dy = -radius; best < 0 && dy <= radius; ++dy) {
-                    for (int dx = -radius; dx <= radius; ++dx) {
-                        if (radius > 0 &&
-                            abs(dx) != radius && abs(dy) != radius && abs(dz) != radius) {
-                            continue;
-                        }
-                        int32_t x = gx + dx;
-                        int32_t y = gy + dy;
-                        int32_t z = gz + dz;
-                        if (x < 0 || y < 0 || z < 0 ||
-                            x >= resolution || y >= resolution || z >= resolution) {
-                            continue;
-                        }
-                        uint64_t key = pbr_coord_key(x, y, z);
-                        if (key == 0) {
-                            key = 1;
-                        }
-                        size_t slot = (size_t) hash_u64(key) & (table_size - 1u);
-                        while (values[slot] >= 0) {
-                            if (keys[slot] == key) {
-                                best = values[slot];
-                                break;
-                            }
-                            slot = (slot + 1u) & (table_size - 1u);
-                        }
-                        if (best >= 0) {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
         float * dst = colors + (size_t) vi * 3u;
-        if (best >= 0) {
-            const float * src = voxels->attrs + (size_t) best * (size_t) voxels->channels;
-            dst[0] = clamp01(src[0]);
-            dst[1] = clamp01(src[1]);
-            dst[2] = clamp01(src[2]);
-        } else {
-            dst[0] = 0.8f;
-            dst[1] = 0.8f;
-            dst[2] = 0.8f;
+        if (!pbr_sample_color_trilinear(voxels, keys, values, table_size, v, dst)) {
+            ++misses;
+        }
+        if (progress_steps > 0 &&
+            vi + 1 >= (mesh->n_vertices * (int64_t) progress_step) / progress_steps) {
+            char detail[128];
+            snprintf(
+                detail,
+                sizeof(detail),
+                "vertices=%lld/%lld misses=%lld",
+                (long long) (vi + 1),
+                (long long) mesh->n_vertices,
+                (long long) misses);
+            trellis_progress_steps(
+                "OBJ vertex colors",
+                progress_step,
+                progress_steps,
+                ggml_time_us() - chunk_start_us,
+                detail);
+            chunk_start_us = ggml_time_us();
+            ++progress_step;
         }
     }
 
@@ -597,7 +687,9 @@ trellis_status trellis_pipeline_write_obj(const char * path, const trellis_mesh_
 
 trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options * options) {
     if (options == NULL || options->model_dir == NULL || options->dino_dir == NULL ||
-        options->image_path == NULL || options->obj_path == NULL) {
+        options->image_path == NULL ||
+        ((options->obj_path == NULL || options->obj_path[0] == '\0') &&
+         (options->gltf_path == NULL || options->gltf_path[0] == '\0'))) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
 
@@ -645,6 +737,8 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     memset(&shape_subs, 0, sizeof(shape_subs));
     memset(&pbr_voxels, 0, sizeof(pbr_voxels));
     memset(&mesh, 0, sizeof(mesh));
+    const int want_obj = options->obj_path != NULL && options->obj_path[0] != '\0';
+    const int want_gltf = options->gltf_path != NULL && options->gltf_path[0] != '\0';
 
     TRELLIS_INFO("[1/5] SparseStructureFlowModel image -> sparse structure");
     trellis_sparse_structure_options sparse_structure;
@@ -772,7 +866,7 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     }
     trellis_sparse_structure_result_free(&sparse_structure_result);
 
-    TRELLIS_INFO("[5/5] SparseUnetVaeDecoder texture SLat -> PBR vertex colors");
+    TRELLIS_INFO("[5/5] SparseUnetVaeDecoder texture SLat -> PBR voxels");
     trellis_pipeline_texture_options tex_decode;
     memset(&tex_decode, 0, sizeof(tex_decode));
     tex_decode.model_dir = options->model_dir;
@@ -786,20 +880,39 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     if (status != TRELLIS_STATUS_OK) {
         goto cleanup;
     }
-    status = trellis_pipeline_apply_pbr_voxels_to_mesh(&pbr_voxels, &mesh);
-    if (status != TRELLIS_STATUS_OK) {
-        goto cleanup;
-    }
-
-    status = trellis_pipeline_write_obj(options->obj_path, &mesh);
-    if (status != TRELLIS_STATUS_OK) {
-        goto cleanup;
-    }
     TRELLIS_INFO(
-        "pipeline: wrote %s (%lld vertices, %lld faces)",
-        options->obj_path,
-        (long long) mesh.n_vertices,
-        (long long) mesh.n_faces);
+        "pipeline: decoded PBR voxels=%lld channels=%d resolution=%d",
+        (long long) pbr_voxels.n_coords,
+        pbr_voxels.channels,
+        pbr_voxels.resolution);
+
+    if (want_obj) {
+        TRELLIS_INFO(
+            "pipeline: applying PBR voxels to OBJ vertex colors vertices=%lld voxels=%lld",
+            (long long) mesh.n_vertices,
+            (long long) pbr_voxels.n_coords);
+        status = trellis_pipeline_apply_pbr_voxels_to_mesh(&pbr_voxels, &mesh);
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
+        status = trellis_pipeline_write_obj(options->obj_path, &mesh);
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
+        TRELLIS_INFO(
+            "pipeline: wrote %s (%lld vertices, %lld faces)",
+            options->obj_path,
+            (long long) mesh.n_vertices,
+            (long long) mesh.n_faces);
+    }
+    if (want_gltf) {
+        const int texture_size = options->texture_size > 0 ? options->texture_size : 1024;
+        status = trellis_pipeline_write_gltf(options->gltf_path, &mesh, &pbr_voxels, texture_size);
+        if (status != TRELLIS_STATUS_OK) {
+            TRELLIS_ERROR("pipeline: glTF export failed: %s", trellis_status_string(status));
+            goto cleanup;
+        }
+    }
 
 cleanup:
     trellis_mesh_free(&mesh);

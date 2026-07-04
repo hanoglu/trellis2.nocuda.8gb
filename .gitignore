@@ -37,11 +37,6 @@ artifacts/
 *.f32
 *.i32
 
-# Local third-party checkouts that are not tracked submodules
-/3rd/cgltf/
-/3rd/stb/
-/3rd/xatlas/
-
 # Local editor/cache files
 .cache/
 .vscode/
