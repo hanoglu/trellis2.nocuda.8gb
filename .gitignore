@@ -1,6 +1,7 @@
 # Build outputs
 /build/
 /build-obj/
+/build-vulkan/
 cmake-build-*/
 CMakeFiles/
 CMakeCache.txt

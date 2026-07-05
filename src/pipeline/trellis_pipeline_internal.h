@@ -24,6 +24,7 @@ typedef struct trellis_sparse_structure_options {
     int flow_block_parts_override;
     int flow_no_rope;
     float voxel_threshold;
+    const trellis_backend_context * backend;
     const trellis_cuda_context * cuda;
 } trellis_sparse_structure_options;
 
@@ -75,6 +76,7 @@ typedef struct trellis_structured_latent_options {
     int flow_no_rope;
     int emulate_bf16_blocks;
     int use_ggml_flash_attn;
+    const trellis_backend_context * backend;
     const trellis_cuda_context * cuda;
 } trellis_structured_latent_options;
 

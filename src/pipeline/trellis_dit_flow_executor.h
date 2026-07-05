@@ -4,7 +4,7 @@
 #include "trellis.h"
 
 typedef struct trellis_dit_flow_executor {
-    const trellis_cuda_context * cuda;
+    const trellis_backend_context * backend;
     const trellis_dit_flow_weights * weights;
     struct ggml_context * ctx;
     struct ggml_cgraph * graph;
@@ -27,7 +27,7 @@ typedef struct trellis_dit_flow_executor {
 
 trellis_status trellis_dit_flow_executor_init_single(
     trellis_dit_flow_executor * executor,
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const trellis_dit_flow_weights * weights,
     int64_t tokens,
     int cond_tokens,

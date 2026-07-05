@@ -186,13 +186,13 @@ static trellis_status set_tensor_data_from_meta(
 
 trellis_status trellis_tensor_store_load_safetensors_f32(
     trellis_tensor_store * store,
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const char * safetensors_path,
     bool transpose_linear_weights,
     size_t * loaded_tensors) {
     return trellis_tensor_store_load_safetensors_f32_ex(
         store,
-        cuda,
+        backend,
         safetensors_path,
         transpose_linear_weights,
         loaded_tensors,
@@ -236,13 +236,13 @@ static void emit_load_progress(
 
 trellis_status trellis_tensor_store_load_safetensors_f32_ex(
     trellis_tensor_store * store,
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const char * safetensors_path,
     bool transpose_linear_weights,
     size_t * loaded_tensors,
     trellis_tensor_store_load_progress_callback progress_callback,
     void * progress_user_data) {
-    if (store == NULL || store->ctx == NULL || cuda == NULL || cuda->backend == NULL || safetensors_path == NULL) {
+    if (store == NULL || store->ctx == NULL || backend == NULL || backend->backend == NULL || safetensors_path == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     if (store->n_entries != 0 || store->buffer != NULL) {
@@ -271,7 +271,7 @@ trellis_status trellis_tensor_store_load_safetensors_f32_ex(
         }
     }
 
-    store->buffer = ggml_backend_alloc_ctx_tensors(store->ctx, cuda->backend);
+    store->buffer = ggml_backend_alloc_ctx_tensors(store->ctx, backend->backend);
     if (store->buffer == NULL) {
         trellis_safetensors_close(&st);
         return TRELLIS_STATUS_OUT_OF_MEMORY;

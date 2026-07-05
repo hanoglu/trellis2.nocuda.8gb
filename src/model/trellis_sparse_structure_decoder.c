@@ -372,12 +372,12 @@ static struct ggml_tensor * ss_decoder_forward_graph(
 trellis_status trellis_ss_decoder_forward_f32_host(
     const trellis_ss_decoder_weights * weights,
     const float * latent,
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     int batch,
     int latent_size,
     float ** logits_out,
     int * output_size) {
-    if (weights == NULL || latent == NULL || cuda == NULL || cuda->backend == NULL ||
+    if (weights == NULL || latent == NULL || backend == NULL || backend->backend == NULL ||
         logits_out == NULL || output_size == NULL || batch != 1 || latent_size <= 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
@@ -428,14 +428,14 @@ trellis_status trellis_ss_decoder_forward_f32_host(
     }
     ggml_build_forward_expand(graph, y);
 
-    alloc = trellis_cuda_new_graph_allocator(cuda);
+    alloc = trellis_backend_new_graph_allocator(backend);
     if (alloc == NULL || !ggml_gallocr_alloc_graph(alloc, graph)) {
         status = TRELLIS_STATUS_OUT_OF_MEMORY;
         goto cleanup;
     }
 
     ggml_backend_tensor_set(x, latent, 0, ggml_nbytes(x));
-    status = trellis_cuda_compute_graph(cuda, graph);
+    status = trellis_backend_compute_graph(backend, graph);
     if (status != TRELLIS_STATUS_OK) {
         goto cleanup;
     }

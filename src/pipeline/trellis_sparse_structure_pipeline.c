@@ -188,7 +188,7 @@ static void token_channels_to_ncdhw(
 }
 
 static int load_sparse_structure_flow(
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const char * model_dir,
     trellis_tensor_store * store,
     trellis_dit_flow_weights * weights) {
@@ -197,7 +197,7 @@ static int load_sparse_structure_flow(
         return 0;
     }
     if (!trellis_load_tensor_store_f32(
-            cuda,
+            backend,
             "sparse-structure flow",
             path,
             true,
@@ -220,7 +220,7 @@ static int load_sparse_structure_flow(
 }
 
 static int load_sparse_structure_decoder(
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const char * model_dir,
     trellis_tensor_store * store,
     trellis_ss_decoder_weights * weights) {
@@ -229,7 +229,7 @@ static int load_sparse_structure_decoder(
         return 0;
     }
     if (!trellis_load_tensor_store_f32(
-            cuda,
+            backend,
             "sparse-structure decoder",
             path,
             false,
@@ -251,7 +251,7 @@ static int load_sparse_structure_decoder(
 }
 
 static int load_sparse_structure_dino(
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const char * dino_dir,
     trellis_tensor_store * store,
     trellis_dino_vit_weights * weights);
@@ -265,7 +265,7 @@ static int copy_tensor_f32(const struct ggml_tensor * tensor, float * dst, size_
 }
 
 static int load_sparse_structure_dino(
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const char * dino_dir,
     trellis_tensor_store * store,
     trellis_dino_vit_weights * weights) {
@@ -274,7 +274,7 @@ static int load_sparse_structure_dino(
         TRELLIS_ERROR("sparse structure: invalid dino model path");
         return 0;
     }
-    if (!trellis_load_tensor_store_f32(cuda, "sparse-structure dino image encoder", path, true, 64, store, NULL)) {
+    if (!trellis_load_tensor_store_f32(backend, "sparse-structure dino image encoder", path, true, 64, store, NULL)) {
         return 0;
     }
     char issue[256];
@@ -459,14 +459,14 @@ static int preprocess_image_for_dino(
 }
 
 static int run_dino_condition(
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const char * dino_dir,
     const char * image_path,
     int cond_resolution,
     const trellis_dino_vit_weights * preloaded_dino,
     float ** context_out,
     int * cond_tokens_out) {
-    if (cuda == NULL || dino_dir == NULL || image_path == NULL ||
+    if (backend == NULL || dino_dir == NULL || image_path == NULL ||
         cond_resolution <= 0 || context_out == NULL || cond_tokens_out == NULL) {
         return 0;
     }
@@ -483,7 +483,7 @@ static int run_dino_condition(
     float * output_tokens = NULL;
 
     if (dino == NULL) {
-        if (!load_sparse_structure_dino(cuda, dino_dir, &dino_store, &dino_local)) {
+        if (!load_sparse_structure_dino(backend, dino_dir, &dino_store, &dino_local)) {
             goto cleanup;
         }
         dino = &dino_local;
@@ -510,7 +510,7 @@ static int run_dino_condition(
     TRELLIS_INFO("sparse structure: running DINO image encoder graph tokens=%d layers=%d",
         expected_tokens, TRELLIS_DINO_VIT_LAYERS);
     trellis_status status = trellis_dino_image_forward_f32_host(
-        cuda, dino, image, 1, cond_resolution, cond_resolution, NULL, NULL, &output_tokens, &total_tokens);
+        backend, dino, image, 1, cond_resolution, cond_resolution, NULL, NULL, &output_tokens, &total_tokens);
     if (status != TRELLIS_STATUS_OK) {
         fprintf(stderr, "sparse structure: dino image encoder failed: %s\n", trellis_status_string(status));
         goto cleanup;
@@ -533,7 +533,7 @@ cleanup:
 }
 
 static int run_sparse_structure_image(
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const char * model_dir,
     const char * dino_dir,
     const char * image_path,
@@ -550,7 +550,7 @@ static int run_sparse_structure_image(
     if (result != NULL) {
         memset(result, 0, sizeof(*result));
     }
-    if (cuda == NULL || model_dir == NULL || dino_dir == NULL ||
+    if (backend == NULL || model_dir == NULL || dino_dir == NULL ||
         image_path == NULL ||
         latent_size <= 0 || steps <= 0 || cond_resolution <= 0 || sparse_resolution <= 0) {
         return 1;
@@ -566,7 +566,7 @@ static int run_sparse_structure_image(
 
     float * context = NULL;
     int cond_tokens = 0;
-    if (!run_dino_condition(cuda, dino_dir, image_path, cond_resolution, NULL, &context, &cond_tokens)) {
+    if (!run_dino_condition(backend, dino_dir, image_path, cond_resolution, NULL, &context, &cond_tokens)) {
         free(context);
         return 1;
     }
@@ -597,10 +597,10 @@ static int run_sparse_structure_image(
     float * cos_phase = NULL;
     float * sin_phase = NULL;
 
-    if (!load_sparse_structure_flow(cuda, model_dir, &flow_store, &flow)) {
+    if (!load_sparse_structure_flow(backend, model_dir, &flow_store, &flow)) {
         goto cleanup;
     }
-    if (!load_sparse_structure_decoder(cuda, model_dir, &decoder_store, &decoder)) {
+    if (!load_sparse_structure_decoder(backend, model_dir, &decoder_store, &decoder)) {
         goto cleanup;
     }
     if (flow_blocks_override >= 0) {
@@ -663,7 +663,7 @@ static int run_sparse_structure_image(
     }
     status = trellis_dit_flow_executor_init_single(
         &flow_executor_cond,
-        cuda,
+        backend,
         &flow,
         tokens,
         cond_tokens,
@@ -673,7 +673,7 @@ static int run_sparse_structure_image(
     if (status == TRELLIS_STATUS_OK) {
         status = trellis_dit_flow_executor_init_single(
             &flow_executor_uncond,
-            cuda,
+            backend,
             &flow,
             tokens,
             cond_tokens,
@@ -738,7 +738,7 @@ static int run_sparse_structure_image(
         float * logits = NULL;
         int output_size = 0;
         TRELLIS_DEBUG("sparse structure: step %d/%d decoding sparse structure", step + 1, steps);
-        status = trellis_ss_decoder_forward_f32_host(&decoder, latent_ncdhw, cuda, 1, latent_size, &logits, &output_size);
+        status = trellis_ss_decoder_forward_f32_host(&decoder, latent_ncdhw, backend, 1, latent_size, &logits, &output_size);
         if (status != TRELLIS_STATUS_OK) {
             fprintf(stderr, "sparse structure: decoder step %d failed: %s\n", step + 1, trellis_status_string(status));
             free(logits);
@@ -842,11 +842,15 @@ cleanup:
 trellis_status trellis_pipeline_run_sparse_structure(
     const trellis_sparse_structure_options * options,
     trellis_sparse_structure_result * result) {
-    if (options == NULL || options->cuda == NULL) {
+    if (options == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    const trellis_backend_context * backend = options->backend != NULL ? options->backend : options->cuda;
+    if (backend == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     int rc = run_sparse_structure_image(
-        options->cuda,
+        backend,
         options->model_dir,
         options->dino_dir,
         options->image_path,

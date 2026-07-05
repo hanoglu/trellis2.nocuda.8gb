@@ -67,21 +67,21 @@ static int set_static_inputs(
 
 static trellis_status init_executor(
     trellis_dit_flow_executor * executor,
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const trellis_dit_flow_weights * weights,
     int64_t tokens,
     int cond_tokens,
     const float * context,
     const float * cos_phase_data,
     const float * sin_phase_data) {
-    if (executor == NULL || cuda == NULL || cuda->backend == NULL || weights == NULL ||
+    if (executor == NULL || backend == NULL || backend->backend == NULL || weights == NULL ||
         tokens <= 0 || cond_tokens <= 0 || weights->in_channels <= 0 ||
         weights->cond_channels <= 0 || weights->head_dim <= 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
 
     memset(executor, 0, sizeof(*executor));
-    executor->cuda = cuda;
+    executor->backend = backend;
     executor->weights = weights;
     executor->tokens = tokens;
     executor->cond_tokens = cond_tokens;
@@ -176,7 +176,7 @@ static trellis_status init_executor(
     }
     ggml_build_forward_expand(executor->graph, executor->y);
 
-    executor->alloc = trellis_cuda_new_graph_allocator(cuda);
+    executor->alloc = trellis_backend_new_graph_allocator(backend);
     if (executor->alloc == NULL || !ggml_gallocr_alloc_graph(executor->alloc, executor->graph)) {
         trellis_dit_flow_executor_free(executor);
         return TRELLIS_STATUS_OUT_OF_MEMORY;
@@ -192,7 +192,7 @@ static trellis_status init_executor(
 
 trellis_status trellis_dit_flow_executor_init_single(
     trellis_dit_flow_executor * executor,
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const trellis_dit_flow_weights * weights,
     int64_t tokens,
     int cond_tokens,
@@ -201,7 +201,7 @@ trellis_status trellis_dit_flow_executor_init_single(
     const float * sin_phase_data) {
     return init_executor(
         executor,
-        cuda,
+        backend,
         weights,
         tokens,
         cond_tokens,
@@ -215,7 +215,7 @@ trellis_status trellis_dit_flow_executor_run_single(
     const float * latent,
     float timestep,
     float * pred) {
-    if (executor == NULL || executor->cuda == NULL || executor->weights == NULL ||
+    if (executor == NULL || executor->backend == NULL || executor->weights == NULL ||
         executor->graph == NULL || executor->x == NULL || executor->y == NULL ||
         executor->x_host == NULL || executor->y_host == NULL ||
         latent == NULL || pred == NULL) {
@@ -230,7 +230,7 @@ trellis_status trellis_dit_flow_executor_run_single(
         ggml_backend_tensor_set(executor->t, &model_timestep, 0, ggml_nbytes(executor->t));
     }
 
-    trellis_status status = trellis_cuda_compute_graph(executor->cuda, executor->graph);
+    trellis_status status = trellis_backend_compute_graph(executor->backend, executor->graph);
     if (status != TRELLIS_STATUS_OK) {
         return status;
     }

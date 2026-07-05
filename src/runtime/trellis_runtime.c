@@ -2,8 +2,12 @@
 
 #include "trellis.h"
 
+#include "ggml-cpu.h"
 #ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
+#endif
+#ifdef GGML_USE_VULKAN
+#include "ggml-vulkan.h"
 #endif
 
 #include <stdarg.h>
@@ -29,35 +33,77 @@ const char * trellis_status_string(trellis_status status) {
         case TRELLIS_STATUS_IO_ERROR: return "io error";
         case TRELLIS_STATUS_PARSE_ERROR: return "parse error";
         case TRELLIS_STATUS_OUT_OF_MEMORY: return "out of memory";
-        case TRELLIS_STATUS_CUDA_UNAVAILABLE: return "cuda unavailable";
+        case TRELLIS_STATUS_CUDA_UNAVAILABLE: return "backend unavailable";
         case TRELLIS_STATUS_NOT_FOUND: return "not found";
         case TRELLIS_STATUS_NOT_IMPLEMENTED: return "not implemented";
         default: return "unknown";
     }
 }
 
-trellis_status trellis_cuda_init(trellis_cuda_context * ctx, int device) {
+const char * trellis_backend_kind_name(trellis_backend_kind kind) {
+    switch (kind) {
+        case TRELLIS_BACKEND_CPU: return "cpu";
+        case TRELLIS_BACKEND_CUDA: return "cuda";
+        case TRELLIS_BACKEND_VULKAN: return "vulkan";
+        default: return "unknown";
+    }
+}
+
+trellis_status trellis_backend_kind_from_name(const char * name, trellis_backend_kind * kind_out) {
+    if (name == NULL || kind_out == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (strcmp(name, "cpu") == 0) {
+        *kind_out = TRELLIS_BACKEND_CPU;
+        return TRELLIS_STATUS_OK;
+    }
+    if (strcmp(name, "cuda") == 0) {
+        *kind_out = TRELLIS_BACKEND_CUDA;
+        return TRELLIS_STATUS_OK;
+    }
+    if (strcmp(name, "vulkan") == 0 || strcmp(name, "vk") == 0) {
+        *kind_out = TRELLIS_BACKEND_VULKAN;
+        return TRELLIS_STATUS_OK;
+    }
+    return TRELLIS_STATUS_INVALID_ARGUMENT;
+}
+
+trellis_status trellis_backend_init(trellis_backend_context * ctx, trellis_backend_kind kind, int device) {
     if (ctx == NULL || device < 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
 
     ctx->backend = NULL;
+    ctx->kind = kind;
     ctx->device = device;
 
-#ifdef GGML_USE_CUDA
     ggml_backend_load_all();
-    ctx->backend = ggml_backend_cuda_init(device);
-    if (ctx->backend == NULL) {
-        return TRELLIS_STATUS_CUDA_UNAVAILABLE;
-    }
-    return TRELLIS_STATUS_OK;
+
+    switch (kind) {
+        case TRELLIS_BACKEND_CPU:
+            ctx->backend = ggml_backend_cpu_init();
+            break;
+        case TRELLIS_BACKEND_CUDA:
+#ifdef GGML_USE_CUDA
+            ctx->backend = ggml_backend_cuda_init(device);
 #else
-    (void) device;
-    return TRELLIS_STATUS_CUDA_UNAVAILABLE;
+            return TRELLIS_STATUS_CUDA_UNAVAILABLE;
 #endif
+            break;
+        case TRELLIS_BACKEND_VULKAN:
+#ifdef GGML_USE_VULKAN
+            ctx->backend = ggml_backend_vk_init((size_t) device);
+#else
+            return TRELLIS_STATUS_CUDA_UNAVAILABLE;
+#endif
+            break;
+        default:
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    return ctx->backend == NULL ? TRELLIS_STATUS_CUDA_UNAVAILABLE : TRELLIS_STATUS_OK;
 }
 
-void trellis_cuda_free(trellis_cuda_context * ctx) {
+void trellis_backend_free(trellis_backend_context * ctx) {
     if (ctx == NULL) {
         return;
     }
@@ -65,22 +111,39 @@ void trellis_cuda_free(trellis_cuda_context * ctx) {
         ggml_backend_free(ctx->backend);
     }
     ctx->backend = NULL;
+    ctx->kind = TRELLIS_BACKEND_CPU;
     ctx->device = -1;
 }
 
-ggml_gallocr_t trellis_cuda_new_graph_allocator(const trellis_cuda_context * ctx) {
+ggml_gallocr_t trellis_backend_new_graph_allocator(const trellis_backend_context * ctx) {
     if (ctx == NULL || ctx->backend == NULL) {
         return NULL;
     }
     return ggml_gallocr_new(ggml_backend_get_default_buffer_type(ctx->backend));
 }
 
-trellis_status trellis_cuda_compute_graph(const trellis_cuda_context * ctx, struct ggml_cgraph * graph) {
+trellis_status trellis_backend_compute_graph(const trellis_backend_context * ctx, struct ggml_cgraph * graph) {
     if (ctx == NULL || ctx->backend == NULL || graph == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     enum ggml_status status = ggml_backend_graph_compute(ctx->backend, graph);
     return status == GGML_STATUS_SUCCESS ? TRELLIS_STATUS_OK : TRELLIS_STATUS_ERROR;
+}
+
+trellis_status trellis_cuda_init(trellis_cuda_context * ctx, int device) {
+    return trellis_backend_init(ctx, TRELLIS_BACKEND_CUDA, device);
+}
+
+void trellis_cuda_free(trellis_cuda_context * ctx) {
+    trellis_backend_free(ctx);
+}
+
+ggml_gallocr_t trellis_cuda_new_graph_allocator(const trellis_cuda_context * ctx) {
+    return trellis_backend_new_graph_allocator(ctx);
+}
+
+trellis_status trellis_cuda_compute_graph(const trellis_cuda_context * ctx, struct ggml_cgraph * graph) {
+    return trellis_backend_compute_graph(ctx, graph);
 }
 
 trellis_status trellis_make_model_path(
@@ -278,7 +341,7 @@ static void model_load_progress(
 }
 
 int trellis_load_tensor_store_f32(
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const char * label,
     const char * path,
     bool transpose_linear_weights,
@@ -288,7 +351,7 @@ int trellis_load_tensor_store_f32(
     if (result != NULL) {
         memset(result, 0, sizeof(*result));
     }
-    if (cuda == NULL || path == NULL || store == NULL) {
+    if (backend == NULL || path == NULL || store == NULL) {
         TRELLIS_ERROR("%s: invalid load request", label == NULL ? "model" : label);
         return 0;
     }
@@ -323,7 +386,7 @@ int trellis_load_tensor_store_f32(
     progress.start_us = ggml_time_us();
     status = trellis_tensor_store_load_safetensors_f32_ex(
         store,
-        cuda,
+        backend,
         path,
         transpose_linear_weights,
         &loaded,
@@ -342,9 +405,10 @@ int trellis_load_tensor_store_f32(
         result->seconds = elapsed_us <= 0 ? 0.0 : (double) elapsed_us / 1000000.0;
     }
     TRELLIS_INFO(
-        "%s: loaded %zu tensors to CUDA in %.2fs",
+        "%s: loaded %zu tensors to %s in %.2fs",
         label == NULL ? "model" : label,
         loaded,
+        trellis_backend_kind_name(backend->kind),
         elapsed_us <= 0 ? 0.0 : (double) elapsed_us / 1000000.0);
     return 1;
 }

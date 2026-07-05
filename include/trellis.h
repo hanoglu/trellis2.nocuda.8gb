@@ -15,6 +15,10 @@ extern "C" {
 
 #define TRELLIS_MAX_DIMS 8
 
+#ifndef TRELLIS_DEFAULT_GGML_BACKEND
+#define TRELLIS_DEFAULT_GGML_BACKEND "cuda"
+#endif
+
 typedef enum trellis_status {
     TRELLIS_STATUS_OK = 0,
     TRELLIS_STATUS_ERROR = 1,
@@ -29,10 +33,26 @@ typedef enum trellis_status {
 
 const char * trellis_status_string(trellis_status status);
 
-typedef struct trellis_cuda_context {
+typedef enum trellis_backend_kind {
+    TRELLIS_BACKEND_CPU = 0,
+    TRELLIS_BACKEND_CUDA = 1,
+    TRELLIS_BACKEND_VULKAN = 2,
+} trellis_backend_kind;
+
+typedef struct trellis_backend_context {
     ggml_backend_t backend;
+    trellis_backend_kind kind;
     int device;
-} trellis_cuda_context;
+} trellis_backend_context;
+
+typedef trellis_backend_context trellis_cuda_context;
+
+const char * trellis_backend_kind_name(trellis_backend_kind kind);
+trellis_status trellis_backend_kind_from_name(const char * name, trellis_backend_kind * kind_out);
+trellis_status trellis_backend_init(trellis_backend_context * ctx, trellis_backend_kind kind, int device);
+void trellis_backend_free(trellis_backend_context * ctx);
+ggml_gallocr_t trellis_backend_new_graph_allocator(const trellis_backend_context * ctx);
+trellis_status trellis_backend_compute_graph(const trellis_backend_context * ctx, struct ggml_cgraph * graph);
 
 trellis_status trellis_cuda_init(trellis_cuda_context * ctx, int device);
 void trellis_cuda_free(trellis_cuda_context * ctx);
@@ -111,7 +131,7 @@ struct ggml_tensor * trellis_tensor_store_get(
 
 trellis_status trellis_tensor_store_load_safetensors_f32(
     trellis_tensor_store * store,
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const char * safetensors_path,
     bool transpose_linear_weights,
     size_t * loaded_tensors);
@@ -131,7 +151,7 @@ typedef void (*trellis_tensor_store_load_progress_callback)(
 
 trellis_status trellis_tensor_store_load_safetensors_f32_ex(
     trellis_tensor_store * store,
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const char * safetensors_path,
     bool transpose_linear_weights,
     size_t * loaded_tensors,
@@ -170,7 +190,7 @@ void trellis_progress_steps(
     const char * detail);
 
 int trellis_load_tensor_store_f32(
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const char * label,
     const char * path,
     bool transpose_linear_weights,
@@ -318,7 +338,7 @@ trellis_status trellis_ss_decoder_bind_weights(
 trellis_status trellis_ss_decoder_forward_f32_host(
     const trellis_ss_decoder_weights * weights,
     const float * latent,
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     int batch,
     int latent_size,
     float ** logits_out,
@@ -527,7 +547,7 @@ struct ggml_tensor * trellis_dino_vit_forward(
     const trellis_dino_vit_weights * weights);
 
 trellis_status trellis_dino_image_forward_f32_host(
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const trellis_dino_vit_weights * weights,
     const float * image,
     int batch,
@@ -577,7 +597,9 @@ typedef struct trellis_image_to_obj_options {
     const char * gltf_path;
     const char * flow_override_path;
     const char * decoder_override_path;
+    const char * ggml_backend;
     int device;
+    int ggml_device;
     int sparse_structure_steps;
     int structured_latent_steps;
     int latent_size;

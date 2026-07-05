@@ -19,6 +19,8 @@ static void usage(const char * argv0) {
         "  --obj FILE              Output OBJ path with vertex colors; no UV texture files\n"
         "  --gltf FILE             Output glTF 2.0 path; writes .gltf + .bin + PBR PNG textures\n"
         "  --texture-size N        glTF texture size, default 1024\n"
+        "  --ggml-backend NAME     ggml graph backend: cuda, vulkan, or cpu; CMake default is " TRELLIS_DEFAULT_GGML_BACKEND "\n"
+        "  --ggml-device N         ggml backend device, default follows --device\n"
         "  --device N              CUDA device, default 0\n"
         "  --steps N               Sparse-structure and structured-latent Euler steps, default 12\n"
         "  --sparse-structure-steps N Override sparse-structure steps\n"
@@ -119,6 +121,7 @@ int main(int argc, char ** argv) {
     options.sparse_resolution = 32;
     options.seed = 1u;
     options.noise_seed = 18u;
+    options.ggml_device = -1;
     options.texture_size = 1024;
     options.rescale_t = 3.0f;
     options.guidance_strength = 7.5f;
@@ -139,6 +142,10 @@ int main(int argc, char ** argv) {
             options.obj_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--gltf") == 0) {
             options.gltf_path = arg_value(argc, argv, &i);
+        } else if (strcmp(argv[i], "--ggml-backend") == 0) {
+            options.ggml_backend = arg_value(argc, argv, &i);
+        } else if (strcmp(argv[i], "--ggml-device") == 0) {
+            if (!parse_int_arg(arg_value(argc, argv, &i), &options.ggml_device)) goto bad_args;
         } else if (strcmp(argv[i], "--flow") == 0) {
             options.flow_override_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--decoder") == 0) {
@@ -209,6 +216,7 @@ int main(int argc, char ** argv) {
         options.sparse_structure_steps <= 0 || options.structured_latent_steps <= 0 ||
         options.latent_size <= 0 || options.cond_resolution <= 0 ||
         options.sparse_resolution <= 0 || options.texture_size <= 0 ||
+        options.ggml_device < -1 ||
         (options.resolution != 512 && options.resolution != 1024)) {
         goto bad_args;
     }

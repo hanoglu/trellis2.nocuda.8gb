@@ -714,16 +714,51 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
         sparse_structure_image_path = temp_image;
     }
 
+    trellis_backend_context graph_backend;
     trellis_cuda_context cuda;
+    memset(&graph_backend, 0, sizeof(graph_backend));
     memset(&cuda, 0, sizeof(cuda));
-    trellis_status status = trellis_cuda_init(&cuda, options->device);
+    const char * graph_backend_name =
+        options->ggml_backend != NULL && options->ggml_backend[0] != '\0' ?
+            options->ggml_backend :
+            TRELLIS_DEFAULT_GGML_BACKEND;
+    trellis_backend_kind graph_backend_kind = TRELLIS_BACKEND_CUDA;
+    trellis_status status = trellis_backend_kind_from_name(graph_backend_name, &graph_backend_kind);
     if (status != TRELLIS_STATUS_OK) {
-        TRELLIS_ERROR("cuda: init failed: %s", trellis_status_string(status));
+        TRELLIS_ERROR("ggml backend: invalid backend '%s'", graph_backend_name);
         if (temp_image[0] != '\0') {
             unlink(temp_image);
         }
         return status;
     }
+    const int graph_device = options->ggml_device >= 0 ? options->ggml_device : options->device;
+    status = trellis_backend_init(&graph_backend, graph_backend_kind, graph_device);
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR(
+            "ggml backend: init %s device=%d failed: %s",
+            trellis_backend_kind_name(graph_backend_kind),
+            graph_device,
+            trellis_status_string(status));
+        if (temp_image[0] != '\0') {
+            unlink(temp_image);
+        }
+        return status;
+    }
+    TRELLIS_INFO(
+        "ggml backend: %s device=%d",
+        trellis_backend_kind_name(graph_backend.kind),
+        graph_backend.device);
+
+    status = trellis_cuda_init(&cuda, options->device);
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR("SparseUnet CUDA decoder: init device=%d failed: %s", options->device, trellis_status_string(status));
+        trellis_backend_free(&graph_backend);
+        if (temp_image[0] != '\0') {
+            unlink(temp_image);
+        }
+        return status;
+    }
+    TRELLIS_INFO("SparseUnet CUDA decoder: device=%d", cuda.device);
 
     trellis_sparse_structure_result sparse_structure_result;
     trellis_structured_latent shape_latent;
@@ -755,6 +790,7 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     sparse_structure.flow_block_parts_override = options->flow_block_parts_override;
     sparse_structure.flow_no_rope = options->flow_no_rope;
     sparse_structure.voxel_threshold = 0.0f;
+    sparse_structure.backend = &graph_backend;
     sparse_structure.cuda = &cuda;
 
     status = trellis_pipeline_run_sparse_structure(&sparse_structure, &sparse_structure_result);
@@ -806,6 +842,7 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     structured_latent.flow_no_rope = options->flow_no_rope;
     structured_latent.emulate_bf16_blocks = options->emulate_bf16_blocks;
     structured_latent.use_ggml_flash_attn = options->use_ggml_flash_attn;
+    structured_latent.backend = &graph_backend;
     structured_latent.cuda = &cuda;
 
     status = trellis_pipeline_run_structured_latent(&structured_latent, &shape_latent);
@@ -858,6 +895,7 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     texture_options.flow_no_rope = options->flow_no_rope;
     texture_options.emulate_bf16_blocks = options->emulate_bf16_blocks;
     texture_options.use_ggml_flash_attn = options->use_ggml_flash_attn;
+    texture_options.backend = &graph_backend;
     texture_options.cuda = &cuda;
 
     status = trellis_pipeline_run_structured_latent(&texture_options, &texture_latent);
@@ -922,6 +960,7 @@ cleanup:
     trellis_structured_latent_free(&shape_latent);
     trellis_sparse_structure_result_free(&sparse_structure_result);
     trellis_cuda_free(&cuda);
+    trellis_backend_free(&graph_backend);
     if (temp_image[0] != '\0') {
         unlink(temp_image);
     }

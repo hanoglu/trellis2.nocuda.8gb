@@ -444,7 +444,7 @@ struct ggml_tensor * trellis_dino_vit_forward(
 }
 
 trellis_status trellis_dino_image_forward_f32_host(
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const trellis_dino_vit_weights * weights,
     const float * image,
     int batch,
@@ -454,7 +454,7 @@ trellis_status trellis_dino_image_forward_f32_host(
     const float * sin_phase_data,
     float ** tokens_out,
     int * n_tokens_out) {
-    if (cuda == NULL || cuda->backend == NULL || weights == NULL || image == NULL ||
+    if (backend == NULL || backend->backend == NULL || weights == NULL || image == NULL ||
         tokens_out == NULL || n_tokens_out == NULL ||
         batch <= 0 || image_h <= 0 || image_w <= 0 || weights->patch_size <= 0 ||
         image_h % weights->patch_size != 0 || image_w % weights->patch_size != 0 ||
@@ -531,7 +531,7 @@ trellis_status trellis_dino_image_forward_f32_host(
     }
     ggml_build_forward_expand(graph, y);
 
-    ggml_gallocr_t alloc = trellis_cuda_new_graph_allocator(cuda);
+    ggml_gallocr_t alloc = trellis_backend_new_graph_allocator(backend);
     if (alloc == NULL || !ggml_gallocr_alloc_graph(alloc, graph)) {
         if (alloc != NULL) {
             ggml_gallocr_free(alloc);
@@ -546,7 +546,7 @@ trellis_status trellis_dino_image_forward_f32_host(
     ggml_backend_tensor_set(cos_phase, cos_phase_data, 0, ggml_nbytes(cos_phase));
     ggml_backend_tensor_set(sin_phase, sin_phase_data, 0, ggml_nbytes(sin_phase));
 
-    trellis_status status = trellis_cuda_compute_graph(cuda, graph);
+    trellis_status status = trellis_backend_compute_graph(backend, graph);
     if (status == TRELLIS_STATUS_OK) {
         float * out = (float *) malloc((size_t) ggml_nelements(y) * sizeof(float));
         if (out == NULL) {

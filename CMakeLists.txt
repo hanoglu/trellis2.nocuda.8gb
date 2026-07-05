@@ -16,13 +16,24 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(TRELLIS2_C_BUILD_TESTS "Build trellis2.c tests" ON)
 option(TRELLIS2_C_BUILD_TOOLS "Build trellis2.c command line tools" ON)
 option(TRELLIS2_C_BUILD_RAYLIB_VIEWER "Build the raylib snapshot viewers" ON)
+set(TRELLIS2_C_GGML_BACKEND "cuda" CACHE STRING "Default ggml graph backend: cuda, vulkan, or cpu")
+set_property(CACHE TRELLIS2_C_GGML_BACKEND PROPERTY STRINGS cuda vulkan cpu)
 
-# TRELLIS.2 inference is CUDA-only in this port. CPU is still built by ggml as a
-# small runtime dependency, but all trellis2.c execution entry points initialize
-# ggml's CUDA backend and fail when CUDA is unavailable.
-set(GGML_CUDA ON CACHE BOOL "Build ggml CUDA backend" FORCE)
+# SparseUnetVaeDecoder still uses custom CUDA kernels in this port. The dense
+# ggml graphs can use any ggml backend enabled here, similar to llama.cpp.
+set(GGML_CUDA ON CACHE BOOL "Build ggml CUDA backend")
+set(GGML_VULKAN OFF CACHE BOOL "Build ggml Vulkan backend")
 set(GGML_NATIVE OFF CACHE BOOL "Avoid host-specific codegen in the embedded ggml build" FORCE)
 set(GGML_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
+if (TRELLIS2_C_GGML_BACKEND STREQUAL "cuda" AND NOT GGML_CUDA)
+    message(FATAL_ERROR "TRELLIS2_C_GGML_BACKEND=cuda requires -DGGML_CUDA=ON")
+endif()
+if (TRELLIS2_C_GGML_BACKEND STREQUAL "vulkan" AND NOT GGML_VULKAN)
+    message(FATAL_ERROR "TRELLIS2_C_GGML_BACKEND=vulkan requires -DGGML_VULKAN=ON")
+endif()
+if (NOT TRELLIS2_C_GGML_BACKEND MATCHES "^(cuda|vulkan|cpu)$")
+    message(FATAL_ERROR "TRELLIS2_C_GGML_BACKEND must be one of: cuda, vulkan, cpu")
+endif()
 
 add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/3rd/ggml" "${CMAKE_CURRENT_BINARY_DIR}/ggml")
 
@@ -75,8 +86,15 @@ if (UNIX)
     target_link_libraries(trellis2_c PUBLIC m)
 endif()
 
+target_compile_definitions(trellis2_c PUBLIC
+    TRELLIS_DEFAULT_GGML_BACKEND="${TRELLIS2_C_GGML_BACKEND}"
+    TRELLIS_HAS_CUDA_DECODER=1
+)
 if (GGML_CUDA)
-    target_compile_definitions(trellis2_c PUBLIC GGML_USE_CUDA TRELLIS_CUDA_ONLY=1)
+    target_compile_definitions(trellis2_c PUBLIC GGML_USE_CUDA)
+endif()
+if (GGML_VULKAN)
+    target_compile_definitions(trellis2_c PUBLIC GGML_USE_VULKAN)
 endif()
 
 if (TRELLIS2_C_BUILD_TESTS)

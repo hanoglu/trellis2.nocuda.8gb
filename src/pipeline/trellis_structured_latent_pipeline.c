@@ -216,7 +216,7 @@ static int make_slat_flow_path(
 }
 
 static int load_slat_flow(
-    const trellis_cuda_context * cuda,
+    const trellis_backend_context * backend,
     const char * path,
     trellis_model_component component,
     const char * label,
@@ -224,7 +224,7 @@ static int load_slat_flow(
     trellis_dit_flow_weights * flow) {
     char load_label[128];
     snprintf(load_label, sizeof(load_label), "structured-latent %s flow", label);
-    if (!trellis_load_tensor_store_f32(cuda, load_label, path, true, 64, store, NULL)) {
+    if (!trellis_load_tensor_store_f32(backend, load_label, path, true, 64, store, NULL)) {
         return 0;
     }
     char issue[256];
@@ -324,7 +324,11 @@ trellis_status trellis_pipeline_run_structured_latent(
     }
     if (options == NULL || latent_out == NULL || options->model_dir == NULL ||
         options->coords_bxyz == NULL || options->n_coords <= 0 ||
-        options->cond == NULL || options->cond_tokens <= 0 || options->cuda == NULL) {
+        options->cond == NULL || options->cond_tokens <= 0) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    const trellis_backend_context * backend = options->backend != NULL ? options->backend : options->cuda;
+    if (backend == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
 
@@ -386,7 +390,7 @@ trellis_status trellis_pipeline_run_structured_latent(
         (long long) options->n_coords,
         (unsigned) options->noise_seed);
 
-    if (!load_slat_flow(options->cuda, flow_path, component, label, &flow_store, &flow)) {
+    if (!load_slat_flow(backend, flow_path, component, label, &flow_store, &flow)) {
         goto cleanup;
     }
     const int state_channels = flow.out_channels;
@@ -533,7 +537,7 @@ trellis_status trellis_pipeline_run_structured_latent(
     const float * neg_context = options->neg_cond != NULL ? options->neg_cond : neg_cond;
     status = trellis_dit_flow_executor_init_single(
         &flow_executor_cond,
-        options->cuda,
+        backend,
         &flow,
         options->n_coords,
         options->cond_tokens,
@@ -543,7 +547,7 @@ trellis_status trellis_pipeline_run_structured_latent(
     if (status == TRELLIS_STATUS_OK) {
         status = trellis_dit_flow_executor_init_single(
             &flow_executor_uncond,
-            options->cuda,
+            backend,
             &flow,
             options->n_coords,
             options->cond_tokens,
