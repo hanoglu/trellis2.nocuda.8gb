@@ -1,0 +1,310 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint op;
+    uint n;
+    uint in_channels;
+    uint out_channels;
+    uint total;
+    uint table_mask;
+    uint flags;
+    float eps;
+} p;
+
+layout(binding = 0) readonly buffer F0 { float f0[]; };
+layout(binding = 1) readonly buffer F1 { float f1[]; };
+layout(binding = 2) readonly buffer F2 { float f2[]; };
+layout(binding = 3) buffer F3 { float f3[]; };
+layout(binding = 4) readonly buffer I0 { int i0[]; };
+layout(binding = 5) buffer I1 { int i1[]; };
+layout(binding = 6) buffer U0 { uint u0[]; };
+layout(binding = 7) buffer I2 { int i2[]; };
+layout(binding = 8) buffer I3 { int i3[]; };
+layout(binding = 9) buffer I4 { int i4[]; };
+
+const uint RULEBOOK_HASH_BASE = 32u;
+
+uint hash_u64(uint lo, uint hi) {
+    uint x = lo ^ (hi * 0x9e3779b9u);
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+uint hash_u32(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+uint pack_coord_key(int b, int x, int y, int z) {
+    uint raw =
+        ((uint(b) & 3u) << 30) |
+        ((uint(x) & 1023u) << 20) |
+        ((uint(y) & 1023u) << 10) |
+        (uint(z) & 1023u);
+    return raw + 1u;
+}
+
+void pack_coord(int b, int x, int y, int z, out uint lo, out uint hi) {
+    hi = (uint(b) & 0xffffu) << 16 | (uint(x) & 0xffffu);
+    lo = (uint(y) & 0xffffu) << 16 | (uint(z) & 0xffffu);
+    lo += 1u;
+    if (lo == 0u) {
+        hi += 1u;
+    }
+}
+
+int find_coord(int b, int x, int y, int z) {
+    uint lo;
+    uint hi;
+    pack_coord(b, x, y, z, lo, hi);
+    uint slot = hash_u64(lo, hi) & p.table_mask;
+    for (uint probe = 0; probe <= p.table_mask; ++probe) {
+        uint key_lo = u0[2u * slot + 0u];
+        uint key_hi = u0[2u * slot + 1u];
+        if (key_lo == lo && key_hi == hi) {
+            return i1[slot];
+        }
+        if (key_lo == 0u && key_hi == 0u) {
+            return -1;
+        }
+        slot = (slot + 1u) & p.table_mask;
+    }
+    return -1;
+}
+
+int find_coord_key(int b, int x, int y, int z) {
+    uint key = pack_coord_key(b, x, y, z);
+    uint slot = hash_u32(key) & p.table_mask;
+    for (uint probe = 0; probe <= p.table_mask; ++probe) {
+        uint found = u0[RULEBOOK_HASH_BASE + slot];
+        if (found == key) {
+            return i1[slot];
+        }
+        if (found == 0u) {
+            return -1;
+        }
+        slot = (slot + 1u) & p.table_mask;
+    }
+    return -1;
+}
+
+void op_linear(uint idx) {
+    if (idx >= p.total) return;
+    uint row = idx / p.out_channels;
+    uint oc = idx - row * p.out_channels;
+    float acc = (p.flags & 1u) != 0u ? f2[oc] : 0.0;
+    uint x_base = row * p.in_channels;
+    uint w_base = oc * p.in_channels;
+    for (uint ic = 0; ic < p.in_channels; ++ic) {
+        acc += f0[x_base + ic] * f1[w_base + ic];
+    }
+    f3[idx] = acc;
+}
+
+void op_row_norm(uint row, bool apply_silu) {
+    if (row >= p.n) return;
+    uint base = row * p.in_channels;
+    float mean = 0.0;
+    for (uint c = 0; c < p.in_channels; ++c) {
+        mean += f0[base + c];
+    }
+    mean /= float(p.in_channels);
+    float var = 0.0;
+    for (uint c = 0; c < p.in_channels; ++c) {
+        float d = f0[base + c] - mean;
+        var += d * d;
+    }
+    float inv_std = inversesqrt(var / float(p.in_channels) + p.eps);
+    for (uint c = 0; c < p.in_channels; ++c) {
+        float v = (f0[base + c] - mean) * inv_std;
+        if ((p.flags & 1u) != 0u) v *= f1[c];
+        if ((p.flags & 2u) != 0u) v += f2[c];
+        if (apply_silu) v = v / (1.0 + exp(-v));
+        f3[base + c] = v;
+    }
+}
+
+void op_silu(uint idx) {
+    if (idx >= p.total) return;
+    float v = f3[idx];
+    f3[idx] = v / (1.0 + exp(-v));
+}
+
+void op_add(uint idx) {
+    if (idx >= p.total) return;
+    f3[idx] = f0[idx] + f1[idx];
+}
+
+void op_sparse_conv(uint idx) {
+    if (idx >= p.total) return;
+    uint row = idx / p.out_channels;
+    uint oc = idx - row * p.out_channels;
+    int b = i0[4u * row + 0u];
+    int x = i0[4u * row + 1u];
+    int y = i0[4u * row + 2u];
+    int z = i0[4u * row + 3u];
+    float acc = (p.flags & 1u) != 0u ? f2[oc] : 0.0;
+    for (uint kd = 0u; kd < 3u; ++kd) {
+        int nx = x + int(kd) - 1;
+        for (uint kh = 0u; kh < 3u; ++kh) {
+            int ny = y + int(kh) - 1;
+            for (uint kw = 0u; kw < 3u; ++kw) {
+                int nz = z + int(kw) - 1;
+                int src = find_coord(b, nx, ny, nz);
+                if (src < 0) continue;
+                uint offset = (kd * 3u + kh) * 3u + kw;
+                uint x_base = uint(src) * p.in_channels;
+                uint w_base = (oc * 27u + offset) * p.in_channels;
+                for (uint ic = 0u; ic < p.in_channels; ++ic) {
+                    acc += f0[x_base + ic] * f1[w_base + ic];
+                }
+            }
+        }
+    }
+    f3[idx] = acc;
+}
+
+void op_c2s_gather(uint idx) {
+    if (idx >= p.total) return;
+    uint c = idx % p.out_channels;
+    uint row = idx / p.out_channels;
+    int parent = i0[row];
+    int subidx = i1[row];
+    f3[idx] = f0[(uint(parent) * 8u + uint(subidx)) * p.out_channels + c];
+}
+
+void op_skip_repeat(uint idx) {
+    if (idx >= p.total) return;
+    uint c = idx % p.out_channels;
+    uint row = idx / p.out_channels;
+    uint parent = uint(i0[row]);
+    uint subidx = uint(i1[row]);
+    uint repeat = (8u * p.out_channels + p.in_channels - 1u) / p.in_channels;
+    uint ic = (subidx * p.out_channels + c) / repeat;
+    if (ic >= p.in_channels) {
+        ic = p.in_channels - 1u;
+    }
+    f3[idx] = f0[parent * p.in_channels + ic];
+}
+
+void op_fill_bias(uint idx) {
+    if (idx >= p.total) return;
+    uint oc = idx % p.out_channels;
+    f3[idx] = (p.flags & 1u) != 0u ? f2[oc] : 0.0;
+}
+
+void op_rulebook_hash_insert(uint row) {
+    if (row >= p.n) return;
+    int b = i0[4u * row + 0u];
+    int x = i0[4u * row + 1u];
+    int y = i0[4u * row + 2u];
+    int z = i0[4u * row + 3u];
+    uint key = pack_coord_key(b, x, y, z);
+    uint slot = hash_u32(key) & p.table_mask;
+    for (uint probe = 0; probe <= p.table_mask; ++probe) {
+        uint old = atomicCompSwap(u0[RULEBOOK_HASH_BASE + slot], 0u, key);
+        if (old == 0u || old == key) {
+            i1[slot] = int(row);
+            return;
+        }
+        slot = (slot + 1u) & p.table_mask;
+    }
+}
+
+void op_rulebook_fill(uint idx) {
+    if (idx >= p.total) return;
+    uint row = idx / 27u;
+    uint offset = idx - row * 27u;
+    int b = i0[4u * row + 0u];
+    int x = i0[4u * row + 1u];
+    int y = i0[4u * row + 2u];
+    int z = i0[4u * row + 3u];
+    uint kd = offset / 9u;
+    uint rem = offset - kd * 9u;
+    uint kh = rem / 3u;
+    uint kw = rem - kh * 3u;
+    int src = find_coord_key(b, x + int(kd) - 1, y + int(kh) - 1, z + int(kw) - 1);
+    if (src < 0) return;
+    uint pos = atomicAdd(u0[offset], 1u);
+    uint out_idx = offset * p.n + pos;
+    i2[out_idx] = src;
+    i3[out_idx] = int(row);
+}
+
+void op_c2s_count(uint row) {
+    if (row >= p.n) return;
+    int count = 0;
+    uint base = row * 8u;
+    for (uint s = 0u; s < 8u; ++s) {
+        if (f0[base + s] > 0.0) {
+            ++count;
+        }
+    }
+    i1[row] = count;
+}
+
+void op_c2s_fill(uint idx) {
+    if (idx >= p.total) return;
+    uint row = idx / 8u;
+    uint sub = idx - row * 8u;
+    uint base = row * 8u;
+    if (f0[base + sub] <= 0.0) return;
+    int local = 0;
+    for (uint s = 0u; s < sub; ++s) {
+        if (f0[base + s] > 0.0) {
+            ++local;
+        }
+    }
+    uint pos = uint(i1[row] + local);
+    int b = i0[4u * row + 0u];
+    int x = i0[4u * row + 1u];
+    int y = i0[4u * row + 2u];
+    int z = i0[4u * row + 3u];
+    i2[4u * pos + 0u] = b;
+    i2[4u * pos + 1u] = x * 2 + int(sub & 1u);
+    i2[4u * pos + 2u] = y * 2 + int((sub >> 1u) & 1u);
+    i2[4u * pos + 3u] = z * 2 + int((sub >> 2u) & 1u);
+    i3[pos] = int(row);
+    i4[pos] = int(sub);
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (p.op == 1u) {
+        op_linear(idx);
+    } else if (p.op == 2u) {
+        op_row_norm(idx, false);
+    } else if (p.op == 3u) {
+        op_silu(idx);
+    } else if (p.op == 4u) {
+        op_add(idx);
+    } else if (p.op == 5u) {
+        op_sparse_conv(idx);
+    } else if (p.op == 6u) {
+        op_c2s_gather(idx);
+    } else if (p.op == 7u) {
+        op_skip_repeat(idx);
+    } else if (p.op == 8u) {
+        op_fill_bias(idx);
+    } else if (p.op == 9u) {
+        op_rulebook_hash_insert(idx);
+    } else if (p.op == 10u) {
+        op_rulebook_fill(idx);
+    } else if (p.op == 11u) {
+        op_c2s_count(idx);
+    } else if (p.op == 12u) {
+        op_c2s_fill(idx);
+    } else if (p.op == 13u) {
+        op_row_norm(idx, true);
+    }
+}

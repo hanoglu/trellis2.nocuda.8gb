@@ -1,0 +1,129 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint op;
+    uint n;
+    uint in_channels;
+    uint out_channels;
+    uint total;
+    uint table_mask;
+    uint flags;
+    float eps;
+} p;
+
+layout(binding = 0) readonly buffer F0 { float f0[]; };
+layout(binding = 1) readonly buffer F1 { float f1[]; };
+layout(binding = 2) readonly buffer F2 { float f2[]; };
+layout(binding = 3) buffer F3 { float f3[]; };
+layout(binding = 4) readonly buffer I0 { int i0[]; };
+layout(binding = 5) readonly buffer I1 { int i1[]; };
+layout(binding = 6) readonly buffer U0 { uint u0[]; };
+
+const uint TILE_K = 64u;
+
+shared float x_tile[16][64];
+shared float w_tile[16][64];
+
+void op_linear() {
+    uint oc = gl_GlobalInvocationID.x;
+    uint row_tile = gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y;
+    uint row = row_tile * 16u + gl_LocalInvocationID.y;
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint local_index = ly * 16u + lx;
+    float acc = 0.0;
+
+    for (uint c0 = 0u; c0 < p.in_channels; c0 += TILE_K) {
+        for (uint load = local_index; load < 16u * TILE_K; load += 16u * 16u) {
+            uint r = load / TILE_K;
+            uint kc = load - r * TILE_K;
+            uint src_row = row_tile * 16u + r;
+            uint c = c0 + kc;
+            x_tile[r][kc] = (src_row < p.n && c < p.in_channels) ?
+                f0[src_row * p.in_channels + c] : 0.0;
+        }
+        for (uint load = local_index; load < 16u * TILE_K; load += 16u * 16u) {
+            uint o = load / TILE_K;
+            uint kc = load - o * TILE_K;
+            uint src_oc = gl_WorkGroupID.x * 16u + o;
+            uint c = c0 + kc;
+            w_tile[o][kc] = (src_oc < p.out_channels && c < p.in_channels) ?
+                f1[src_oc * p.in_channels + c] : 0.0;
+        }
+        barrier();
+        if (row < p.n && oc < p.out_channels) {
+            for (uint kc = 0u; kc < TILE_K; ++kc) {
+                acc += x_tile[ly][kc] * w_tile[lx][kc];
+            }
+        }
+        barrier();
+    }
+
+    if (row < p.n && oc < p.out_channels) {
+        if ((p.flags & 1u) != 0u) {
+            acc += f2[oc];
+        }
+        if (p.op == 3u) {
+            acc = acc / (1.0 + exp(-acc));
+        }
+        f3[row * p.out_channels + oc] = acc;
+    }
+}
+
+void op_sparse_conv_offset() {
+    uint oc = gl_GlobalInvocationID.x;
+    uint pair_tile = gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y;
+    uint pair = pair_tile * 16u + gl_LocalInvocationID.y;
+    uint pair_base = p.flags;
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint local_index = ly * 16u + lx;
+    uint offset = p.table_mask;
+    float acc = 0.0;
+
+    for (uint c0 = 0u; c0 < p.in_channels; c0 += TILE_K) {
+        for (uint load = local_index; load < 16u * TILE_K; load += 16u * 16u) {
+            uint r = load / TILE_K;
+            uint kc = load - r * TILE_K;
+            uint src_pair = pair_tile * 16u + r;
+            uint c = c0 + kc;
+            if (src_pair < p.n && c < p.in_channels) {
+                uint src = uint(i0[pair_base + src_pair]);
+                x_tile[r][kc] = f0[src * p.in_channels + c];
+            } else {
+                x_tile[r][kc] = 0.0;
+            }
+        }
+        for (uint load = local_index; load < 16u * TILE_K; load += 16u * 16u) {
+            uint o = load / TILE_K;
+            uint kc = load - o * TILE_K;
+            uint src_oc = gl_WorkGroupID.x * 16u + o;
+            uint c = c0 + kc;
+            w_tile[o][kc] = (src_oc < p.out_channels && c < p.in_channels) ?
+                f1[(src_oc * 27u + offset) * p.in_channels + c] : 0.0;
+        }
+        barrier();
+        if (pair < p.n && oc < p.out_channels) {
+            for (uint kc = 0u; kc < TILE_K; ++kc) {
+                acc += x_tile[ly][kc] * w_tile[lx][kc];
+            }
+        }
+        barrier();
+    }
+
+    if (pair < p.n && oc < p.out_channels) {
+        uint dst = uint(i1[pair_base + pair]);
+        uint out_idx = dst * p.out_channels + oc;
+        f3[out_idx] = f3[out_idx] + acc;
+    }
+}
+
+void main() {
+    if (p.op == 1u || p.op == 3u) {
+        op_linear();
+    } else if (p.op == 2u) {
+        op_sparse_conv_offset();
+    }
+}

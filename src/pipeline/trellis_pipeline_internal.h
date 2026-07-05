@@ -92,6 +92,8 @@ typedef struct trellis_pipeline_mesh_options {
     int decode_max_levels;
     int64_t decode_max_input_tokens;
     const trellis_cuda_context * cuda;
+    trellis_sparse_backend_kind sparse_backend_kind;
+    int sparse_device;
 } trellis_pipeline_mesh_options;
 
 trellis_status trellis_pipeline_decode_shape_latent_mesh(
@@ -116,6 +118,8 @@ typedef struct trellis_pipeline_texture_options {
     int decode_max_levels;
     int64_t decode_max_input_tokens;
     const trellis_cuda_context * cuda;
+    trellis_sparse_backend_kind sparse_backend_kind;
+    int sparse_device;
 } trellis_pipeline_texture_options;
 
 trellis_status trellis_pipeline_decode_texture_latent_voxels(

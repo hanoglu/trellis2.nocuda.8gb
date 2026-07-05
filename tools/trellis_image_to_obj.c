@@ -21,6 +21,7 @@ static void usage(const char * argv0) {
         "  --texture-size N        glTF texture size, default 1024\n"
         "  --ggml-backend NAME     ggml graph backend: cuda, vulkan, or cpu; CMake default is " TRELLIS_DEFAULT_GGML_BACKEND "\n"
         "  --ggml-device N         ggml backend device, default follows --device\n"
+        "  --sparse-backend NAME   SparseUnet decoder backend: cuda, cpu, or vulkan; default cuda\n"
         "  --device N              CUDA device, default 0\n"
         "  --steps N               Sparse-structure and structured-latent Euler steps, default 12\n"
         "  --sparse-structure-steps N Override sparse-structure steps\n"
@@ -146,6 +147,8 @@ int main(int argc, char ** argv) {
             options.ggml_backend = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--ggml-device") == 0) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.ggml_device)) goto bad_args;
+        } else if (strcmp(argv[i], "--sparse-backend") == 0) {
+            options.sparse_backend = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--flow") == 0) {
             options.flow_override_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--decoder") == 0) {

@@ -39,6 +39,12 @@ typedef enum trellis_backend_kind {
     TRELLIS_BACKEND_VULKAN = 2,
 } trellis_backend_kind;
 
+typedef enum trellis_sparse_backend_kind {
+    TRELLIS_SPARSE_BACKEND_CUDA = 0,
+    TRELLIS_SPARSE_BACKEND_CPU = 1,
+    TRELLIS_SPARSE_BACKEND_VULKAN = 2,
+} trellis_sparse_backend_kind;
+
 typedef struct trellis_backend_context {
     ggml_backend_t backend;
     trellis_backend_kind kind;
@@ -457,6 +463,25 @@ trellis_status trellis_sparse_unet_vae_decoder_forward_f32_host(
     int64_t * n_out,
     int * channels_out);
 
+typedef struct trellis_sparse_unet_vae_decoder_forward_options {
+    trellis_sparse_backend_kind backend_kind;
+    int device;
+    int max_levels;
+    const trellis_sparse_c2s_guides * guide_subs;
+    trellis_sparse_c2s_guides * return_subs;
+} trellis_sparse_unet_vae_decoder_forward_options;
+
+trellis_status trellis_sparse_unet_vae_decoder_forward_backend_f32_host(
+    const trellis_sparse_unet_vae_decoder_weights * weights,
+    const int32_t * coords,
+    const float * feats,
+    int64_t n,
+    const trellis_sparse_unet_vae_decoder_forward_options * options,
+    int32_t ** coords_out,
+    float ** feats_out,
+    int64_t * n_out,
+    int * channels_out);
+
 trellis_status trellis_shape_decoder_forward_f32_host(
     const trellis_shape_decoder_weights * weights,
     const int32_t * coords,
@@ -598,6 +623,7 @@ typedef struct trellis_image_to_obj_options {
     const char * flow_override_path;
     const char * decoder_override_path;
     const char * ggml_backend;
+    const char * sparse_backend;
     int device;
     int ggml_device;
     int sparse_structure_steps;

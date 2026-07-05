@@ -35,6 +35,13 @@ if (NOT TRELLIS2_C_GGML_BACKEND MATCHES "^(cuda|vulkan|cpu)$")
     message(FATAL_ERROR "TRELLIS2_C_GGML_BACKEND must be one of: cuda, vulkan, cpu")
 endif()
 
+if (GGML_VULKAN)
+    find_package(Vulkan REQUIRED)
+    if (NOT Vulkan_GLSLC_EXECUTABLE)
+        find_program(Vulkan_GLSLC_EXECUTABLE glslc REQUIRED)
+    endif()
+endif()
+
 add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/3rd/ggml" "${CMAKE_CURRENT_BINARY_DIR}/ggml")
 
 add_library(xatlas STATIC
@@ -68,13 +75,61 @@ add_library(trellis2_c
     src/export/trellis_gltf_export.c
     src/io/trellis_safetensors.c
     src/model/trellis_sparse_unet_vae_decoder.c
+    src/model/trellis_sparse_unet_vae_decoder_exec.c
+    src/model/sparse/trellis_sparse_cpu.c
+    src/model/sparse/trellis_sparse_vulkan.c
     src/io/trellis_weights.c
 )
+
+if (GGML_VULKAN)
+    set(TRELLIS_SPARSE_VK_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_sparse_vk.spv")
+    set(TRELLIS_SPARSE_VK_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_sparse_vk_spv.h")
+    set(TRELLIS_SPARSE_VK_MAT_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_sparse_vk_mat.spv")
+    set(TRELLIS_SPARSE_VK_MAT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_sparse_vk_mat_spv.h")
+    add_custom_command(
+        OUTPUT "${TRELLIS_SPARSE_VK_SPV}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
+                "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse/trellis_sparse_vk.comp"
+                -o "${TRELLIS_SPARSE_VK_SPV}"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse/trellis_sparse_vk.comp"
+        COMMENT "Compile TRELLIS sparse Vulkan shader")
+    add_custom_command(
+        OUTPUT "${TRELLIS_SPARSE_VK_MAT_SPV}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
+                "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse/trellis_sparse_vk_mat.comp"
+                -o "${TRELLIS_SPARSE_VK_MAT_SPV}"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse/trellis_sparse_vk_mat.comp"
+        COMMENT "Compile TRELLIS sparse Vulkan tiled matmul shader")
+    add_custom_command(
+        OUTPUT "${TRELLIS_SPARSE_VK_HEADER}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND "${CMAKE_COMMAND}"
+                -DINPUT="${TRELLIS_SPARSE_VK_SPV}"
+                -DOUTPUT="${TRELLIS_SPARSE_VK_HEADER}"
+                -DSYMBOL=trellis_sparse_vk_spv
+                -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        DEPENDS "${TRELLIS_SPARSE_VK_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        COMMENT "Generate TRELLIS sparse Vulkan shader header")
+    add_custom_command(
+        OUTPUT "${TRELLIS_SPARSE_VK_MAT_HEADER}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND "${CMAKE_COMMAND}"
+                -DINPUT="${TRELLIS_SPARSE_VK_MAT_SPV}"
+                -DOUTPUT="${TRELLIS_SPARSE_VK_MAT_HEADER}"
+                -DSYMBOL=trellis_sparse_vk_mat_spv
+                -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        DEPENDS "${TRELLIS_SPARSE_VK_MAT_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        COMMENT "Generate TRELLIS sparse Vulkan tiled matmul shader header")
+    add_custom_target(trellis_sparse_vk_shader DEPENDS "${TRELLIS_SPARSE_VK_HEADER}" "${TRELLIS_SPARSE_VK_MAT_HEADER}")
+    add_dependencies(trellis2_c trellis_sparse_vk_shader)
+endif()
 
 target_include_directories(trellis2_c
     PUBLIC
         "${CMAKE_CURRENT_LIST_DIR}/include"
     PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/model"
+        "${CMAKE_CURRENT_BINARY_DIR}/generated"
         "${CMAKE_CURRENT_LIST_DIR}/3rd/cgltf"
         "${CMAKE_CURRENT_LIST_DIR}/3rd/stb"
         "${CMAKE_CURRENT_LIST_DIR}/3rd/xatlas/source/xatlas"
@@ -82,6 +137,9 @@ target_include_directories(trellis2_c
 
 find_package(CUDAToolkit REQUIRED)
 target_link_libraries(trellis2_c PUBLIC ggml xatlas CUDA::cudart CUDA::cublas)
+if (GGML_VULKAN)
+    target_link_libraries(trellis2_c PRIVATE Vulkan::Vulkan)
+endif()
 if (UNIX)
     target_link_libraries(trellis2_c PUBLIC m)
 endif()
@@ -95,6 +153,7 @@ if (GGML_CUDA)
 endif()
 if (GGML_VULKAN)
     target_compile_definitions(trellis2_c PUBLIC GGML_USE_VULKAN)
+    target_compile_definitions(trellis2_c PRIVATE TRELLIS_HAS_SPARSE_VULKAN=1)
 endif()
 
 if (TRELLIS2_C_BUILD_TESTS)
@@ -118,6 +177,19 @@ if (TRELLIS2_C_BUILD_TESTS)
     target_link_libraries(trellis2_c_backend_ops_tests PRIVATE trellis2_c ggml)
     add_test(NAME trellis2_c_backend_ops_tests COMMAND trellis2_c_backend_ops_tests)
     set_tests_properties(trellis2_c_backend_ops_tests PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(trellis2_c_sparse_decoder_backend_tests
+        tests/test_sparse_decoder_backend.c
+    )
+    target_include_directories(trellis2_c_sparse_decoder_backend_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/model")
+    target_link_libraries(trellis2_c_sparse_decoder_backend_tests PRIVATE trellis2_c ggml)
+    add_test(NAME trellis2_c_sparse_decoder_backend_cpu_tests COMMAND trellis2_c_sparse_decoder_backend_tests cpu)
+    set_tests_properties(trellis2_c_sparse_decoder_backend_cpu_tests PROPERTIES SKIP_RETURN_CODE 77)
+    if (GGML_VULKAN)
+        add_test(NAME trellis2_c_sparse_decoder_backend_vulkan_tests COMMAND trellis2_c_sparse_decoder_backend_tests vulkan)
+        set_tests_properties(trellis2_c_sparse_decoder_backend_vulkan_tests PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 endif()
 
 if (TRELLIS2_C_BUILD_TOOLS)
