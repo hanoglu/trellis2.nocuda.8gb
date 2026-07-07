@@ -1,0 +1,52 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Faces {
+    int faces[];
+};
+
+layout(binding = 1) readonly buffer Vertices {
+    float vertices[];
+};
+
+layout(binding = 2) readonly buffer Parents {
+    uint parents[];
+};
+
+layout(binding = 3) buffer RepairData {
+    uint repair_data[];
+};
+
+uint find_root(uint x) {
+    uint p0 = parents[x];
+    for (uint i = 0u; i < 64u && p0 != parents[p0]; ++i) {
+        p0 = parents[p0];
+    }
+    return p0;
+}
+
+void main() {
+    uint corner = gl_GlobalInvocationID.x;
+    if (corner >= p.n) return;
+
+    uint root = find_root(corner);
+    uint dst = repair_data[root];
+    if (dst >= p.n) return;
+
+    uint src_v = uint(faces[corner]);
+    uint out_v = p.aux1 + dst * 3u;
+    repair_data[out_v + 0u] = floatBitsToUint(vertices[src_v * 3u + 0u]);
+    repair_data[out_v + 1u] = floatBitsToUint(vertices[src_v * 3u + 1u]);
+    repair_data[out_v + 2u] = floatBitsToUint(vertices[src_v * 3u + 2u]);
+    repair_data[p.aux2 + corner] = dst;
+}

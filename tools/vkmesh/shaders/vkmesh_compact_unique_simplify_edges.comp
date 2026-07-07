@@ -1,0 +1,56 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Edges {
+    uint edges[];
+};
+
+layout(binding = 1) buffer UniqueEdges {
+    uint unique_edges[];
+};
+
+layout(binding = 2) buffer BoundaryFlags {
+    uint boundary_flags[];
+};
+
+layout(binding = 3) buffer Counter {
+    uint counter[];
+};
+
+bool same_edge(uint a, uint b) {
+    uint abase = a * 5u;
+    uint bbase = b * 5u;
+    return edges[abase + 0u] == edges[bbase + 0u] &&
+           edges[abase + 1u] == edges[bbase + 1u];
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.n) return;
+    if (idx > 0u && same_edge(idx - 1u, idx)) return;
+
+    uint src = idx * 5u;
+    uint v0 = edges[src + 0u];
+    uint v1 = edges[src + 1u];
+    if (v0 >= p.aux0 || v1 >= p.aux0) return;
+
+    uint out_idx = atomicAdd(counter[0], 1u);
+    unique_edges[out_idx * 2u + 0u] = v0;
+    unique_edges[out_idx * 2u + 1u] = v1;
+
+    bool same_next = idx + 1u < p.n && same_edge(idx, idx + 1u);
+    if (!same_next) {
+        atomicOr(boundary_flags[p.aux1 + v0], 1u);
+        atomicOr(boundary_flags[p.aux1 + v1], 1u);
+    }
+}

@@ -1,0 +1,62 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Edges {
+    uint edges[];
+};
+
+layout(binding = 1) buffer Unused1 {
+    uint unused1[];
+};
+
+layout(binding = 2) buffer Unused2 {
+    uint unused2[];
+};
+
+layout(binding = 3) buffer Scratch {
+    uint scratch[];
+};
+
+uint offset_base() { return p.aux0 * 10u; }
+uint adjacency_base() { return offset_base() + p.aux0 + 1u; }
+uint boundary_base() { return adjacency_base() + p.aux2; }
+uint cost_base() { return boundary_base() + p.aux0; }
+uint best_cost_base() { return cost_base() + p.n; }
+uint best_edge_base() { return best_cost_base() + p.aux1; }
+
+void propagate_vertex(uint v, uint edge_id, uint cost_bits) {
+    uint ob = offset_base();
+    uint ab = adjacency_base();
+    uint bc = best_cost_base();
+    uint be = best_edge_base();
+    uint begin = scratch[ob + v];
+    uint end = scratch[ob + v + 1u];
+    for (uint item = begin; item < end && item < p.aux2; ++item) {
+        uint face_id = scratch[ab + item];
+        if (face_id < p.aux1 && scratch[bc + face_id] == cost_bits) {
+            atomicMin(scratch[be + face_id], edge_id);
+        }
+    }
+}
+
+void main() {
+    uint edge_id = gl_GlobalInvocationID.x;
+    if (edge_id >= p.n) return;
+    uint cost_bits = scratch[cost_base() + edge_id];
+    if (cost_bits >= 0x7f800000u) return;
+    uint v0 = edges[edge_id * 2u + 0u];
+    uint v1 = edges[edge_id * 2u + 1u];
+    if (v0 >= p.aux0 || v1 >= p.aux0) return;
+    propagate_vertex(v0, edge_id, cost_bits);
+    propagate_vertex(v1, edge_id, cost_bits);
+}

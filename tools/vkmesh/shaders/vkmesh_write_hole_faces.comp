@@ -1,0 +1,56 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer BoundaryEdges {
+    uint boundary_edges[];
+};
+
+layout(binding = 1) readonly buffer HoleData {
+    uint hole_data[];
+};
+
+layout(binding = 2) readonly buffer Aux {
+    uint aux[];
+};
+
+layout(binding = 3) buffer OutFaces {
+    int out_faces[];
+};
+
+uint face_offsets_offset() { return p.n; }
+
+uint find_root(uint x) {
+    uint r = hole_data[x];
+    for (uint i = 0u; i < 64u && r < p.n && hole_data[r] != r; ++i) {
+        r = hole_data[r];
+    }
+    return r;
+}
+
+void main() {
+    uint edge_id = gl_GlobalInvocationID.x;
+    if (edge_id >= p.n) return;
+    uint root = find_root(edge_id);
+    if (root >= p.n) return;
+    uint center = aux[root];
+    if (center == 0xffffffffu) return;
+
+    uint dst_face = p.aux1 + aux[face_offsets_offset() + edge_id];
+    uint bbase = edge_id * 4u;
+    uint a = boundary_edges[bbase + 0u];
+    uint b = boundary_edges[bbase + 1u];
+    uint dst = dst_face * 3u;
+    out_faces[dst + 0u] = int(b);
+    out_faces[dst + 1u] = int(a);
+    out_faces[dst + 2u] = int(center);
+}

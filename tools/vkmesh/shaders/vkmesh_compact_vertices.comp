@@ -1,0 +1,40 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Vertices {
+    float vertices[];
+};
+
+layout(binding = 1) readonly buffer VertexMap {
+    int vertex_map[];
+};
+
+layout(binding = 2) buffer OutVertices {
+    float out_vertices[];
+};
+
+layout(binding = 3) buffer AuxData {
+    uint aux_data[];
+};
+
+void main() {
+    uint vertex_id = gl_GlobalInvocationID.x;
+    if (vertex_id >= p.n) return;
+    int dst = vertex_map[vertex_id];
+    if (dst < 0) return;
+    uint src_base = vertex_id * 3u;
+    uint dst_base = uint(dst) * 3u;
+    out_vertices[dst_base + 0u] = vertices[src_base + 0u];
+    out_vertices[dst_base + 1u] = vertices[src_base + 1u];
+    out_vertices[dst_base + 2u] = vertices[src_base + 2u];
+}

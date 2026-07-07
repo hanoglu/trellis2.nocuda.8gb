@@ -71,7 +71,7 @@ static const trellis_component_status g_status[] = {
         TRELLIS_COMPONENT_OVOXEL_POSTPROCESS,
         "O-Voxel postprocess",
         false,
-        "mesh extraction and vertex-color OBJ sampling are implemented; full UV unwrap/raster/inpaint PBR texture bake is pending",
+        "vkmesh topology cleanup and Vulkan compute UV-space PBR texture bake are implemented; optional remesh_narrow_band_dc is pending",
     },
 };
 

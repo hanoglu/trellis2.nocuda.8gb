@@ -1,0 +1,34 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Degree {
+    uint degree[];
+};
+
+layout(binding = 1) buffer Offsets {
+    uint offsets[];
+};
+
+layout(binding = 2) buffer Unused2 {
+    uint unused2[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= p.n) return;
+    offsets[id] = id == 0u ? 0u : degree[id - 1u];
+}

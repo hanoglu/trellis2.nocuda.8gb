@@ -96,7 +96,7 @@ set(TRELLIS2_C_SOURCES
     src/pipeline/trellis_flow_sampler.c
     src/pipeline/trellis_sparse_structure_pipeline.c
     src/pipeline/trellis_structured_latent_pipeline.c
-    src/export/trellis_gltf_export.c
+    tools/vkmesh/trellis_gltf_export.c
     src/io/trellis_safetensors.c
     src/model/trellis_sparse_unet_vae_decoder.c
     src/model/trellis_sparse_unet_vae_decoder_exec.c
@@ -126,8 +126,10 @@ if (GGML_VULKAN)
     set(TRELLIS_SPARSE_VK_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_sparse_vk_spv.h")
     set(TRELLIS_SPARSE_VK_MAT_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_sparse_vk_mat.spv")
     set(TRELLIS_SPARSE_VK_MAT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_sparse_vk_mat_spv.h")
-    set(TRELLIS_GLTF_BAKE_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_bake.spv")
-    set(TRELLIS_GLTF_BAKE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_bake_spv.h")
+    set(TRELLIS_GLTF_BAKE_VERT_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_bake_vert.spv")
+    set(TRELLIS_GLTF_BAKE_VERT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_bake_vert_spv.h")
+    set(TRELLIS_GLTF_BAKE_FRAG_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_bake_frag.spv")
+    set(TRELLIS_GLTF_BAKE_FRAG_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_bake_frag_spv.h")
     set(TRELLIS_GLTF_DILATE_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_dilate.spv")
     set(TRELLIS_GLTF_DILATE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_dilate_spv.h")
     set(TRELLIS_GLTF_FILL_EMPTY_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_fill_empty.spv")
@@ -167,36 +169,53 @@ if (GGML_VULKAN)
         DEPENDS "${TRELLIS_SPARSE_VK_MAT_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
         COMMENT "Generate TRELLIS sparse Vulkan tiled matmul shader header")
     add_custom_command(
-        OUTPUT "${TRELLIS_GLTF_BAKE_SPV}"
-        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
-                "${CMAKE_CURRENT_LIST_DIR}/src/export/trellis_gltf_bake.comp"
-                -o "${TRELLIS_GLTF_BAKE_SPV}"
-        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/export/trellis_gltf_bake.comp"
-        COMMENT "Compile TRELLIS glTF Vulkan texture bake shader")
+        OUTPUT "${TRELLIS_GLTF_BAKE_VERT_SPV}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=vertex --target-env=vulkan1.2
+                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.vert"
+                -o "${TRELLIS_GLTF_BAKE_VERT_SPV}"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.vert"
+        COMMENT "Compile TRELLIS glTF Vulkan texture bake vertex shader")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_BAKE_FRAG_SPV}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=fragment --target-env=vulkan1.2
+                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.frag"
+                -o "${TRELLIS_GLTF_BAKE_FRAG_SPV}"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.frag"
+        COMMENT "Compile TRELLIS glTF Vulkan texture bake fragment shader")
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_DILATE_SPV}"
         COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
-                "${CMAKE_CURRENT_LIST_DIR}/src/export/trellis_gltf_dilate.comp"
+                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_dilate.comp"
                 -o "${TRELLIS_GLTF_DILATE_SPV}"
-        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/export/trellis_gltf_dilate.comp"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_dilate.comp"
         COMMENT "Compile TRELLIS glTF Vulkan texture dilation shader")
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_FILL_EMPTY_SPV}"
         COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
-                "${CMAKE_CURRENT_LIST_DIR}/src/export/trellis_gltf_fill_empty.comp"
+                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_fill_empty.comp"
                 -o "${TRELLIS_GLTF_FILL_EMPTY_SPV}"
-        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/export/trellis_gltf_fill_empty.comp"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_fill_empty.comp"
         COMMENT "Compile TRELLIS glTF Vulkan texture fill shader")
     add_custom_command(
-        OUTPUT "${TRELLIS_GLTF_BAKE_HEADER}"
+        OUTPUT "${TRELLIS_GLTF_BAKE_VERT_HEADER}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
         COMMAND "${CMAKE_COMMAND}"
-                -DINPUT="${TRELLIS_GLTF_BAKE_SPV}"
-                -DOUTPUT="${TRELLIS_GLTF_BAKE_HEADER}"
-                -DSYMBOL=trellis_gltf_bake_spv
+                -DINPUT="${TRELLIS_GLTF_BAKE_VERT_SPV}"
+                -DOUTPUT="${TRELLIS_GLTF_BAKE_VERT_HEADER}"
+                -DSYMBOL=trellis_gltf_bake_vert_spv
                 -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
-        DEPENDS "${TRELLIS_GLTF_BAKE_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
-        COMMENT "Generate TRELLIS glTF Vulkan texture bake shader header")
+        DEPENDS "${TRELLIS_GLTF_BAKE_VERT_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        COMMENT "Generate TRELLIS glTF Vulkan texture bake vertex shader header")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_BAKE_FRAG_HEADER}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND "${CMAKE_COMMAND}"
+                -DINPUT="${TRELLIS_GLTF_BAKE_FRAG_SPV}"
+                -DOUTPUT="${TRELLIS_GLTF_BAKE_FRAG_HEADER}"
+                -DSYMBOL=trellis_gltf_bake_frag_spv
+                -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        DEPENDS "${TRELLIS_GLTF_BAKE_FRAG_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        COMMENT "Generate TRELLIS glTF Vulkan texture bake fragment shader header")
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_DILATE_HEADER}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
@@ -219,7 +238,8 @@ if (GGML_VULKAN)
         COMMENT "Generate TRELLIS glTF Vulkan texture fill shader header")
     add_custom_target(trellis_sparse_vk_shader DEPENDS "${TRELLIS_SPARSE_VK_HEADER}" "${TRELLIS_SPARSE_VK_MAT_HEADER}")
     add_custom_target(trellis_gltf_vk_shader DEPENDS
-        "${TRELLIS_GLTF_BAKE_HEADER}"
+        "${TRELLIS_GLTF_BAKE_VERT_HEADER}"
+        "${TRELLIS_GLTF_BAKE_FRAG_HEADER}"
         "${TRELLIS_GLTF_DILATE_HEADER}"
         "${TRELLIS_GLTF_FILL_EMPTY_HEADER}")
     add_dependencies(trellis2_c trellis_sparse_vk_shader)
@@ -376,16 +396,54 @@ if (TRELLIS2_C_BUILD_TOOLS)
             set(VKMESH_SHADER_HEADERS "${VKMESH_SHADER_HEADERS}" PARENT_SCOPE)
         endfunction()
         set(VKMESH_SHADER_HEADERS)
-        add_vkmesh_shader(vkmesh_expand_edges tools/vkmesh_expand_edges.comp vkmesh_expand_edges_spv)
-        add_vkmesh_shader(vkmesh_degenerate_faces tools/vkmesh_degenerate_faces.comp vkmesh_degenerate_faces_spv)
-        add_vkmesh_shader(vkmesh_face_keys tools/vkmesh_face_keys.comp vkmesh_face_keys_spv)
-        add_vkmesh_shader(vkmesh_sort_edges tools/vkmesh_sort_edges.comp vkmesh_sort_edges_spv)
-        add_vkmesh_shader(vkmesh_sort_face_keys tools/vkmesh_sort_face_keys.comp vkmesh_sort_face_keys_spv)
-        add_vkmesh_shader(vkmesh_mark_duplicate_faces tools/vkmesh_mark_duplicate_faces.comp vkmesh_mark_duplicate_faces_spv)
-        add_vkmesh_shader(vkmesh_mark_boundary_edges tools/vkmesh_mark_boundary_edges.comp vkmesh_mark_boundary_edges_spv)
-        add_vkmesh_shader(vkmesh_unsigned_distance tools/vkmesh_unsigned_distance.comp vkmesh_unsigned_distance_spv)
+        set(VKMESH_SHADER_DIR tools/vkmesh/shaders)
+        add_vkmesh_shader(vkmesh_expand_edges ${VKMESH_SHADER_DIR}/vkmesh_expand_edges.comp vkmesh_expand_edges_spv)
+        add_vkmesh_shader(vkmesh_degenerate_faces ${VKMESH_SHADER_DIR}/vkmesh_degenerate_faces.comp vkmesh_degenerate_faces_spv)
+        add_vkmesh_shader(vkmesh_face_keys ${VKMESH_SHADER_DIR}/vkmesh_face_keys.comp vkmesh_face_keys_spv)
+        add_vkmesh_shader(vkmesh_sort_edges ${VKMESH_SHADER_DIR}/vkmesh_sort_edges.comp vkmesh_sort_edges_spv)
+        add_vkmesh_shader(vkmesh_sort_face_keys ${VKMESH_SHADER_DIR}/vkmesh_sort_face_keys.comp vkmesh_sort_face_keys_spv)
+        add_vkmesh_shader(vkmesh_mark_duplicate_faces ${VKMESH_SHADER_DIR}/vkmesh_mark_duplicate_faces.comp vkmesh_mark_duplicate_faces_spv)
+        add_vkmesh_shader(vkmesh_mark_boundary_edges ${VKMESH_SHADER_DIR}/vkmesh_mark_boundary_edges.comp vkmesh_mark_boundary_edges_spv)
+        add_vkmesh_shader(vkmesh_boundary_degree_owner ${VKMESH_SHADER_DIR}/vkmesh_boundary_degree_owner.comp vkmesh_boundary_degree_owner_spv)
+        add_vkmesh_shader(vkmesh_compact_boundary_edges ${VKMESH_SHADER_DIR}/vkmesh_compact_boundary_edges.comp vkmesh_compact_boundary_edges_spv)
+        add_vkmesh_shader(vkmesh_compact_face_pairs ${VKMESH_SHADER_DIR}/vkmesh_compact_face_pairs.comp vkmesh_compact_face_pairs_spv)
+        add_vkmesh_shader(vkmesh_compact_faces ${VKMESH_SHADER_DIR}/vkmesh_compact_faces.comp vkmesh_compact_faces_spv)
+        add_vkmesh_shader(vkmesh_compact_unique_simplify_edges ${VKMESH_SHADER_DIR}/vkmesh_compact_unique_simplify_edges.comp vkmesh_compact_unique_simplify_edges_spv)
+        add_vkmesh_shader(vkmesh_copy_u32 ${VKMESH_SHADER_DIR}/vkmesh_copy_u32.comp vkmesh_copy_u32_spv)
+        add_vkmesh_shader(vkmesh_accumulate_hole_components ${VKMESH_SHADER_DIR}/vkmesh_accumulate_hole_components.comp vkmesh_accumulate_hole_components_spv)
+        add_vkmesh_shader(vkmesh_apply_orientation_flips ${VKMESH_SHADER_DIR}/vkmesh_apply_orientation_flips.comp vkmesh_apply_orientation_flips_spv)
+        add_vkmesh_shader(vkmesh_assign_vertex_map ${VKMESH_SHADER_DIR}/vkmesh_assign_vertex_map.comp vkmesh_assign_vertex_map_spv)
+        add_vkmesh_shader(vkmesh_fill_u32 ${VKMESH_SHADER_DIR}/vkmesh_fill_u32.comp vkmesh_fill_u32_spv)
+        add_vkmesh_shader(vkmesh_remap_faces ${VKMESH_SHADER_DIR}/vkmesh_remap_faces.comp vkmesh_remap_faces_spv)
+        add_vkmesh_shader(vkmesh_compact_vertices ${VKMESH_SHADER_DIR}/vkmesh_compact_vertices.comp vkmesh_compact_vertices_spv)
+        add_vkmesh_shader(vkmesh_init_u32_sequence ${VKMESH_SHADER_DIR}/vkmesh_init_u32_sequence.comp vkmesh_init_u32_sequence_spv)
+        add_vkmesh_shader(vkmesh_init_orientation_state ${VKMESH_SHADER_DIR}/vkmesh_init_orientation_state.comp vkmesh_init_orientation_state_spv)
+        add_vkmesh_shader(vkmesh_seed_vertex_offsets ${VKMESH_SHADER_DIR}/vkmesh_seed_vertex_offsets.comp vkmesh_seed_vertex_offsets_spv)
+        add_vkmesh_shader(vkmesh_scan_u32_stride ${VKMESH_SHADER_DIR}/vkmesh_scan_u32_stride.comp vkmesh_scan_u32_stride_spv)
+        add_vkmesh_shader(vkmesh_union_face_edges ${VKMESH_SHADER_DIR}/vkmesh_union_face_edges.comp vkmesh_union_face_edges_spv)
+        add_vkmesh_shader(vkmesh_union_boundary_edges ${VKMESH_SHADER_DIR}/vkmesh_union_boundary_edges.comp vkmesh_union_boundary_edges_spv)
+        add_vkmesh_shader(vkmesh_union_corner_edges ${VKMESH_SHADER_DIR}/vkmesh_union_corner_edges.comp vkmesh_union_corner_edges_spv)
+        add_vkmesh_shader(vkmesh_union_orientation_edges ${VKMESH_SHADER_DIR}/vkmesh_union_orientation_edges.comp vkmesh_union_orientation_edges_spv)
+        add_vkmesh_shader(vkmesh_compress_parents ${VKMESH_SHADER_DIR}/vkmesh_compress_parents.comp vkmesh_compress_parents_spv)
+        add_vkmesh_shader(vkmesh_compress_orientation_state ${VKMESH_SHADER_DIR}/vkmesh_compress_orientation_state.comp vkmesh_compress_orientation_state_spv)
+        add_vkmesh_shader(vkmesh_vertex_face_degree ${VKMESH_SHADER_DIR}/vkmesh_vertex_face_degree.comp vkmesh_vertex_face_degree_spv)
+        add_vkmesh_shader(vkmesh_vertex_face_adjacency ${VKMESH_SHADER_DIR}/vkmesh_vertex_face_adjacency.comp vkmesh_vertex_face_adjacency_spv)
+        add_vkmesh_shader(vkmesh_vertex_qem ${VKMESH_SHADER_DIR}/vkmesh_vertex_qem.comp vkmesh_vertex_qem_spv)
+        add_vkmesh_shader(vkmesh_simplify_edge_cost ${VKMESH_SHADER_DIR}/vkmesh_simplify_edge_cost.comp vkmesh_simplify_edge_cost_spv)
+        add_vkmesh_shader(vkmesh_simplify_propagate_cost ${VKMESH_SHADER_DIR}/vkmesh_simplify_propagate_cost.comp vkmesh_simplify_propagate_cost_spv)
+        add_vkmesh_shader(vkmesh_simplify_best_edge ${VKMESH_SHADER_DIR}/vkmesh_simplify_best_edge.comp vkmesh_simplify_best_edge_spv)
+        add_vkmesh_shader(vkmesh_simplify_collapse_edges ${VKMESH_SHADER_DIR}/vkmesh_simplify_collapse_edges.comp vkmesh_simplify_collapse_edges_spv)
+        add_vkmesh_shader(vkmesh_assign_corner_vertices ${VKMESH_SHADER_DIR}/vkmesh_assign_corner_vertices.comp vkmesh_assign_corner_vertices_spv)
+        add_vkmesh_shader(vkmesh_write_repaired_mesh ${VKMESH_SHADER_DIR}/vkmesh_write_repaired_mesh.comp vkmesh_write_repaired_mesh_spv)
+        add_vkmesh_shader(vkmesh_component_area ${VKMESH_SHADER_DIR}/vkmesh_component_area.comp vkmesh_component_area_spv)
+        add_vkmesh_shader(vkmesh_mark_component_keep ${VKMESH_SHADER_DIR}/vkmesh_mark_component_keep.comp vkmesh_mark_component_keep_spv)
+        add_vkmesh_shader(vkmesh_mark_hole_roots ${VKMESH_SHADER_DIR}/vkmesh_mark_hole_roots.comp vkmesh_mark_hole_roots_spv)
+        add_vkmesh_shader(vkmesh_mark_hole_faces ${VKMESH_SHADER_DIR}/vkmesh_mark_hole_faces.comp vkmesh_mark_hole_faces_spv)
+        add_vkmesh_shader(vkmesh_write_hole_vertices ${VKMESH_SHADER_DIR}/vkmesh_write_hole_vertices.comp vkmesh_write_hole_vertices_spv)
+        add_vkmesh_shader(vkmesh_write_hole_faces ${VKMESH_SHADER_DIR}/vkmesh_write_hole_faces.comp vkmesh_write_hole_faces_spv)
+        add_vkmesh_shader(vkmesh_unsigned_distance ${VKMESH_SHADER_DIR}/vkmesh_unsigned_distance.comp vkmesh_unsigned_distance_spv)
         add_custom_target(vkmesh_shader DEPENDS ${VKMESH_SHADER_HEADERS})
-        add_executable(vkmesh tools/vkmesh.c)
+        add_executable(vkmesh tools/vkmesh/vkmesh.c)
         add_dependencies(vkmesh vkmesh_shader)
         target_include_directories(vkmesh PRIVATE
             "${CMAKE_CURRENT_BINARY_DIR}/generated"

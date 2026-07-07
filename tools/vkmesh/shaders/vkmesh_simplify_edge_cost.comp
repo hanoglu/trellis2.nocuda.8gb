@@ -1,0 +1,141 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Edges {
+    uint edges[];
+};
+
+layout(binding = 1) readonly buffer Vertices {
+    float vertices[];
+};
+
+layout(binding = 2) readonly buffer Faces {
+    int faces[];
+};
+
+layout(binding = 3) buffer Scratch {
+    uint scratch[];
+};
+
+uint qem_base() { return 0u; }
+uint offset_base() { return p.aux0 * 10u; }
+uint adjacency_base() { return offset_base() + p.aux0 + 1u; }
+uint boundary_base() { return adjacency_base() + p.aux2; }
+uint cost_base() { return boundary_base() + p.aux0; }
+
+vec3 load_vertex(uint v) {
+    return vec3(vertices[v * 3u + 0u], vertices[v * 3u + 1u], vertices[v * 3u + 2u]);
+}
+
+uvec3 load_face(uint f) {
+    uint base = f * 3u;
+    return uvec3(uint(faces[base + 0u]), uint(faces[base + 1u]), uint(faces[base + 2u]));
+}
+
+bool face_contains(uvec3 f, uint v) {
+    return f.x == v || f.y == v || f.z == v;
+}
+
+float qem_eval(uint v0, uint v1, vec3 pos) {
+    float x = pos.x;
+    float y = pos.y;
+    float z = pos.z;
+    uint b0 = qem_base() + v0 * 10u;
+    uint b1 = qem_base() + v1 * 10u;
+    float q[10];
+    for (uint i = 0u; i < 10u; ++i) {
+        q[i] = uintBitsToFloat(scratch[b0 + i]) + uintBitsToFloat(scratch[b1 + i]);
+    }
+    return q[0] * x * x + 2.0 * q[1] * x * y + 2.0 * q[2] * x * z + 2.0 * q[3] * x +
+           q[4] * y * y + 2.0 * q[5] * y * z + 2.0 * q[6] * y +
+           q[7] * z * z + 2.0 * q[8] * z + q[9];
+}
+
+bool process_incident(uint face_id, uint keep_v, uint other_v, vec3 new_pos, inout float skinny, inout uint num_tri) {
+    if (face_id >= p.aux1) return true;
+    uvec3 f = load_face(face_id);
+    if (face_contains(f, other_v)) return true;
+    if (f.x >= p.aux0 || f.y >= p.aux0 || f.z >= p.aux0) return true;
+
+    vec3 a = load_vertex(f.x);
+    vec3 b = load_vertex(f.y);
+    vec3 c = load_vertex(f.z);
+    vec3 old_n = cross(b - a, c - a);
+
+    vec3 na = (f.x == keep_v) ? new_pos : a;
+    vec3 nb = (f.y == keep_v) ? new_pos : b;
+    vec3 nc = (f.z == keep_v) ? new_pos : c;
+    vec3 new_e1 = nb - na;
+    vec3 new_e2 = nc - na;
+    vec3 new_n = cross(new_e1, new_e2);
+    if (dot(old_n, new_n) < 0.0) return false;
+
+    vec3 new_e0 = nc - nb;
+    float area2 = length(new_n);
+    float denom = dot(new_e0, new_e0) + dot(new_e1, new_e1) + dot(new_e2, new_e2);
+    denom = max(denom, 1.0e-24);
+    float shape = clamp(2.0 * sqrt(3.0) * area2 / denom, 0.0, 1.0);
+    skinny += 1.0 - shape;
+    num_tri += 1u;
+    return true;
+}
+
+bool process_vertex_faces(uint v, uint other_v, vec3 new_pos, inout float skinny, inout uint num_tri) {
+    uint ob = offset_base();
+    uint ab = adjacency_base();
+    uint begin = scratch[ob + v];
+    uint end = scratch[ob + v + 1u];
+    for (uint item = begin; item < end && item < p.aux2; ++item) {
+        uint face_id = scratch[ab + item];
+        if (!process_incident(face_id, v, other_v, new_pos, skinny, num_tri)) return false;
+    }
+    return true;
+}
+
+void main() {
+    uint edge_id = gl_GlobalInvocationID.x;
+    if (edge_id >= p.n) return;
+
+    uint v0 = edges[edge_id * 2u + 0u];
+    uint v1 = edges[edge_id * 2u + 1u];
+    uint cost_index = cost_base() + edge_id;
+    if (v0 >= p.aux0 || v1 >= p.aux0) {
+        scratch[cost_index] = floatBitsToUint(uintBitsToFloat(0x7f800000u));
+        return;
+    }
+
+    vec3 p0 = load_vertex(v0);
+    vec3 p1 = load_vertex(v1);
+    float w0 = 0.5;
+    bool b0 = scratch[boundary_base() + v0] != 0u;
+    bool b1 = scratch[boundary_base() + v1] != 0u;
+    if (b0 && !b1) w0 = 1.0;
+    else if (!b0 && b1) w0 = 0.0;
+    vec3 pos = p0 * w0 + p1 * (1.0 - w0);
+
+    float cost = qem_eval(v0, v1, pos);
+    float len2 = dot(p1 - p0, p1 - p0);
+    cost += p.eps * len2;
+
+    float skinny = 0.0;
+    uint num_tri = 0u;
+    if (!process_vertex_faces(v0, v1, pos, skinny, num_tri) ||
+        !process_vertex_faces(v1, v0, pos, skinny, num_tri)) {
+        scratch[cost_index] = 0x7f800000u;
+        return;
+    }
+    if (num_tri > 0u) skinny /= float(num_tri);
+    cost += p.rel_eps * skinny * len2;
+    if (!(cost >= 0.0) || isinf(cost) || isnan(cost)) cost = uintBitsToFloat(0x7f800000u);
+    scratch[cost_index] = floatBitsToUint(cost);
+}

@@ -1,0 +1,39 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Faces {
+    int faces[];
+};
+
+layout(binding = 1) readonly buffer KeepFlags {
+    uint keep_flags[];
+};
+
+layout(binding = 2) buffer OutFaces {
+    int out_faces[];
+};
+
+layout(binding = 3) buffer Counter {
+    uint counter[];
+};
+
+void main() {
+    uint face_id = gl_GlobalInvocationID.x;
+    if (face_id >= p.n || keep_flags[p.aux0 + face_id] == 0u) return;
+    uint dst = atomicAdd(counter[0], 1u);
+    uint src_base = face_id * 3u;
+    uint dst_base = dst * 3u;
+    out_faces[dst_base + 0u] = faces[src_base + 0u];
+    out_faces[dst_base + 1u] = faces[src_base + 1u];
+    out_faces[dst_base + 2u] = faces[src_base + 2u];
+}

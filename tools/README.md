@@ -41,6 +41,8 @@ mirrors the standard PyTorch/o-voxel export cleanup order: fill small holes,
 simplify toward `3 * target`, remove duplicate/non-manifold/small-component
 artifacts, fill again, simplify to the final target, repeat cleanup, fill once
 more, unify winding, then unwrap UVs by default.
+The implementation lives under `tools/vkmesh/`; compute shaders, including the
+glTF texture bake/dilate/fill shaders, live under `tools/vkmesh/shaders/`.
 
 ```sh
 ../build/trellis-image-to-obj \
@@ -57,12 +59,19 @@ more, unify winding, then unwrap UVs by default.
 ```
 
 In the full pipeline, `vkmesh` cleans topology before PBR voxel baking, so the
-glTF exporter unwraps and bakes textures on the processed mesh. BiRefNet follows
-the same `--backend` and `--device` settings as the rest of the image-to-3D
-pipeline. Use standalone `vkmesh --postprocess --no-uv-unwrap` for geometry-only
-OBJ output, `--cleanup` for a single primitive cleanup pass, or individual flags
-such as `--fill-holes`, `--repair-non-manifold-edges`, and
+glTF exporter unwraps and bakes textures on the processed mesh. In Vulkan
+builds, UV-space rasterization and PBR voxel sampling run through the Vulkan
+bake pipeline, then seam dilation and empty texel fill run as compute passes.
+BiRefNet follows the same `--backend` and `--device` settings as the rest of the
+image-to-3D pipeline. Use standalone `vkmesh --postprocess --no-uv-unwrap` for
+geometry-only OBJ output, `--cleanup` for a single primitive cleanup pass, or
+individual flags such as `--fill-holes`, `--repair-non-manifold-edges`, and
 `--remove-small-components` when debugging one stage at a time.
+CuMesh-style UV unwrap is hybrid rather than fully GPU-resident: chart
+clustering is the GPU-accelerated part, then each chart is copied to CPU xatlas
+for parameterization and packing. The current vkmesh exporter still feeds the
+cleaned mesh directly to CPU xatlas; the next alignment step is to add the
+CuMesh-like GPU chart clustering stage before xatlas.
 
 `trellis-birefnet-rgba` runs only the BiRefNet background-removal model and
 writes an RGBA PNG:

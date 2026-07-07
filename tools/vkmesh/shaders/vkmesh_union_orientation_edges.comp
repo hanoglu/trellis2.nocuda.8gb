@@ -1,0 +1,103 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Edges {
+    uint edges[];
+};
+
+layout(binding = 1) readonly buffer Faces {
+    int faces[];
+};
+
+layout(binding = 2) buffer State {
+    uint state[];
+};
+
+layout(binding = 3) buffer Changed {
+    uint changed[];
+};
+
+bool same_edge(uint a, uint b) {
+    uint abase = a * 5u;
+    uint bbase = b * 5u;
+    return edges[abase + 0u] == edges[bbase + 0u] &&
+           edges[abase + 1u] == edges[bbase + 1u];
+}
+
+uint local_index(uint face_id, uint vertex_id) {
+    uint base = face_id * 3u;
+    if (uint(faces[base + 0u]) == vertex_id) return 0u;
+    if (uint(faces[base + 1u]) == vertex_id) return 1u;
+    if (uint(faces[base + 2u]) == vertex_id) return 2u;
+    return 3u;
+}
+
+uint edge_needs_flip(uint face0, uint face1, uint v0, uint v1) {
+    uint a0 = local_index(face0, v0);
+    uint a1 = local_index(face0, v1);
+    uint b0 = local_index(face1, v0);
+    uint b1 = local_index(face1, v1);
+    if (a0 >= 3u || a1 >= 3u || b0 >= 3u || b1 >= 3u) return 0u;
+    uint dir0 = (a1 + 3u - a0) % 3u;
+    uint dir1 = (b1 + 3u - b0) % 3u;
+    return dir0 == dir1 ? 1u : 0u;
+}
+
+uint find_root(uint x, out uint parity) {
+    parity = 0u;
+    uint cur = x;
+    for (uint i = 0u; i < 256u; ++i) {
+        uint packed = state[cur];
+        uint parent = packed >> 1u;
+        parity ^= packed & 1u;
+        if (parent == cur) return cur;
+        cur = parent;
+    }
+    return cur;
+}
+
+void unite(uint a, uint b, uint need_flip) {
+    for (uint iter = 0u; iter < 32u; ++iter) {
+        uint pa = 0u;
+        uint pb = 0u;
+        uint ra = find_root(a, pa);
+        uint rb = find_root(b, pb);
+        if (ra == rb) return;
+
+        uint hi = max(ra, rb);
+        uint lo = min(ra, rb);
+        uint root_parity = pa ^ pb ^ need_flip;
+        uint expected = hi << 1u;
+        uint desired = (lo << 1u) | root_parity;
+        uint old = atomicCompSwap(state[hi], expected, desired);
+        if (old == expected) {
+            atomicOr(changed[0], 1u);
+            return;
+        }
+    }
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx + 1u >= p.n) return;
+    if (!same_edge(idx, idx + 1u)) return;
+    if (idx > 0u && same_edge(idx - 1u, idx)) return;
+    if (idx + 2u < p.n && same_edge(idx + 1u, idx + 2u)) return;
+
+    uint face0 = edges[idx * 5u + 4u];
+    uint face1 = edges[(idx + 1u) * 5u + 4u];
+    if (face0 >= p.aux0 || face1 >= p.aux0) return;
+
+    uint need = edge_needs_flip(face0, face1, edges[idx * 5u + 0u], edges[idx * 5u + 1u]);
+    unite(face0, face1, need);
+}

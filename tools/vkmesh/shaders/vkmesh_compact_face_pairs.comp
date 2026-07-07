@@ -1,0 +1,54 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Edges {
+    uint edges[];
+};
+
+layout(binding = 1) buffer FacePairs {
+    uint pairs[];
+};
+
+layout(binding = 2) buffer Counter {
+    uint counter[];
+};
+
+layout(binding = 3) buffer AuxData {
+    uint aux_data[];
+};
+
+bool same_edge(uint a, uint b) {
+    uint abase = a * 5u;
+    uint bbase = b * 5u;
+    return edges[abase + 0u] == edges[bbase + 0u] &&
+           edges[abase + 1u] == edges[bbase + 1u];
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx + 1u >= p.n) return;
+    if (!same_edge(idx, idx + 1u)) return;
+    if (idx > 0u && same_edge(idx - 1u, idx)) return;
+    if (idx + 2u < p.n && same_edge(idx + 1u, idx + 2u)) return;
+
+    uint face0 = edges[idx * 5u + 4u];
+    uint face1 = edges[(idx + 1u) * 5u + 4u];
+    if (face0 >= p.aux0 || face1 >= p.aux0) return;
+
+    uint out_idx = atomicAdd(counter[0], 1u);
+    uint base = out_idx * 4u;
+    pairs[base + 0u] = face0;
+    pairs[base + 1u] = face1;
+    pairs[base + 2u] = edges[idx * 5u + 0u];
+    pairs[base + 3u] = edges[idx * 5u + 1u];
+}

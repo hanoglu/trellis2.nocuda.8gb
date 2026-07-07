@@ -1,0 +1,43 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer HoleData {
+    uint hole_data[];
+};
+
+layout(binding = 1) readonly buffer RootFlags {
+    uint root_flags[];
+};
+
+layout(binding = 2) buffer FaceFlags {
+    uint face_flags[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+uint find_root(uint x) {
+    uint r = hole_data[x];
+    for (uint i = 0u; i < 64u && r < p.n && hole_data[r] != r; ++i) {
+        r = hole_data[r];
+    }
+    return r;
+}
+
+void main() {
+    uint edge_id = gl_GlobalInvocationID.x;
+    if (edge_id >= p.n) return;
+    uint root = find_root(edge_id);
+    face_flags[edge_id] = root < p.n ? root_flags[root] : 0u;
+}

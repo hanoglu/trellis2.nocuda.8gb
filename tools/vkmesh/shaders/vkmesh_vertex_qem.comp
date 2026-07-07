@@ -1,0 +1,85 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Faces {
+    int faces[];
+};
+
+layout(binding = 1) readonly buffer Vertices {
+    float vertices[];
+};
+
+layout(binding = 2) buffer Qems {
+    uint qems[];
+};
+
+layout(binding = 3) readonly buffer Scratch {
+    uint scratch[];
+};
+
+uint offset_base() {
+    return p.aux0 * 10u;
+}
+
+uint adjacency_base() {
+    return offset_base() + p.aux0 + 1u;
+}
+
+void add_plane(inout float q[10], vec3 n, float d) {
+    q[0] += n.x * n.x;
+    q[1] += n.x * n.y;
+    q[2] += n.x * n.z;
+    q[3] += n.x * d;
+    q[4] += n.y * n.y;
+    q[5] += n.y * n.z;
+    q[6] += n.y * d;
+    q[7] += n.z * n.z;
+    q[8] += n.z * d;
+    q[9] += d * d;
+}
+
+void main() {
+    uint vertex_id = gl_GlobalInvocationID.x;
+    if (vertex_id >= p.n || vertex_id >= p.aux0) return;
+
+    float q[10];
+    for (uint i = 0u; i < 10u; ++i) q[i] = 0.0;
+
+    uint ob = offset_base();
+    uint ab = adjacency_base();
+    uint begin = scratch[ob + vertex_id];
+    uint end = scratch[ob + vertex_id + 1u];
+    for (uint item = begin; item < end && item < p.aux2; ++item) {
+        uint face_id = scratch[ab + item];
+        if (face_id >= p.aux1) continue;
+
+        uint fbase = face_id * 3u;
+        uint ia = uint(faces[fbase + 0u]);
+        uint ib = uint(faces[fbase + 1u]);
+        uint ic = uint(faces[fbase + 2u]);
+        if (ia >= p.aux0 || ib >= p.aux0 || ic >= p.aux0) continue;
+
+        vec3 a = vec3(vertices[ia * 3u + 0u], vertices[ia * 3u + 1u], vertices[ia * 3u + 2u]);
+        vec3 b = vec3(vertices[ib * 3u + 0u], vertices[ib * 3u + 1u], vertices[ib * 3u + 2u]);
+        vec3 c = vec3(vertices[ic * 3u + 0u], vertices[ic * 3u + 1u], vertices[ic * 3u + 2u]);
+        vec3 n = cross(b - a, c - a);
+        float len = length(n);
+        if (len <= 1.0e-30) continue;
+        n /= len;
+        float d = -dot(n, a);
+        add_plane(q, n, d);
+    }
+
+    uint base = vertex_id * 10u;
+    for (uint i = 0u; i < 10u; ++i) qems[base + i] = floatBitsToUint(q[i]);
+}

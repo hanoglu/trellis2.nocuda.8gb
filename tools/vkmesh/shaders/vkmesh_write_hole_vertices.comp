@@ -1,0 +1,55 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer HoleData {
+    uint hole_data[];
+};
+
+layout(binding = 1) readonly buffer RootOffsets {
+    uint root_offsets[];
+};
+
+layout(binding = 2) buffer RootToVertex {
+    uint root_to_vertex[];
+};
+
+layout(binding = 3) buffer OutVertices {
+    uint out_vertices[];
+};
+
+uint comp_edges_offset() { return p.n + 2u * p.aux0; }
+uint comp_invalid_offset() { return comp_edges_offset() + p.n; }
+uint comp_perim_offset() { return comp_invalid_offset() + p.n; }
+uint comp_mid_offset() { return comp_perim_offset() + p.n; }
+
+bool valid_root(uint root) {
+    return hole_data[root] == root &&
+           hole_data[comp_edges_offset() + root] != 0u &&
+           hole_data[comp_invalid_offset() + root] == 0u &&
+           uintBitsToFloat(hole_data[comp_perim_offset() + root]) < p.eps;
+}
+
+void main() {
+    uint root = gl_GlobalInvocationID.x;
+    if (root >= p.n || !valid_root(root)) return;
+    uint edge_count = hole_data[comp_edges_offset() + root];
+    uint new_vertex = p.aux1 + root_offsets[root];
+    root_to_vertex[root] = new_vertex;
+
+    float inv = 1.0 / float(edge_count);
+    uint dst = new_vertex * 3u;
+    uint mid = comp_mid_offset() + root * 3u;
+    out_vertices[dst + 0u] = floatBitsToUint(uintBitsToFloat(hole_data[mid + 0u]) * inv);
+    out_vertices[dst + 1u] = floatBitsToUint(uintBitsToFloat(hole_data[mid + 1u]) * inv);
+    out_vertices[dst + 2u] = floatBitsToUint(uintBitsToFloat(hole_data[mid + 2u]) * inv);
+}

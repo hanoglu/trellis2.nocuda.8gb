@@ -1,0 +1,80 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer BoundaryEdges {
+    uint boundary_edges[];
+};
+
+layout(binding = 1) readonly buffer Vertices {
+    float vertices[];
+};
+
+layout(binding = 2) buffer HoleData {
+    uint hole_data[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+uint degree_offset() { return p.n; }
+uint comp_edges_offset() { return p.n + 2u * p.aux0; }
+uint comp_invalid_offset() { return comp_edges_offset() + p.n; }
+uint comp_perim_offset() { return comp_invalid_offset() + p.n; }
+uint comp_mid_offset() { return comp_perim_offset() + p.n; }
+
+uint find_root(uint x) {
+    uint p0 = hole_data[x];
+    for (uint i = 0u; i < 64u && p0 != hole_data[p0]; ++i) {
+        p0 = hole_data[p0];
+    }
+    return p0;
+}
+
+void atomicAddFloat(uint index, float value) {
+    uint old_bits = hole_data[index];
+    for (uint i = 0u; i < 64u; ++i) {
+        float old_value = uintBitsToFloat(old_bits);
+        uint new_bits = floatBitsToUint(old_value + value);
+        uint prev = atomicCompSwap(hole_data[index], old_bits, new_bits);
+        if (prev == old_bits) return;
+        old_bits = prev;
+    }
+}
+
+void main() {
+    uint edge_id = gl_GlobalInvocationID.x;
+    if (edge_id >= p.n) return;
+
+    uint root = find_root(edge_id);
+    uint base = edge_id * 4u;
+    uint ia = boundary_edges[base + 0u];
+    uint ib = boundary_edges[base + 1u];
+    if (ia >= p.aux0 || ib >= p.aux0) {
+        atomicOr(hole_data[comp_invalid_offset() + root], 1u);
+        return;
+    }
+
+    if (hole_data[degree_offset() + ia] != 2u || hole_data[degree_offset() + ib] != 2u) {
+        atomicOr(hole_data[comp_invalid_offset() + root], 1u);
+    }
+
+    vec3 a = vec3(vertices[ia * 3u + 0u], vertices[ia * 3u + 1u], vertices[ia * 3u + 2u]);
+    vec3 b = vec3(vertices[ib * 3u + 0u], vertices[ib * 3u + 1u], vertices[ib * 3u + 2u]);
+    vec3 mid = 0.5 * (a + b);
+    atomicAdd(hole_data[comp_edges_offset() + root], 1u);
+    atomicAddFloat(comp_perim_offset() + root, length(a - b));
+    atomicAddFloat(comp_mid_offset() + root * 3u + 0u, mid.x);
+    atomicAddFloat(comp_mid_offset() + root * 3u + 1u, mid.y);
+    atomicAddFloat(comp_mid_offset() + root * 3u + 2u, mid.z);
+}

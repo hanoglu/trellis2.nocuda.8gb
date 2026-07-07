@@ -1,0 +1,37 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) buffer Faces {
+    int faces[];
+};
+
+layout(binding = 1) readonly buffer VertexMap {
+    int vertex_map[];
+};
+
+layout(binding = 2) buffer AuxOut {
+    uint aux_out[];
+};
+
+layout(binding = 3) buffer AuxData {
+    uint aux_data[];
+};
+
+void main() {
+    uint corner_id = gl_GlobalInvocationID.x;
+    if (corner_id >= p.n) return;
+    int old_vertex = faces[corner_id];
+    if (old_vertex >= 0) {
+        faces[corner_id] = vertex_map[old_vertex];
+    }
+}
