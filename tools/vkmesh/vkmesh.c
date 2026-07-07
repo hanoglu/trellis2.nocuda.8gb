@@ -6398,6 +6398,7 @@ cleanup:
 
 static int vkmesh_trellis_postprocess_device_inner(
     vkmesh_mesh * mesh,
+    const char * projection_output,
     int decimation_target,
     float max_hole_perimeter,
     float degenerate_abs,
@@ -6442,6 +6443,22 @@ static int vkmesh_trellis_postprocess_device_inner(
         added_faces,
         before_f,
         dm.n_faces);
+    if (projection_output != NULL && projection_output[0] != '\0') {
+        vkmesh_mesh projection_mesh;
+        memset(&projection_mesh, 0, sizeof(projection_mesh));
+        if (!vkmesh_device_mesh_download(&dm, &projection_mesh)) {
+            mesh_free(&projection_mesh);
+            goto cleanup;
+        }
+        int wrote_projection = write_obj(projection_output, &projection_mesh);
+        fprintf(stderr,
+            "vkmesh: trellis.pre projection_mesh_output %s vertices=%" PRId64 " faces=%" PRId64 "\n",
+            projection_output,
+            projection_mesh.n_vertices,
+            projection_mesh.n_faces);
+        mesh_free(&projection_mesh);
+        if (!wrote_projection) goto cleanup;
+    }
 
     int64_t first_target = (int64_t) decimation_target * 3;
     if (first_target > INT_MAX) first_target = INT_MAX;
@@ -6582,6 +6599,7 @@ static int vkmesh_log_simplify(
 
 static int vkmesh_trellis_postprocess_inner(
     vkmesh_mesh * mesh,
+    const char * projection_output,
     int decimation_target,
     float max_hole_perimeter,
     float degenerate_abs,
@@ -6594,6 +6612,7 @@ static int vkmesh_trellis_postprocess_inner(
     int run_degenerate_cleanup) {
     if (vkmesh_trellis_postprocess_device_inner(
             mesh,
+            projection_output,
             decimation_target,
             max_hole_perimeter,
             degenerate_abs,
@@ -6615,6 +6634,14 @@ static int vkmesh_trellis_postprocess_inner(
         min_component_area);
 
     if (!vkmesh_log_fill_holes(mesh, max_hole_perimeter, "trellis.pre")) return 0;
+    if (projection_output != NULL && projection_output[0] != '\0') {
+        if (!write_obj(projection_output, mesh)) return 0;
+        fprintf(stderr,
+            "vkmesh: trellis.pre projection_mesh_output %s vertices=%" PRId64 " faces=%" PRId64 "\n",
+            projection_output,
+            mesh->n_vertices,
+            mesh->n_faces);
+    }
 
     int64_t first_target = (int64_t) decimation_target * 3;
     if (first_target > INT_MAX) first_target = INT_MAX;
@@ -6706,6 +6733,7 @@ static int vkmesh_trellis_postprocess_inner(
 
 static int vkmesh_trellis_postprocess(
     vkmesh_mesh * mesh,
+    const char * projection_output,
     int decimation_target,
     float max_hole_perimeter,
     float degenerate_abs,
@@ -6719,6 +6747,7 @@ static int vkmesh_trellis_postprocess(
     if (g_active_vkmesh_vk != NULL) {
         return vkmesh_trellis_postprocess_inner(
             mesh,
+            projection_output,
             decimation_target,
             max_hole_perimeter,
             degenerate_abs,
@@ -6740,6 +6769,7 @@ static int vkmesh_trellis_postprocess(
     fprintf(stderr, "vkmesh: trellis_postprocess using one persistent Vulkan context\n");
     int ok = vkmesh_trellis_postprocess_inner(
         mesh,
+        projection_output,
         decimation_target,
         max_hole_perimeter,
         degenerate_abs,
@@ -6789,6 +6819,7 @@ static void print_usage(const char * argv0) {
         "  --texture-size N              xatlas pack resolution, default 1024\n"
         "  --unsigned-distance pts.txt   Compute UDF for text points: x y z per line\n"
         "  --distance-output out.txt     Required with --unsigned-distance unless --output is enough for mesh only\n"
+        "  --projection-mesh-output OBJ  With --postprocess, write post-fill source mesh for texture projection\n"
         "\n"
         "Note: unsigned_distance is currently a Vulkan compute brute-force kernel;\n"
         "      remesh_narrow_band_dc is the remaining optional stage.\n",
@@ -6798,6 +6829,7 @@ static void print_usage(const char * argv0) {
 int main(int argc, char ** argv) {
     const char * input = NULL;
     const char * output = NULL;
+    const char * projection_output = NULL;
     const char * points_path = NULL;
     const char * distance_output = NULL;
     float max_hole_perimeter = 3e-2f;
@@ -6825,6 +6857,8 @@ int main(int argc, char ** argv) {
             input = argv[++i];
         } else if (strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             output = argv[++i];
+        } else if (strcmp(argv[i], "--projection-mesh-output") == 0 && i + 1 < argc) {
+            projection_output = argv[++i];
         } else if (strcmp(argv[i], "--postprocess") == 0 || strcmp(argv[i], "--trellis-postprocess") == 0) {
             trellis_postprocess = 1;
             uv_unwrap = 1;
@@ -6914,6 +6948,7 @@ int main(int argc, char ** argv) {
         int decimation_target = disable_simplify ? INT_MAX : target_faces;
         if (!vkmesh_trellis_postprocess(
                 &mesh,
+                projection_output,
                 decimation_target,
                 max_hole_perimeter,
                 degenerate_abs,

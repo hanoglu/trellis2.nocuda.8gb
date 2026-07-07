@@ -15,10 +15,10 @@
 #include "trellis_gltf_bake_frag_spv.h"
 #include "trellis_gltf_dilate_spv.h"
 #include "trellis_gltf_fill_empty_spv.h"
-#include "trellis_gltf_chart_keys_spv.h"
 #endif
 
 #include <errno.h>
+#include <float.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdint.h>
@@ -40,6 +40,12 @@ typedef struct trellis_gltf_chart_record {
     uint32_t key;
     uint32_t face;
 } trellis_gltf_chart_record;
+
+typedef struct trellis_gltf_edge_record {
+    uint64_t key;
+    uint32_t face;
+    uint32_t local_edge;
+} trellis_gltf_edge_record;
 
 typedef struct trellis_gltf_chart_input {
     float * positions;
@@ -130,6 +136,22 @@ static int make_named_file(
         return 0;
     }
     return make_joined_path(abs, abs_size, dir, uri);
+}
+
+static int path_has_extension_ci(const char * path, const char * ext) {
+    if (path == NULL || ext == NULL) return 0;
+    size_t path_len = strlen(path);
+    size_t ext_len = strlen(ext);
+    if (path_len < ext_len) return 0;
+    const char * p = path + path_len - ext_len;
+    for (size_t i = 0; i < ext_len; ++i) {
+        char a = p[i];
+        char b = ext[i];
+        if (a >= 'A' && a <= 'Z') a = (char) (a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char) (b - 'A' + 'a');
+        if (a != b) return 0;
+    }
+    return 1;
 }
 
 static float clamp01_export(float x) {
@@ -225,45 +247,51 @@ static void sample_pbr(
     const float p[3],
     float out[6]) {
     const int resolution = voxels->resolution > 0 ? voxels->resolution : 512;
-    int32_t gx = (int32_t) floorf((p[0] + 0.5f) * (float) resolution + 0.5f);
-    int32_t gy = (int32_t) floorf((p[1] + 0.5f) * (float) resolution + 0.5f);
-    int32_t gz = (int32_t) floorf((p[2] + 0.5f) * (float) resolution + 0.5f);
-    if (gx < 0) gx = 0; if (gy < 0) gy = 0; if (gz < 0) gz = 0;
-    if (gx >= resolution) gx = resolution - 1;
-    if (gy >= resolution) gy = resolution - 1;
-    if (gz >= resolution) gz = resolution - 1;
-    int best = -1;
-    for (int radius = 0; best < 0 && radius <= 2; ++radius) {
-        for (int dz = -radius; best < 0 && dz <= radius; ++dz) {
-            for (int dy = -radius; best < 0 && dy <= radius; ++dy) {
-                for (int dx = -radius; dx <= radius; ++dx) {
-                    if (radius > 0 && abs(dx) != radius && abs(dy) != radius && abs(dz) != radius) {
-                        continue;
-                    }
-                    int32_t x = gx + dx, y = gy + dy, z = gz + dz;
-                    if (x < 0 || y < 0 || z < 0 || x >= resolution || y >= resolution || z >= resolution) {
-                        continue;
-                    }
-                    best = pbr_hash_find(hash, x, y, z);
-                    if (best >= 0) {
-                        break;
-                    }
+    const float qx = (p[0] + 0.5f) * (float) resolution;
+    const float qy = (p[1] + 0.5f) * (float) resolution;
+    const float qz = (p[2] + 0.5f) * (float) resolution;
+    const int32_t bx = (int32_t) floorf(qx - 0.5f);
+    const int32_t by = (int32_t) floorf(qy - 0.5f);
+    const int32_t bz = (int32_t) floorf(qz - 0.5f);
+    float acc[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float sum_w = 0.0f;
+    for (int dz = 0; dz < 2; ++dz) {
+        for (int dy = 0; dy < 2; ++dy) {
+            for (int dx = 0; dx < 2; ++dx) {
+                int32_t x = bx + dx, y = by + dy, z = bz + dz;
+                if (x < 0 || y < 0 || z < 0 || x >= resolution || y >= resolution || z >= resolution) {
+                    continue;
                 }
+                const float wx = 1.0f - fabsf(qx - (float) x - 0.5f);
+                const float wy = 1.0f - fabsf(qy - (float) y - 0.5f);
+                const float wz = 1.0f - fabsf(qz - (float) z - 0.5f);
+                const float w = wx * wy * wz;
+                if (w <= 0.0f) {
+                    continue;
+                }
+                int idx = pbr_hash_find(hash, x, y, z);
+                if (idx < 0) {
+                    continue;
+                }
+                float v[6] = {0.8f, 0.8f, 0.8f, 0.0f, 0.8f, 1.0f};
+                const float * src = voxels->attrs + (size_t) idx * (size_t) voxels->channels;
+                for (int c = 0; c < voxels->channels && c < 6; ++c) {
+                    v[c] = clamp01_export(src[c]);
+                }
+                v[5] = 1.0f;
+                for (int c = 0; c < 6; ++c) {
+                    acc[c] += v[c] * w;
+                }
+                sum_w += w;
             }
         }
     }
-    out[0] = out[1] = out[2] = 0.8f;
-    out[3] = 0.0f;
-    out[4] = 0.8f;
-    out[5] = 1.0f;
-    if (best >= 0) {
-        const float * src = voxels->attrs + (size_t) best * (size_t) voxels->channels;
-        for (int c = 0; c < voxels->channels && c < 6; ++c) {
-            out[c] = clamp01_export(src[c]);
+    if (sum_w > 1e-12f) {
+        for (int c = 0; c < 6; ++c) {
+            out[c] = acc[c] / sum_w;
         }
-        if (voxels->channels < 6) {
-            out[5] = 1.0f;
-        }
+    } else {
+        memset(out, 0, 6u * sizeof(float));
     }
 }
 
@@ -368,7 +396,7 @@ static trellis_status unwrap_mesh_xatlas_direct(
     xatlasPackOptions pack_options;
     xatlasPackOptionsInit(&pack_options);
     pack_options.resolution = (uint32_t) texture_size;
-    pack_options.padding = 4;
+    pack_options.padding = 0;
     pack_options.createImage = false;
     xatlasGenerate(atlas, NULL, &pack_options);
     if (atlas->meshCount != 1 || atlas->meshes == NULL || atlas->meshes[0].vertexCount == 0) {
@@ -399,7 +427,7 @@ static trellis_status unwrap_mesh_xatlas_direct(
         memcpy(out->positions + (size_t) i * 3u, mesh->vertices + (size_t) src * 3u, 3u * sizeof(float));
         memcpy(out->normals + (size_t) i * 3u, input_normals + (size_t) src * 3u, 3u * sizeof(float));
         out->uvs[(size_t) i * 2u + 0u] = clamp01_export(v->uv[0] / atlas_w);
-        out->uvs[(size_t) i * 2u + 1u] = clamp01_export(1.0f - v->uv[1] / atlas_h);
+        out->uvs[(size_t) i * 2u + 1u] = clamp01_export(v->uv[1] / atlas_h);
     }
     memcpy(out->indices, xm->indexArray, (size_t) out->index_count * sizeof(uint32_t));
     TRELLIS_INFO(
@@ -502,11 +530,11 @@ static trellis_status bake_textures(
         const float * uv1 = mesh->uvs + (size_t) i1 * 2u;
         const float * uv2 = mesh->uvs + (size_t) i2 * 2u;
         float x0 = uv0[0] * (float) (texture_size - 1);
-        float y0 = (1.0f - uv0[1]) * (float) (texture_size - 1);
+        float y0 = uv0[1] * (float) (texture_size - 1);
         float x1 = uv1[0] * (float) (texture_size - 1);
-        float y1 = (1.0f - uv1[1]) * (float) (texture_size - 1);
+        float y1 = uv1[1] * (float) (texture_size - 1);
         float x2 = uv2[0] * (float) (texture_size - 1);
-        float y2 = (1.0f - uv2[1]) * (float) (texture_size - 1);
+        float y2 = uv2[1] * (float) (texture_size - 1);
         float area = edge2(x0, y0, x1, y1, x2, y2);
         if (fabsf(area) < 1e-8f) {
             continue;
@@ -583,15 +611,14 @@ typedef struct trellis_gltf_vk {
     VkPipelineLayout pipeline_layout;
     VkRenderPass render_pass;
     VkPipeline graphics_pipeline;
-    VkPipeline compute_pipelines[3];
+    VkPipeline compute_pipelines[2];
     VkDescriptorPool descriptor_pool;
 } trellis_gltf_vk;
 
 typedef enum trellis_gltf_vk_compute_pipeline {
     TRELLIS_GLTF_COMPUTE_DILATE = 0,
     TRELLIS_GLTF_COMPUTE_FILL_EMPTY = 1,
-    TRELLIS_GLTF_COMPUTE_CHART_KEYS = 2,
-    TRELLIS_GLTF_COMPUTE_COUNT = 3,
+    TRELLIS_GLTF_COMPUTE_COUNT = 2,
 } trellis_gltf_vk_compute_pipeline;
 
 typedef struct trellis_gltf_vk_shader {
@@ -615,7 +642,6 @@ static const trellis_gltf_vk_shader g_gltf_bake_frag_shader = {
 static const trellis_gltf_vk_shader g_gltf_compute_shaders[TRELLIS_GLTF_COMPUTE_COUNT] = {
     { trellis_gltf_dilate_spv, trellis_gltf_dilate_spv_len, "gltf_dilate" },
     { trellis_gltf_fill_empty_spv, trellis_gltf_fill_empty_spv_len, "gltf_fill_empty" },
-    { trellis_gltf_chart_keys_spv, trellis_gltf_chart_keys_spv_len, "gltf_chart_keys" },
 };
 
 typedef struct trellis_gltf_vk_push {
@@ -635,7 +661,199 @@ typedef struct trellis_gltf_vk_push {
     uint32_t chart_target_faces;
     uint32_t chart_normal_bins;
     uint32_t chart_flags;
+    uint32_t project_vertex_count;
+    uint32_t project_face_count;
+    uint32_t project_node_count;
+    uint32_t project_flags;
 } trellis_gltf_vk_push;
+
+typedef struct trellis_gltf_bvh_tri {
+    float bmin[3];
+    float bmax[3];
+    float centroid[3];
+    uint32_t face;
+} trellis_gltf_bvh_tri;
+
+typedef struct trellis_gltf_bvh_node {
+    float bmin[3];
+    float bmax[3];
+    uint32_t left;
+    uint32_t meta;
+} trellis_gltf_bvh_node;
+
+static uint32_t u32_from_float_export(float value) {
+    union {
+        uint32_t u;
+        float f;
+    } v;
+    v.f = value;
+    return v.u;
+}
+
+static void gltf_bvh_bounds_init(float bmin[3], float bmax[3]) {
+    bmin[0] = bmin[1] = bmin[2] = FLT_MAX;
+    bmax[0] = bmax[1] = bmax[2] = -FLT_MAX;
+}
+
+static void gltf_bvh_bounds_add(float bmin[3], float bmax[3], const float pmin[3], const float pmax[3]) {
+    for (int i = 0; i < 3; ++i) {
+        if (pmin[i] < bmin[i]) bmin[i] = pmin[i];
+        if (pmax[i] > bmax[i]) bmax[i] = pmax[i];
+    }
+}
+
+static uint32_t gltf_bvh_build_recursive(
+    trellis_gltf_bvh_tri * tris,
+    int start,
+    int count,
+    trellis_gltf_bvh_node * nodes,
+    uint32_t * node_count) {
+    uint32_t node_id = (*node_count)++;
+    trellis_gltf_bvh_node * node = &nodes[node_id];
+    gltf_bvh_bounds_init(node->bmin, node->bmax);
+    for (int i = start; i < start + count; ++i) {
+        gltf_bvh_bounds_add(node->bmin, node->bmax, tris[i].bmin, tris[i].bmax);
+    }
+    if (count <= 4) {
+        node->left = (uint32_t) start;
+        node->meta = 0x80000000u | (uint32_t) count;
+        return node_id;
+    }
+
+    float cmin[3];
+    float cmax[3];
+    gltf_bvh_bounds_init(cmin, cmax);
+    for (int i = start; i < start + count; ++i) {
+        gltf_bvh_bounds_add(cmin, cmax, tris[i].centroid, tris[i].centroid);
+    }
+    float ex[3] = { cmax[0] - cmin[0], cmax[1] - cmin[1], cmax[2] - cmin[2] };
+    int axis = 0;
+    if (ex[1] > ex[axis]) axis = 1;
+    if (ex[2] > ex[axis]) axis = 2;
+    float split = 0.5f * (cmin[axis] + cmax[axis]);
+    int mid = start;
+    for (int i = start; i < start + count; ++i) {
+        if (tris[i].centroid[axis] < split) {
+            trellis_gltf_bvh_tri tmp = tris[mid];
+            tris[mid] = tris[i];
+            tris[i] = tmp;
+            ++mid;
+        }
+    }
+    int left_count = mid - start;
+    if (left_count <= 0 || left_count >= count) left_count = count / 2;
+    uint32_t left = gltf_bvh_build_recursive(tris, start, left_count, nodes, node_count);
+    uint32_t right = gltf_bvh_build_recursive(tris, start + left_count, count - left_count, nodes, node_count);
+    node->left = left;
+    node->meta = right;
+    return node_id;
+}
+
+static trellis_status build_projection_bvh_buffer(
+    const trellis_mesh_host * mesh,
+    uint32_t ** words_out,
+    size_t * word_count_out,
+    uint32_t * vertex_count_out,
+    uint32_t * face_count_out,
+    uint32_t * node_count_out) {
+    *words_out = NULL;
+    *word_count_out = 0;
+    *vertex_count_out = 0;
+    *face_count_out = 0;
+    *node_count_out = 0;
+    if (mesh == NULL) {
+        return TRELLIS_STATUS_OK;
+    }
+    if (mesh->vertices == NULL || mesh->faces == NULL ||
+        mesh->n_vertices <= 0 || mesh->n_faces <= 0 ||
+        mesh->n_vertices > UINT32_MAX || mesh->n_faces > INT32_MAX) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+
+    trellis_gltf_bvh_tri * tris =
+        (trellis_gltf_bvh_tri *) malloc((size_t) mesh->n_faces * sizeof(*tris));
+    trellis_gltf_bvh_node * nodes =
+        (trellis_gltf_bvh_node *) malloc((size_t) mesh->n_faces * 2u * sizeof(*nodes));
+    uint32_t * tri_indices =
+        (uint32_t *) malloc((size_t) mesh->n_faces * sizeof(*tri_indices));
+    if (tris == NULL || nodes == NULL || tri_indices == NULL) {
+        free(tris);
+        free(nodes);
+        free(tri_indices);
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+
+    for (int64_t i = 0; i < mesh->n_faces; ++i) {
+        const int32_t * face = mesh->faces + (size_t) i * 3u;
+        gltf_bvh_bounds_init(tris[i].bmin, tris[i].bmax);
+        float sum[3] = { 0.0f, 0.0f, 0.0f };
+        for (int k = 0; k < 3; ++k) {
+            if (face[k] < 0 || (int64_t) face[k] >= mesh->n_vertices) {
+                free(tris);
+                free(nodes);
+                free(tri_indices);
+                return TRELLIS_STATUS_INVALID_ARGUMENT;
+            }
+            const float * v = mesh->vertices + (size_t) face[k] * 3u;
+            gltf_bvh_bounds_add(tris[i].bmin, tris[i].bmax, v, v);
+            sum[0] += v[0];
+            sum[1] += v[1];
+            sum[2] += v[2];
+        }
+        tris[i].centroid[0] = sum[0] / 3.0f;
+        tris[i].centroid[1] = sum[1] / 3.0f;
+        tris[i].centroid[2] = sum[2] / 3.0f;
+        tris[i].face = (uint32_t) i;
+    }
+
+    uint32_t node_count = 0;
+    (void) gltf_bvh_build_recursive(tris, 0, (int) mesh->n_faces, nodes, &node_count);
+    for (int64_t i = 0; i < mesh->n_faces; ++i) {
+        tri_indices[i] = tris[i].face;
+    }
+    free(tris);
+
+    const size_t vertex_words = (size_t) mesh->n_vertices * 3u;
+    const size_t face_words = (size_t) mesh->n_faces * 3u;
+    const size_t node_words = (size_t) node_count * 8u;
+    const size_t tri_words = (size_t) mesh->n_faces;
+    const size_t total_words = vertex_words + face_words + node_words + tri_words;
+    uint32_t * words = (uint32_t *) malloc(total_words * sizeof(uint32_t));
+    if (words == NULL) {
+        free(nodes);
+        free(tri_indices);
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    for (int64_t i = 0; i < mesh->n_vertices * 3; ++i) {
+        words[i] = u32_from_float_export(mesh->vertices[i]);
+    }
+    size_t face_base = vertex_words;
+    for (int64_t i = 0; i < mesh->n_faces * 3; ++i) {
+        words[face_base + (size_t) i] = (uint32_t) mesh->faces[i];
+    }
+    size_t node_base = face_base + face_words;
+    for (uint32_t i = 0; i < node_count; ++i) {
+        size_t base = node_base + (size_t) i * 8u;
+        words[base + 0u] = u32_from_float_export(nodes[i].bmin[0]);
+        words[base + 1u] = u32_from_float_export(nodes[i].bmin[1]);
+        words[base + 2u] = u32_from_float_export(nodes[i].bmin[2]);
+        words[base + 3u] = nodes[i].left;
+        words[base + 4u] = u32_from_float_export(nodes[i].bmax[0]);
+        words[base + 5u] = u32_from_float_export(nodes[i].bmax[1]);
+        words[base + 6u] = u32_from_float_export(nodes[i].bmax[2]);
+        words[base + 7u] = nodes[i].meta;
+    }
+    memcpy(words + node_base + node_words, tri_indices, tri_words * sizeof(uint32_t));
+    free(nodes);
+    free(tri_indices);
+
+    *words_out = words;
+    *word_count_out = total_words;
+    *vertex_count_out = (uint32_t) mesh->n_vertices;
+    *face_count_out = (uint32_t) mesh->n_faces;
+    *node_count_out = node_count;
+    return TRELLIS_STATUS_OK;
+}
 
 static uint32_t hash_coord_export32(int32_t x, int32_t y, int32_t z) {
     uint32_t h = (uint32_t) x * 73856093u ^ (uint32_t) y * 19349663u ^ (uint32_t) z * 83492791u;
@@ -1259,21 +1477,25 @@ static uint32_t gltf_uv_chart_target_faces(void) {
     return value;
 }
 
-static uint32_t gltf_uv_chart_grid(uint32_t face_count, uint32_t target_faces) {
-    uint32_t grid = 1u;
-    uint64_t desired = ((uint64_t) face_count + (uint64_t) target_faces - 1u) / (uint64_t) target_faces;
-    while (grid < 255u && (uint64_t) grid * (uint64_t) grid * (uint64_t) grid < desired) {
-        ++grid;
-    }
-    const char * env = getenv("TRELLIS_GLTF_UV_CHART_GRID");
-    if (env != NULL && env[0] != '\0') {
-        char * end = NULL;
-        unsigned long parsed = strtoul(env, &end, 10);
-        if (end != env && parsed >= 1ul && parsed <= 255ul) {
-            grid = (uint32_t) parsed;
-        }
-    }
-    return grid;
+static int gltf_uv_batch_clusters_enabled(void) {
+    const char * env = getenv("TRELLIS_GLTF_UV_BATCH_CLUSTERS");
+    return env != NULL &&
+        (strcmp(env, "1") == 0 ||
+         strcmp(env, "true") == 0 ||
+         strcmp(env, "TRUE") == 0);
+}
+
+static int gltf_uv_charted_enabled(void) {
+    const char * env = getenv("TRELLIS_GLTF_UV_CHARTED");
+    return env == NULL || !(strcmp(env, "0") == 0 || strcmp(env, "false") == 0 || strcmp(env, "FALSE") == 0);
+}
+
+static int gltf_env_truthy(const char * name) {
+    const char * env = getenv(name);
+    return env != NULL && env[0] != '\0' &&
+        strcmp(env, "0") != 0 &&
+        strcmp(env, "false") != 0 &&
+        strcmp(env, "FALSE") != 0;
 }
 
 static int gltf_chart_record_compare(const void * a, const void * b) {
@@ -1284,93 +1506,258 @@ static int gltf_chart_record_compare(const void * a, const void * b) {
     return 0;
 }
 
-static int gltf_compute_chart_records_vulkan(
+static int gltf_edge_record_compare(const void * a, const void * b) {
+    const trellis_gltf_edge_record * ea = (const trellis_gltf_edge_record *) a;
+    const trellis_gltf_edge_record * eb = (const trellis_gltf_edge_record *) b;
+    if (ea->key != eb->key) return ea->key < eb->key ? -1 : 1;
+    if (ea->face != eb->face) return ea->face < eb->face ? -1 : 1;
+    if (ea->local_edge != eb->local_edge) return ea->local_edge < eb->local_edge ? -1 : 1;
+    return 0;
+}
+
+static uint64_t gltf_edge_key_u32(uint32_t a, uint32_t b) {
+    uint32_t lo = a < b ? a : b;
+    uint32_t hi = a < b ? b : a;
+    return ((uint64_t) lo << 32) | (uint64_t) hi;
+}
+
+static float gltf_vec3_dot(const float * a, const float * b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static void gltf_vec3_normalize(float * v) {
+    float len2 = gltf_vec3_dot(v, v);
+    if (len2 > 1e-20f) {
+        float inv = 1.0f / sqrtf(len2);
+        v[0] *= inv;
+        v[1] *= inv;
+        v[2] *= inv;
+    } else {
+        v[0] = 0.0f;
+        v[1] = 0.0f;
+        v[2] = 1.0f;
+    }
+}
+
+static int gltf_face_normal_area(
+    const trellis_mesh_host * mesh,
+    uint32_t face_id,
+    float normal[3],
+    float * area_out) {
+    const int32_t * face = mesh->faces + (size_t) face_id * 3u;
+    for (uint32_t i = 0; i < 3u; ++i) {
+        if (face[i] < 0 || (uint32_t) face[i] >= (uint32_t) mesh->n_vertices) {
+            return 0;
+        }
+    }
+    const float * p0 = mesh->vertices + (size_t) (uint32_t) face[0] * 3u;
+    const float * p1 = mesh->vertices + (size_t) (uint32_t) face[1] * 3u;
+    const float * p2 = mesh->vertices + (size_t) (uint32_t) face[2] * 3u;
+    float ux = p1[0] - p0[0], uy = p1[1] - p0[1], uz = p1[2] - p0[2];
+    float vx = p2[0] - p0[0], vy = p2[1] - p0[1], vz = p2[2] - p0[2];
+    float cx = uy * vz - uz * vy;
+    float cy = uz * vx - ux * vz;
+    float cz = ux * vy - uy * vx;
+    float len = sqrtf(cx * cx + cy * cy + cz * cz);
+    if (len > 1e-20f) {
+        float inv = 1.0f / len;
+        normal[0] = cx * inv;
+        normal[1] = cy * inv;
+        normal[2] = cz * inv;
+    } else {
+        normal[0] = 0.0f;
+        normal[1] = 0.0f;
+        normal[2] = 1.0f;
+    }
+    *area_out = 0.5f * len;
+    return 1;
+}
+
+static float gltf_uv_chart_cone_cos(void) {
+    float degrees = 90.0f;
+    const char * env = getenv("TRELLIS_GLTF_UV_CONE_DEGREES");
+    if (env != NULL && env[0] != '\0') {
+        char * end = NULL;
+        float parsed = strtof(env, &end);
+        if (end != env && parsed >= 5.0f && parsed <= 180.0f) {
+            degrees = parsed;
+        }
+    }
+    return cosf(degrees * 0.017453292519943295769f);
+}
+
+static int gltf_compute_chart_records_connected(
     const trellis_mesh_host * mesh,
     uint32_t target_faces,
     trellis_gltf_chart_record ** records_out,
-    uint32_t * grid_out) {
+    uint32_t * chart_count_out,
+    uint32_t * max_chart_faces_out) {
     *records_out = NULL;
-    *grid_out = 1u;
+    *chart_count_out = 0;
+    *max_chart_faces_out = 0;
     if (mesh == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
         mesh->n_vertices <= 0 || mesh->n_faces <= 0 ||
         mesh->n_vertices > UINT32_MAX || mesh->n_faces > UINT32_MAX) {
         return 0;
     }
 
-    float min_x = mesh->vertices[0], min_y = mesh->vertices[1], min_z = mesh->vertices[2];
-    float max_x = min_x, max_y = min_y, max_z = min_z;
-    for (int64_t i = 1; i < mesh->n_vertices; ++i) {
-        const float * p = mesh->vertices + (size_t) i * 3u;
-        if (p[0] < min_x) min_x = p[0];
-        if (p[1] < min_y) min_y = p[1];
-        if (p[2] < min_z) min_z = p[2];
-        if (p[0] > max_x) max_x = p[0];
-        if (p[1] > max_y) max_y = p[1];
-        if (p[2] > max_z) max_z = p[2];
-    }
-    float extent_x = max_x - min_x;
-    float extent_y = max_y - min_y;
-    float extent_z = max_z - min_z;
-    float extent = fmaxf(extent_x, fmaxf(extent_y, extent_z));
-    if (extent <= 1e-20f) extent = 1.0f;
-
     uint32_t face_count = (uint32_t) mesh->n_faces;
-    uint32_t grid = gltf_uv_chart_grid(face_count, target_faces);
+    uint64_t edge_count64 = (uint64_t) face_count * 3u;
+    if (edge_count64 > SIZE_MAX / sizeof(trellis_gltf_edge_record)) {
+        return 0;
+    }
     trellis_gltf_chart_record * records =
         (trellis_gltf_chart_record *) malloc((size_t) face_count * sizeof(trellis_gltf_chart_record));
-    if (records == NULL) return 0;
-
-    trellis_gltf_vk vk;
-    trellis_gltf_vk_buffer buffers[10];
-    memset(&vk, 0, sizeof(vk));
-    memset(buffers, 0, sizeof(buffers));
-    int ok = 0;
-    if (!gltf_vk_init(&vk)) goto cleanup;
-
-    size_t positions_bytes = (size_t) mesh->n_vertices * 3u * sizeof(float);
-    size_t faces_bytes = (size_t) mesh->n_faces * 3u * sizeof(int32_t);
-    size_t records_bytes = (size_t) face_count * sizeof(trellis_gltf_chart_record);
-    if (!gltf_vk_buffer_create(&vk, positions_bytes, &buffers[0]) ||
-        !gltf_vk_buffer_create(&vk, faces_bytes, &buffers[1]) ||
-        !gltf_vk_buffer_create(&vk, records_bytes, &buffers[2])) {
-        goto cleanup;
-    }
-    for (uint32_t i = 3; i < 10; ++i) {
-        if (!gltf_vk_buffer_create(&vk, 4u, &buffers[i])) goto cleanup;
+    trellis_gltf_edge_record * edges =
+        (trellis_gltf_edge_record *) malloc((size_t) edge_count64 * sizeof(trellis_gltf_edge_record));
+    int32_t * neighbors = (int32_t *) malloc((size_t) face_count * 3u * sizeof(int32_t));
+    float * face_normals = (float *) malloc((size_t) face_count * 3u * sizeof(float));
+    float * face_areas = (float *) malloc((size_t) face_count * sizeof(float));
+    int32_t * chart_ids = (int32_t *) malloc((size_t) face_count * sizeof(int32_t));
+    uint32_t * queue = (uint32_t *) malloc((size_t) face_count * sizeof(uint32_t));
+    if (records == NULL || edges == NULL || neighbors == NULL ||
+        face_normals == NULL || face_areas == NULL || chart_ids == NULL || queue == NULL) {
+        free(records);
+        free(edges);
+        free(neighbors);
+        free(face_normals);
+        free(face_areas);
+        free(chart_ids);
+        free(queue);
+        return 0;
     }
 
-    memcpy(buffers[0].mapped, mesh->vertices, positions_bytes);
-    memcpy(buffers[1].mapped, mesh->faces, faces_bytes);
-    memset(buffers[2].mapped, 0, records_bytes);
-
-    trellis_gltf_vk_push push;
-    memset(&push, 0, sizeof(push));
-    push.triangle_count = face_count;
-    push.bounds_min_x = min_x;
-    push.bounds_min_y = min_y;
-    push.bounds_min_z = min_z;
-    push.bounds_inv_extent = 1.0f / extent;
-    push.chart_grid = grid;
-    push.chart_target_faces = target_faces;
-    push.chart_normal_bins = 6u;
-
-    trellis_gltf_vk_buffer * desc[10];
-    for (int i = 0; i < 10; ++i) desc[i] = &buffers[i];
-    uint32_t groups = (face_count + 127u) / 128u;
-    if (!gltf_vk_dispatch(&vk, TRELLIS_GLTF_COMPUTE_CHART_KEYS, desc, &push, groups, 1u)) {
-        goto cleanup;
+    for (uint32_t i = 0; i < face_count * 3u; ++i) {
+        neighbors[i] = -1;
     }
-    memcpy(records, buffers[2].mapped, records_bytes);
+    for (uint32_t i = 0; i < face_count; ++i) {
+        chart_ids[i] = -1;
+        float n[3];
+        float area = 0.0f;
+        if (!gltf_face_normal_area(mesh, i, n, &area)) {
+            free(records);
+            free(edges);
+            free(neighbors);
+            free(face_normals);
+            free(face_areas);
+            free(chart_ids);
+            free(queue);
+            return 0;
+        }
+        face_normals[(size_t) i * 3u + 0u] = n[0];
+        face_normals[(size_t) i * 3u + 1u] = n[1];
+        face_normals[(size_t) i * 3u + 2u] = n[2];
+        face_areas[i] = area > 1e-20f ? area : 1.0f;
+
+        const int32_t * f = mesh->faces + (size_t) i * 3u;
+        uint32_t v0 = (uint32_t) f[0], v1 = (uint32_t) f[1], v2 = (uint32_t) f[2];
+        edges[(size_t) i * 3u + 0u] = (trellis_gltf_edge_record) { gltf_edge_key_u32(v0, v1), i, 0u };
+        edges[(size_t) i * 3u + 1u] = (trellis_gltf_edge_record) { gltf_edge_key_u32(v1, v2), i, 1u };
+        edges[(size_t) i * 3u + 2u] = (trellis_gltf_edge_record) { gltf_edge_key_u32(v2, v0), i, 2u };
+    }
+
+    qsort(edges, (size_t) edge_count64, sizeof(*edges), gltf_edge_record_compare);
+    size_t e = 0;
+    while (e < (size_t) edge_count64) {
+        size_t end = e + 1u;
+        while (end < (size_t) edge_count64 && edges[end].key == edges[e].key) ++end;
+        if (end - e == 2u) {
+            const trellis_gltf_edge_record * a = &edges[e];
+            const trellis_gltf_edge_record * b = &edges[e + 1u];
+            neighbors[(size_t) a->face * 3u + a->local_edge] = (int32_t) b->face;
+            neighbors[(size_t) b->face * 3u + b->local_edge] = (int32_t) a->face;
+        }
+        e = end;
+    }
+    free(edges);
+    edges = NULL;
+
+    const float cone_cos = gltf_uv_chart_cone_cos();
+    uint32_t chunk_count = 0;
+    uint32_t batch_count = 0;
+    uint32_t current_batch = 0;
+    uint32_t current_batch_faces = 0;
+    uint32_t max_batch_faces = 0;
+    const int batch_clusters = gltf_uv_batch_clusters_enabled();
+    for (uint32_t seed = 0; seed < face_count; ++seed) {
+        if (chart_ids[seed] >= 0) continue;
+        if (chunk_count == INT32_MAX || batch_count == UINT32_MAX) {
+            free(records);
+            free(neighbors);
+            free(face_normals);
+            free(face_areas);
+            free(chart_ids);
+            free(queue);
+            return 0;
+        }
+        uint32_t chunk = chunk_count++;
+        uint32_t head = 0;
+        uint32_t tail = 0;
+        uint32_t chart_faces = 0;
+        float axis_sum[3] = {
+            face_normals[(size_t) seed * 3u + 0u] * face_areas[seed],
+            face_normals[(size_t) seed * 3u + 1u] * face_areas[seed],
+            face_normals[(size_t) seed * 3u + 2u] * face_areas[seed],
+        };
+        float axis[3] = { axis_sum[0], axis_sum[1], axis_sum[2] };
+        gltf_vec3_normalize(axis);
+        chart_ids[seed] = (int32_t) chunk;
+        queue[tail++] = seed;
+        chart_faces = 1u;
+
+        while (head < tail) {
+            uint32_t f = queue[head++];
+            for (uint32_t le = 0; le < 3u; ++le) {
+                if (chart_faces >= target_faces) break;
+                int32_t nb_i32 = neighbors[(size_t) f * 3u + le];
+                if (nb_i32 < 0) continue;
+                uint32_t nb = (uint32_t) nb_i32;
+                if (chart_ids[nb] >= 0) continue;
+                const float * nn = face_normals + (size_t) nb * 3u;
+                float score = gltf_vec3_dot(axis, nn);
+                if (score < cone_cos) continue;
+                chart_ids[nb] = (int32_t) chunk;
+                queue[tail++] = nb;
+                ++chart_faces;
+                float area = face_areas[nb];
+                axis_sum[0] += nn[0] * area;
+                axis_sum[1] += nn[1] * area;
+                axis_sum[2] += nn[2] * area;
+                axis[0] = axis_sum[0];
+                axis[1] = axis_sum[1];
+                axis[2] = axis_sum[2];
+                gltf_vec3_normalize(axis);
+            }
+        }
+        if (batch_clusters) {
+            if (current_batch_faces == 0 || current_batch_faces + chart_faces > target_faces) {
+                current_batch = batch_count++;
+                current_batch_faces = 0;
+            }
+        } else {
+            current_batch = batch_count++;
+            current_batch_faces = 0;
+        }
+        for (uint32_t i = 0; i < tail; ++i) {
+            uint32_t f = queue[i];
+            records[f].key = current_batch;
+            records[f].face = f;
+        }
+        current_batch_faces += chart_faces;
+        if (current_batch_faces > max_batch_faces) max_batch_faces = current_batch_faces;
+    }
+
     *records_out = records;
-    *grid_out = grid;
+    *chart_count_out = batch_count;
+    *max_chart_faces_out = max_batch_faces;
     records = NULL;
-    ok = 1;
-
-cleanup:
-    for (int i = 0; i < 10; ++i) gltf_vk_buffer_destroy(&vk, &buffers[i]);
-    gltf_vk_destroy(&vk);
     free(records);
-    return ok;
+    free(neighbors);
+    free(face_normals);
+    free(face_areas);
+    free(chart_ids);
+    free(queue);
+    return 1;
 }
 
 static trellis_status unwrap_mesh_xatlas_charted_vulkan(
@@ -1394,8 +1781,9 @@ static trellis_status unwrap_mesh_xatlas_charted_vulkan(
     mesh_compute_normals(mesh, input_normals);
 
     trellis_gltf_chart_record * records = NULL;
-    uint32_t grid = 1u;
-    if (!gltf_compute_chart_records_vulkan(mesh, target_faces, &records, &grid)) {
+    uint32_t clustered_chart_count = 0;
+    uint32_t max_chart_faces = 0;
+    if (!gltf_compute_chart_records_connected(mesh, target_faces, &records, &clustered_chart_count, &max_chart_faces)) {
         free(input_normals);
         return TRELLIS_STATUS_ERROR;
     }
@@ -1404,6 +1792,12 @@ static trellis_status unwrap_mesh_xatlas_charted_vulkan(
     uint32_t chart_count = 0;
     for (int64_t i = 0; i < mesh->n_faces; ++i) {
         if (i == 0 || records[i].key != records[i - 1].key) ++chart_count;
+    }
+    if (clustered_chart_count != chart_count) {
+        TRELLIS_INFO(
+        "glTF export: connected chart count adjusted records=%u sorted=%u",
+            clustered_chart_count,
+            chart_count);
     }
     if (chart_count <= 1u) {
         free(records);
@@ -1514,7 +1908,7 @@ static trellis_status unwrap_mesh_xatlas_charted_vulkan(
         xatlasPackOptions pack_options;
         xatlasPackOptionsInit(&pack_options);
         pack_options.resolution = (uint32_t) texture_size;
-        pack_options.padding = 4;
+        pack_options.padding = 0;
         pack_options.createImage = false;
         xatlasGenerate(atlas, NULL, &pack_options);
         if (atlas->meshCount != chart_count || atlas->meshes == NULL) {
@@ -1568,7 +1962,7 @@ static trellis_status unwrap_mesh_xatlas_charted_vulkan(
                     input_normals + (size_t) global * 3u,
                     3u * sizeof(float));
                 out->uvs[(size_t) (vertex_base + i) * 2u + 0u] = clamp01_export(v->uv[0] / atlas_w);
-                out->uvs[(size_t) (vertex_base + i) * 2u + 1u] = clamp01_export(1.0f - v->uv[1] / atlas_h);
+                out->uvs[(size_t) (vertex_base + i) * 2u + 1u] = clamp01_export(v->uv[1] / atlas_h);
             }
             if (status != TRELLIS_STATUS_OK) break;
             for (uint32_t i = 0; i < xm->indexCount; ++i) {
@@ -1584,10 +1978,11 @@ static trellis_status unwrap_mesh_xatlas_charted_vulkan(
         }
         if (status == TRELLIS_STATUS_OK) {
             TRELLIS_INFO(
-                "glTF export: Vulkan charted xatlas unwrap faces=%" PRId64 " grid=%u charts=%u xatlas_charts=%u vertices=%u atlas=%ux%u",
+                "glTF export: connected xatlas unwrap faces=%" PRId64 " target=%u clusters=%u max_cluster_faces=%u xatlas_charts=%u vertices=%u atlas=%ux%u",
                 mesh->n_faces,
-                grid,
+                target_faces,
                 chart_count,
+                max_chart_faces,
                 atlas->chartCount,
                 out->vertex_count,
                 atlas->width,
@@ -1797,6 +2192,7 @@ static trellis_status build_pbr_hash_entries(
 
 static trellis_status bake_textures_vulkan(
     const trellis_gltf_mesh * mesh,
+    const trellis_mesh_host * sample_mesh,
     const trellis_pbr_voxels * voxels,
     int texture_size,
     uint8_t ** base_out,
@@ -1829,6 +2225,39 @@ static trellis_status bake_textures_vulkan(
         return status;
     }
 
+    uint32_t * projection_words = NULL;
+    size_t projection_word_count = 0;
+    uint32_t projection_vertex_count = 0;
+    uint32_t projection_face_count = 0;
+    uint32_t projection_node_count = 0;
+    const char * project_env = getenv("TRELLIS_GLTF_PROJECT_SOURCE");
+    const int projection_disabled =
+        project_env != NULL &&
+        (strcmp(project_env, "0") == 0 ||
+         strcmp(project_env, "false") == 0 ||
+         strcmp(project_env, "FALSE") == 0);
+    const int projection_enabled = sample_mesh != NULL && !projection_disabled;
+    if (projection_enabled) {
+        status = build_projection_bvh_buffer(
+            sample_mesh,
+            &projection_words,
+            &projection_word_count,
+            &projection_vertex_count,
+            &projection_face_count,
+            &projection_node_count);
+        if (status != TRELLIS_STATUS_OK) {
+            free(hash_entries);
+            free(base);
+            free(mr);
+            return status;
+        }
+        TRELLIS_INFO(
+            "glTF export: source projection BVH vertices=%u faces=%u nodes=%u",
+            projection_vertex_count,
+            projection_face_count,
+            projection_node_count);
+    }
+
     trellis_gltf_vk vk;
     trellis_gltf_vk_buffer buffers[10];
     trellis_gltf_vk_image base_image;
@@ -1838,6 +2267,7 @@ static trellis_status bake_textures_vulkan(
     memset(&base_image, 0, sizeof(base_image));
     memset(&mr_image, 0, sizeof(mr_image));
     if (!gltf_vk_init(&vk)) {
+        free(projection_words);
         free(hash_entries);
         free(base);
         free(mr);
@@ -1849,13 +2279,14 @@ static trellis_status bake_textures_vulkan(
     const size_t indices_bytes = (size_t) mesh->index_count * sizeof(uint32_t);
     const size_t hash_bytes = (size_t) hash_size * 4u * sizeof(int32_t);
     const size_t attrs_bytes = (size_t) voxels->n_coords * (size_t) voxels->channels * sizeof(float);
+    const size_t projection_bytes = projection_word_count * sizeof(uint32_t);
     int ok =
         gltf_vk_buffer_create(&vk, positions_bytes, &buffers[0]) &&
         gltf_vk_buffer_create(&vk, uvs_bytes, &buffers[1]) &&
         gltf_vk_buffer_create(&vk, indices_bytes, &buffers[2]) &&
         gltf_vk_buffer_create(&vk, hash_bytes, &buffers[3]) &&
         gltf_vk_buffer_create(&vk, attrs_bytes, &buffers[4]) &&
-        gltf_vk_buffer_create(&vk, image_bytes, &buffers[5]) &&
+        gltf_vk_buffer_create(&vk, projection_bytes > 0 ? projection_bytes : 4u, &buffers[5]) &&
         gltf_vk_buffer_create(&vk, image_bytes, &buffers[6]) &&
         gltf_vk_buffer_create(&vk, image_bytes, &buffers[7]) &&
         gltf_vk_buffer_create(&vk, image_bytes, &buffers[8]) &&
@@ -1875,7 +2306,11 @@ static trellis_status bake_textures_vulkan(
     memcpy(buffers[2].mapped, mesh->indices, indices_bytes);
     memcpy(buffers[3].mapped, hash_entries, hash_bytes);
     memcpy(buffers[4].mapped, voxels->attrs, attrs_bytes);
-    memset(buffers[5].mapped, 0, image_bytes);
+    if (projection_bytes > 0) {
+        memcpy(buffers[5].mapped, projection_words, projection_bytes);
+    } else {
+        memset(buffers[5].mapped, 0, buffers[5].bytes);
+    }
     memset(buffers[6].mapped, 0, image_bytes);
     memset(buffers[7].mapped, 0, image_bytes);
     memset(buffers[8].mapped, 0, image_bytes);
@@ -1889,13 +2324,18 @@ static trellis_status bake_textures_vulkan(
     push.channels = (uint32_t) voxels->channels;
     push.hash_size = hash_size;
     push.resolution = (uint32_t) (voxels->resolution > 0 ? voxels->resolution : 512);
+    push.project_vertex_count = projection_vertex_count;
+    push.project_face_count = projection_face_count;
+    push.project_node_count = projection_node_count;
+    push.project_flags = projection_enabled ? 1u : 0u;
 
     TRELLIS_INFO(
-        "glTF export: Vulkan raster texture bake tris=%u voxels=%" PRId64 " texture=%d hash=%u",
+        "glTF export: Vulkan raster texture bake tris=%u voxels=%" PRId64 " texture=%d hash=%u projection_nodes=%u",
         push.triangle_count,
         voxels->n_coords,
         texture_size,
-        hash_size);
+        hash_size,
+        push.project_node_count);
 
     trellis_gltf_vk_buffer * desc[10];
     for (int i = 0; i < 10; ++i) desc[i] = &buffers[i];
@@ -1948,6 +2388,7 @@ cleanup:
     gltf_vk_image_destroy(&vk, &base_image);
     for (int i = 0; i < 10; ++i) gltf_vk_buffer_destroy(&vk, &buffers[i]);
     gltf_vk_destroy(&vk);
+    free(projection_words);
     free(hash_entries);
     free(base);
     free(mr);
@@ -1960,7 +2401,7 @@ static trellis_status unwrap_mesh_xatlas(
     int texture_size,
     trellis_gltf_mesh * out) {
 #ifdef GGML_USE_VULKAN
-    if (mesh != NULL && mesh->n_faces >= (int64_t) gltf_uv_chart_target_faces() * 2) {
+    if (gltf_uv_charted_enabled() && mesh != NULL && mesh->n_faces >= (int64_t) gltf_uv_chart_target_faces() * 2) {
         trellis_status status = unwrap_mesh_xatlas_charted_vulkan(mesh, texture_size, out);
         if (status == TRELLIS_STATUS_OK) {
             return status;
@@ -1990,12 +2431,7 @@ static size_t align4(size_t n) {
     return (n + 3u) & ~((size_t) 3u);
 }
 
-static trellis_status write_binary_buffer(
-    const char * path,
-    const trellis_gltf_mesh * mesh,
-    size_t offsets[4],
-    size_t sizes[4],
-    size_t * total_size_out) {
+static void compute_mesh_buffer_layout(const trellis_gltf_mesh * mesh, size_t offsets[4], size_t sizes[4], size_t * total_size_out) {
     sizes[0] = (size_t) mesh->index_count * sizeof(uint32_t);
     sizes[1] = (size_t) mesh->vertex_count * 3u * sizeof(float);
     sizes[2] = (size_t) mesh->vertex_count * 3u * sizeof(float);
@@ -2004,31 +2440,116 @@ static trellis_status write_binary_buffer(
     offsets[1] = align4(offsets[0] + sizes[0]);
     offsets[2] = align4(offsets[1] + sizes[1]);
     offsets[3] = align4(offsets[2] + sizes[2]);
-    size_t total = align4(offsets[3] + sizes[3]);
+    *total_size_out = align4(offsets[3] + sizes[3]);
+}
+
+static trellis_status build_mesh_binary_buffer(
+    const trellis_gltf_mesh * mesh,
+    size_t offsets[4],
+    size_t sizes[4],
+    size_t * total_size_out,
+    uint8_t ** data_out) {
+    *data_out = NULL;
+    compute_mesh_buffer_layout(mesh, offsets, sizes, total_size_out);
+    uint8_t * data = (uint8_t *) calloc(*total_size_out, 1);
+    if (data == NULL) {
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    memcpy(data + offsets[0], mesh->indices, sizes[0]);
+    memcpy(data + offsets[1], mesh->positions, sizes[1]);
+    memcpy(data + offsets[2], mesh->normals, sizes[2]);
+    memcpy(data + offsets[3], mesh->uvs, sizes[3]);
+    *data_out = data;
+    return TRELLIS_STATUS_OK;
+}
+
+static trellis_status write_binary_buffer(
+    const char * path,
+    const trellis_gltf_mesh * mesh,
+    size_t offsets[4],
+    size_t sizes[4],
+    size_t * total_size_out) {
+    uint8_t * data = NULL;
+    trellis_status status = build_mesh_binary_buffer(mesh, offsets, sizes, total_size_out, &data);
+    if (status != TRELLIS_STATUS_OK) {
+        return status;
+    }
     FILE * f = fopen(path, "wb");
     if (f == NULL) {
+        free(data);
         return TRELLIS_STATUS_IO_ERROR;
     }
-    const uint8_t zero[4] = {0, 0, 0, 0};
-#define WRITE_CHUNK(data, size, next_offset) do { \
-    if (fwrite((data), 1, (size), f) != (size)) { fclose(f); return TRELLIS_STATUS_IO_ERROR; } \
-    size_t pos = (size_t) ftell(f); \
-    while (pos < (next_offset)) { \
-        size_t pad = (next_offset) - pos; \
-        if (pad > 4u) pad = 4u; \
-        if (fwrite(zero, 1, pad, f) != pad) { fclose(f); return TRELLIS_STATUS_IO_ERROR; } \
-        pos += pad; \
-    } \
-} while (0)
-    WRITE_CHUNK(mesh->indices, sizes[0], offsets[1]);
-    WRITE_CHUNK(mesh->positions, sizes[1], offsets[2]);
-    WRITE_CHUNK(mesh->normals, sizes[2], offsets[3]);
-    WRITE_CHUNK(mesh->uvs, sizes[3], total);
-#undef WRITE_CHUNK
+    if (fwrite(data, 1, *total_size_out, f) != *total_size_out) {
+        free(data);
+        fclose(f);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+    free(data);
     if (fclose(f) != 0) {
         return TRELLIS_STATUS_IO_ERROR;
     }
-    *total_size_out = total;
+    return TRELLIS_STATUS_OK;
+}
+
+static trellis_status encode_png_rgba_memory(
+    const uint8_t * rgba,
+    int texture_size,
+    uint8_t ** png_out,
+    size_t * png_size_out) {
+    *png_out = NULL;
+    *png_size_out = 0;
+    int png_len = 0;
+    unsigned char * png = stbi_write_png_to_mem(
+        rgba,
+        texture_size * 4,
+        texture_size,
+        texture_size,
+        4,
+        &png_len);
+    if (png == NULL || png_len <= 0) {
+        if (png != NULL) STBIW_FREE(png);
+        return TRELLIS_STATUS_ERROR;
+    }
+    *png_out = png;
+    *png_size_out = (size_t) png_len;
+    return TRELLIS_STATUS_OK;
+}
+
+static trellis_status build_glb_binary_buffer(
+    const trellis_gltf_mesh * mesh,
+    const uint8_t * base_png,
+    size_t base_png_size,
+    const uint8_t * mr_png,
+    size_t mr_png_size,
+    size_t offsets[6],
+    size_t sizes[6],
+    size_t * total_size_out,
+    uint8_t ** data_out) {
+    *data_out = NULL;
+    size_t mesh_offsets[4];
+    size_t mesh_sizes[4];
+    size_t mesh_size = 0;
+    compute_mesh_buffer_layout(mesh, mesh_offsets, mesh_sizes, &mesh_size);
+    for (int i = 0; i < 4; ++i) {
+        offsets[i] = mesh_offsets[i];
+        sizes[i] = mesh_sizes[i];
+    }
+    offsets[4] = align4(mesh_size);
+    sizes[4] = base_png_size;
+    offsets[5] = align4(offsets[4] + sizes[4]);
+    sizes[5] = mr_png_size;
+    *total_size_out = align4(offsets[5] + sizes[5]);
+    uint8_t * data = (uint8_t *) calloc(*total_size_out, 1);
+    if (data == NULL) {
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    memcpy(data + offsets[0], mesh->indices, sizes[0]);
+    memcpy(data + offsets[1], mesh->positions, sizes[1]);
+    memcpy(data + offsets[2], mesh->normals, sizes[2]);
+    memcpy(data + offsets[3], mesh->uvs, sizes[3]);
+    memcpy(data + offsets[4], base_png, sizes[4]);
+    memcpy(data + offsets[5], mr_png, sizes[5]);
+    *data_out = data;
     return TRELLIS_STATUS_OK;
 }
 
@@ -2038,25 +2559,35 @@ static trellis_status write_gltf_json(
     const char * base_uri,
     const char * mr_uri,
     const trellis_gltf_mesh * mesh,
-    const size_t offsets[4],
-    const size_t sizes[4],
-    size_t buffer_size) {
+    const size_t offsets[6],
+    const size_t sizes[6],
+    size_t buffer_size,
+    int write_glb,
+    const void * bin_data) {
+    if (write_glb && (bin_data == NULL || buffer_size == 0)) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
     cgltf_data data;
     memset(&data, 0, sizeof(data));
-    data.file_type = cgltf_file_type_gltf;
+    data.file_type = write_glb ? cgltf_file_type_glb : cgltf_file_type_gltf;
     data.asset.version = (char *) "2.0";
     data.asset.generator = (char *) "trellis2.c";
+    if (write_glb) {
+        data.bin = bin_data;
+        data.bin_size = buffer_size;
+    }
 
     cgltf_buffer buffer;
     memset(&buffer, 0, sizeof(buffer));
-    buffer.uri = (char *) bin_uri;
+    buffer.uri = write_glb ? NULL : (char *) bin_uri;
     buffer.size = buffer_size;
     data.buffers = &buffer;
     data.buffers_count = 1;
 
-    cgltf_buffer_view views[4];
+    cgltf_buffer_view views[6];
     memset(views, 0, sizeof(views));
-    for (int i = 0; i < 4; ++i) {
+    int view_count = write_glb ? 6 : 4;
+    for (int i = 0; i < view_count; ++i) {
         views[i].buffer = &buffer;
         views[i].offset = offsets[i];
         views[i].size = sizes[i];
@@ -2067,7 +2598,7 @@ static trellis_status write_gltf_json(
     views[2].stride = 3u * sizeof(float);
     views[3].stride = 2u * sizeof(float);
     data.buffer_views = views;
-    data.buffer_views_count = 4;
+    data.buffer_views_count = (cgltf_size) view_count;
 
     cgltf_accessor accessors[4];
     memset(accessors, 0, sizeof(accessors));
@@ -2104,8 +2635,15 @@ static trellis_status write_gltf_json(
 
     cgltf_image images[2];
     memset(images, 0, sizeof(images));
-    images[0].uri = (char *) base_uri;
-    images[1].uri = (char *) mr_uri;
+    if (write_glb) {
+        images[0].buffer_view = &views[4];
+        images[0].mime_type = (char *) "image/png";
+        images[1].buffer_view = &views[5];
+        images[1].mime_type = (char *) "image/png";
+    } else {
+        images[0].uri = (char *) base_uri;
+        images[1].uri = (char *) mr_uri;
+    }
     data.images = images;
     data.images_count = 2;
 
@@ -2192,7 +2730,7 @@ static trellis_status write_gltf_json(
 
     cgltf_options options;
     memset(&options, 0, sizeof(options));
-    options.type = cgltf_file_type_gltf;
+    options.type = write_glb ? cgltf_file_type_glb : cgltf_file_type_gltf;
     cgltf_result result = cgltf_write_file(&options, gltf_path, &data);
     return result == cgltf_result_success ? TRELLIS_STATUS_OK : TRELLIS_STATUS_ERROR;
 }
@@ -2200,6 +2738,7 @@ static trellis_status write_gltf_json(
 trellis_status trellis_pipeline_write_gltf(
     const char * path,
     const trellis_mesh_host * mesh,
+    const trellis_mesh_host * sample_mesh,
     const trellis_pbr_voxels * voxels,
     int texture_size) {
     if (path == NULL || mesh == NULL || voxels == NULL || mesh->vertices == NULL ||
@@ -2218,50 +2757,107 @@ trellis_status trellis_pipeline_write_gltf(
     if (!split_output_paths(path, dir, sizeof(dir), stem, sizeof(stem)) || !mkdir_p_export(dir)) {
         return TRELLIS_STATUS_IO_ERROR;
     }
+    int write_glb = path_has_extension_ci(path, ".glb");
     char bin_uri[1024], base_uri[1024], mr_uri[1024];
     char bin_path[4096], base_path[4096], mr_path[4096];
-    if (!make_named_file(bin_uri, sizeof(bin_uri), bin_path, sizeof(bin_path), dir, stem, ".bin") ||
-        !make_named_file(base_uri, sizeof(base_uri), base_path, sizeof(base_path), dir, stem, "_baseColor.png") ||
-        !make_named_file(mr_uri, sizeof(mr_uri), mr_path, sizeof(mr_path), dir, stem, "_metallicRoughness.png")) {
+    memset(bin_uri, 0, sizeof(bin_uri));
+    memset(base_uri, 0, sizeof(base_uri));
+    memset(mr_uri, 0, sizeof(mr_uri));
+    memset(bin_path, 0, sizeof(bin_path));
+    memset(base_path, 0, sizeof(base_path));
+    memset(mr_path, 0, sizeof(mr_path));
+    if (!write_glb &&
+        (!make_named_file(bin_uri, sizeof(bin_uri), bin_path, sizeof(bin_path), dir, stem, ".bin") ||
+         !make_named_file(base_uri, sizeof(base_uri), base_path, sizeof(base_path), dir, stem, "_baseColor.png") ||
+         !make_named_file(mr_uri, sizeof(mr_uri), mr_path, sizeof(mr_path), dir, stem, "_metallicRoughness.png"))) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
 
     trellis_gltf_mesh gltf_mesh;
     uint8_t * base = NULL;
     uint8_t * mr = NULL;
+    uint8_t * base_png = NULL;
+    uint8_t * mr_png = NULL;
+    uint8_t * glb_bin = NULL;
+    size_t base_png_size = 0;
+    size_t mr_png_size = 0;
     memset(&gltf_mesh, 0, sizeof(gltf_mesh));
     trellis_status status = unwrap_mesh_xatlas(mesh, texture_size, &gltf_mesh);
     if (status == TRELLIS_STATUS_OK) {
 #ifdef GGML_USE_VULKAN
-        status = bake_textures_vulkan(&gltf_mesh, voxels, texture_size, &base, &mr);
+        if (gltf_env_truthy("TRELLIS_GLTF_BAKE_CPU")) {
+            TRELLIS_ERROR(
+                "glTF export: TRELLIS_GLTF_BAKE_CPU is a legacy debug path and does not match CuMesh source projection; unset it to use Vulkan bake");
+            status = TRELLIS_STATUS_NOT_IMPLEMENTED;
+        } else {
+            status = bake_textures_vulkan(&gltf_mesh, sample_mesh, voxels, texture_size, &base, &mr);
+        }
 #else
+        (void) sample_mesh;
         status = bake_textures(&gltf_mesh, voxels, texture_size, &base, &mr);
 #endif
     }
     if (status == TRELLIS_STATUS_OK) {
-        if (!stbi_write_png(base_path, texture_size, texture_size, 4, base, texture_size * 4) ||
-            !stbi_write_png(mr_path, texture_size, texture_size, 4, mr, texture_size * 4)) {
-            status = TRELLIS_STATUS_IO_ERROR;
+        if (write_glb) {
+            status = encode_png_rgba_memory(base, texture_size, &base_png, &base_png_size);
+            if (status == TRELLIS_STATUS_OK) {
+                status = encode_png_rgba_memory(mr, texture_size, &mr_png, &mr_png_size);
+            }
+        } else {
+            if (!stbi_write_png(base_path, texture_size, texture_size, 4, base, texture_size * 4) ||
+                !stbi_write_png(mr_path, texture_size, texture_size, 4, mr, texture_size * 4)) {
+                status = TRELLIS_STATUS_IO_ERROR;
+            }
         }
     }
-    size_t offsets[4] = {0, 0, 0, 0};
-    size_t sizes[4] = {0, 0, 0, 0};
+    size_t offsets[6] = {0, 0, 0, 0, 0, 0};
+    size_t sizes[6] = {0, 0, 0, 0, 0, 0};
     size_t buffer_size = 0;
     if (status == TRELLIS_STATUS_OK) {
         transform_mesh_to_viewer_axes(&gltf_mesh);
-        status = write_binary_buffer(bin_path, &gltf_mesh, offsets, sizes, &buffer_size);
+        if (write_glb) {
+            status = build_glb_binary_buffer(
+                &gltf_mesh,
+                base_png,
+                base_png_size,
+                mr_png,
+                mr_png_size,
+                offsets,
+                sizes,
+                &buffer_size,
+                &glb_bin);
+        } else {
+            status = write_binary_buffer(bin_path, &gltf_mesh, offsets, sizes, &buffer_size);
+        }
     }
     if (status == TRELLIS_STATUS_OK) {
-        status = write_gltf_json(path, bin_uri, base_uri, mr_uri, &gltf_mesh, offsets, sizes, buffer_size);
-    }
-    if (status == TRELLIS_STATUS_OK) {
-        TRELLIS_INFO(
-            "glTF export: wrote %s with %s, %s, %s",
+        status = write_gltf_json(
             path,
-            bin_uri,
-            base_uri,
-            mr_uri);
+            write_glb ? NULL : bin_uri,
+            write_glb ? NULL : base_uri,
+            write_glb ? NULL : mr_uri,
+            &gltf_mesh,
+            offsets,
+            sizes,
+            buffer_size,
+            write_glb,
+            glb_bin);
     }
+    if (status == TRELLIS_STATUS_OK) {
+        if (write_glb) {
+            TRELLIS_INFO("glTF export: wrote packed GLB %s", path);
+        } else {
+            TRELLIS_INFO(
+                "glTF export: wrote %s with %s, %s, %s",
+                path,
+                bin_uri,
+                base_uri,
+                mr_uri);
+        }
+    }
+    if (base_png != NULL) STBIW_FREE(base_png);
+    if (mr_png != NULL) STBIW_FREE(mr_png);
+    free(glb_bin);
     free(base);
     free(mr);
     gltf_mesh_free(&gltf_mesh);

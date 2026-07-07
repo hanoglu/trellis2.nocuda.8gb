@@ -29,7 +29,7 @@ void main() {
     uint idx = y * pc.texture_size + x;
     uint b = src_base[idx];
     uint m = src_mr[idx];
-    if (alpha_of(b) != 0u) {
+    if (alpha_of(m) != 0u) {
         dst_base[idx] = b;
         dst_mr[idx] = m;
         return;
@@ -41,9 +41,9 @@ void main() {
             int ny = int(y) + dy;
             if (nx < 0 || ny < 0 || nx >= tex || ny >= tex) continue;
             uint nidx = uint(ny) * pc.texture_size + uint(nx);
-            uint nb = src_base[nidx];
-            if (alpha_of(nb) == 0u) continue;
-            dst_base[idx] = nb;
+            uint nm = src_mr[nidx];
+            if (alpha_of(nm) == 0u) continue;
+            dst_base[idx] = src_base[nidx];
             dst_mr[idx] = src_mr[nidx];
             return;
         }

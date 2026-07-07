@@ -135,6 +135,7 @@ trellis_status trellis_pipeline_write_obj(const char * path, const trellis_mesh_
 trellis_status trellis_pipeline_write_gltf(
     const char * path,
     const trellis_mesh_host * mesh,
+    const trellis_mesh_host * sample_mesh,
     const trellis_pbr_voxels * voxels,
     int texture_size);
 

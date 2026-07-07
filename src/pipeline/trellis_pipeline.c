@@ -1,3 +1,7 @@
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "trellis.h"
 #include "trellis_pipeline_internal.h"
 
@@ -13,6 +17,10 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 extern unsigned char * stbi_load(char const * filename, int * x, int * y, int * comp, int req_comp);
 extern void stbi_image_free(void * retval_from_stbi_load);
@@ -614,37 +622,28 @@ static int pbr_sample_color_trilinear(
     const float vertex[3],
     float color[3]) {
     const int resolution = voxels->resolution > 0 ? voxels->resolution : 512;
-    float gx = (vertex[0] + 0.5f) * (float) resolution;
-    float gy = (vertex[1] + 0.5f) * (float) resolution;
-    float gz = (vertex[2] + 0.5f) * (float) resolution;
-    if (gx < 0.0f) gx = 0.0f;
-    if (gy < 0.0f) gy = 0.0f;
-    if (gz < 0.0f) gz = 0.0f;
-    if (gx > (float) (resolution - 1)) gx = (float) (resolution - 1);
-    if (gy > (float) (resolution - 1)) gy = (float) (resolution - 1);
-    if (gz > (float) (resolution - 1)) gz = (float) (resolution - 1);
-
-    const int32_t x0 = (int32_t) floorf(gx);
-    const int32_t y0 = (int32_t) floorf(gy);
-    const int32_t z0 = (int32_t) floorf(gz);
-    const int32_t x1 = x0 + 1 < resolution ? x0 + 1 : x0;
-    const int32_t y1 = y0 + 1 < resolution ? y0 + 1 : y0;
-    const int32_t z1 = z0 + 1 < resolution ? z0 + 1 : z0;
-    const float tx = gx - (float) x0;
-    const float ty = gy - (float) y0;
-    const float tz = gz - (float) z0;
+    const float qx = (vertex[0] + 0.5f) * (float) resolution;
+    const float qy = (vertex[1] + 0.5f) * (float) resolution;
+    const float qz = (vertex[2] + 0.5f) * (float) resolution;
+    const int32_t bx = (int32_t) floorf(qx - 0.5f);
+    const int32_t by = (int32_t) floorf(qy - 0.5f);
+    const int32_t bz = (int32_t) floorf(qz - 0.5f);
 
     float acc[3] = {0.0f, 0.0f, 0.0f};
     float weight_sum = 0.0f;
     for (int dz = 0; dz < 2; ++dz) {
-        const int32_t z = dz == 0 ? z0 : z1;
-        const float wz = dz == 0 ? 1.0f - tz : tz;
         for (int dy = 0; dy < 2; ++dy) {
-            const int32_t y = dy == 0 ? y0 : y1;
-            const float wy = dy == 0 ? 1.0f - ty : ty;
             for (int dx = 0; dx < 2; ++dx) {
-                const int32_t x = dx == 0 ? x0 : x1;
-                const float wx = dx == 0 ? 1.0f - tx : tx;
+                const int32_t x = bx + dx;
+                const int32_t y = by + dy;
+                const int32_t z = bz + dz;
+                if (x < 0 || y < 0 || z < 0 ||
+                    x >= resolution || y >= resolution || z >= resolution) {
+                    continue;
+                }
+                const float wx = 1.0f - fabsf(qx - (float) x - 0.5f);
+                const float wy = 1.0f - fabsf(qy - (float) y - 0.5f);
+                const float wz = 1.0f - fabsf(qz - (float) z - 0.5f);
                 const float w = wx * wy * wz;
                 if (w <= 0.0f) {
                     continue;
@@ -668,9 +667,9 @@ static int pbr_sample_color_trilinear(
         return 1;
     }
 
-    const int32_t cx = (int32_t) floorf(gx + 0.5f);
-    const int32_t cy = (int32_t) floorf(gy + 0.5f);
-    const int32_t cz = (int32_t) floorf(gz + 0.5f);
+    const int32_t cx = (int32_t) floorf(qx);
+    const int32_t cy = (int32_t) floorf(qy);
+    const int32_t cz = (int32_t) floorf(qz);
     int32_t best = -1;
     for (int radius = 0; best < 0 && radius <= 2; ++radius) {
         for (int dz = -radius; best < 0 && dz <= radius; ++dz) {
@@ -822,6 +821,115 @@ trellis_status trellis_pipeline_write_obj(const char * path, const trellis_mesh_
         }
     }
     return fclose(f) == 0 ? TRELLIS_STATUS_OK : TRELLIS_STATUS_IO_ERROR;
+}
+
+static trellis_status trellis_pipeline_write_pbr_voxels_debug(
+    const char * path,
+    const trellis_pbr_voxels * voxels) {
+    if (path == NULL || voxels == NULL || voxels->coords_bxyz == NULL || voxels->attrs == NULL ||
+        voxels->n_coords <= 0 || voxels->channels <= 0) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (!mkdir_parent(path)) {
+        TRELLIS_ERROR("pipeline: failed to create PBR voxel dump directory for %s", path);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+    FILE * f = fopen(path, "wb");
+    if (f == NULL) {
+        TRELLIS_ERROR("pipeline: failed to open PBR voxel dump %s", path);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+    const char magic[8] = { 'T', 'R', 'L', 'P', 'B', 'R', '1', '\0' };
+    const size_t coords_count = (size_t) voxels->n_coords * 4u;
+    const size_t attrs_count = (size_t) voxels->n_coords * (size_t) voxels->channels;
+    trellis_status status = TRELLIS_STATUS_OK;
+    if (fwrite(magic, 1, sizeof(magic), f) != sizeof(magic) ||
+        fwrite(&voxels->n_coords, sizeof(voxels->n_coords), 1, f) != 1 ||
+        fwrite(&voxels->channels, sizeof(voxels->channels), 1, f) != 1 ||
+        fwrite(&voxels->resolution, sizeof(voxels->resolution), 1, f) != 1 ||
+        fwrite(voxels->coords_bxyz, sizeof(int32_t), coords_count, f) != coords_count ||
+        fwrite(voxels->attrs, sizeof(float), attrs_count, f) != attrs_count) {
+        status = TRELLIS_STATUS_IO_ERROR;
+    }
+    if (fclose(f) != 0 && status == TRELLIS_STATUS_OK) {
+        status = TRELLIS_STATUS_IO_ERROR;
+    }
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR("pipeline: failed to write PBR voxel dump %s", path);
+    }
+    return status;
+}
+
+static int make_material_dump_path(char * out, size_t out_size, const char * dir, const char * name) {
+    int n = snprintf(out, out_size, "%s/%s", dir, name);
+    return n >= 0 && (size_t) n < out_size;
+}
+
+static trellis_status trellis_pipeline_dump_material_inputs_if_requested(
+    const char * dump_dir,
+    const trellis_mesh_host * mesh,
+    const trellis_mesh_host * sample_mesh,
+    const trellis_pbr_voxels * voxels) {
+    if (dump_dir == NULL || dump_dir[0] == '\0') {
+        return TRELLIS_STATUS_OK;
+    }
+    if (!mkdir_p(dump_dir)) {
+        TRELLIS_ERROR("pipeline: failed to create material dump directory %s", dump_dir);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+
+    char path[4096];
+    if (!make_material_dump_path(path, sizeof(path), dump_dir, "processed.obj")) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    trellis_status status = trellis_pipeline_write_obj(path, mesh);
+    if (status != TRELLIS_STATUS_OK) {
+        return status;
+    }
+
+    if (sample_mesh != NULL && sample_mesh->vertices != NULL && sample_mesh->faces != NULL &&
+        sample_mesh->n_vertices > 0 && sample_mesh->n_faces > 0) {
+        if (!make_material_dump_path(path, sizeof(path), dump_dir, "projection_source.obj")) {
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
+        }
+        status = trellis_pipeline_write_obj(path, sample_mesh);
+        if (status != TRELLIS_STATUS_OK) {
+            return status;
+        }
+    }
+
+    if (!make_material_dump_path(path, sizeof(path), dump_dir, "pbr_voxels.bin")) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    status = trellis_pipeline_write_pbr_voxels_debug(path, voxels);
+    if (status != TRELLIS_STATUS_OK) {
+        return status;
+    }
+
+    if (!make_material_dump_path(path, sizeof(path), dump_dir, "manifest.txt")) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    FILE * f = fopen(path, "w");
+    if (f == NULL) {
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+    fprintf(f, "processed_vertices=%lld\n", (long long) mesh->n_vertices);
+    fprintf(f, "processed_faces=%lld\n", (long long) mesh->n_faces);
+    if (sample_mesh != NULL && sample_mesh->vertices != NULL && sample_mesh->faces != NULL) {
+        fprintf(f, "projection_vertices=%lld\n", (long long) sample_mesh->n_vertices);
+        fprintf(f, "projection_faces=%lld\n", (long long) sample_mesh->n_faces);
+    } else {
+        fprintf(f, "projection_vertices=0\n");
+        fprintf(f, "projection_faces=0\n");
+    }
+    fprintf(f, "pbr_voxels=%lld\n", (long long) voxels->n_coords);
+    fprintf(f, "pbr_channels=%d\n", voxels->channels);
+    fprintf(f, "pbr_resolution=%d\n", voxels->resolution);
+    if (fclose(f) != 0) {
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+    TRELLIS_INFO("pipeline: dumped material bake inputs to %s", dump_dir);
+    return TRELLIS_STATUS_OK;
 }
 
 static int postprocess_mesh_reserve_vertices(trellis_mesh_host * mesh, int64_t need, int64_t * vertex_capacity) {
@@ -982,23 +1090,50 @@ static int run_vkmesh_postprocess_command(
     const char * vkmesh_path,
     const char * input_obj,
     const char * output_obj,
+    const char * projection_obj,
     int decimation_target,
     int no_simplify) {
     char target[64];
     snprintf(target, sizeof(target), "%d", decimation_target > 0 ? decimation_target : 1000000);
-    const char * exe = vkmesh_path != NULL && vkmesh_path[0] != '\0' ? vkmesh_path : "vkmesh";
+    char sibling_vkmesh[PATH_MAX];
+    const char * exe = vkmesh_path != NULL && vkmesh_path[0] != '\0' ? vkmesh_path : NULL;
+    if (exe == NULL) {
+        ssize_t self_len = readlink("/proc/self/exe", sibling_vkmesh, sizeof(sibling_vkmesh) - 1u);
+        if (self_len > 0) {
+            sibling_vkmesh[self_len] = '\0';
+            char * slash = strrchr(sibling_vkmesh, '/');
+            if (slash != NULL) {
+                slash[1] = '\0';
+                size_t dir_len = strlen(sibling_vkmesh);
+                if (dir_len + strlen("vkmesh") < sizeof(sibling_vkmesh)) {
+                    memcpy(sibling_vkmesh + dir_len, "vkmesh", sizeof("vkmesh"));
+                    if (access(sibling_vkmesh, X_OK) == 0) {
+                        exe = sibling_vkmesh;
+                    }
+                }
+            }
+        }
+    }
+    if (exe == NULL) {
+        exe = "vkmesh";
+    }
+    TRELLIS_INFO("mesh postprocess: using vkmesh executable %s", exe);
     pid_t pid = fork();
     if (pid < 0) {
         return 0;
     }
     if (pid == 0) {
-        char * argv[12];
+        char * argv[16];
         int argc = 0;
         argv[argc++] = (char *) exe;
         argv[argc++] = (char *) "--input";
         argv[argc++] = (char *) input_obj;
         argv[argc++] = (char *) "--output";
         argv[argc++] = (char *) output_obj;
+        if (projection_obj != NULL && projection_obj[0] != '\0') {
+            argv[argc++] = (char *) "--projection-mesh-output";
+            argv[argc++] = (char *) projection_obj;
+        }
         argv[argc++] = (char *) "--postprocess";
         argv[argc++] = (char *) "--decimation-target";
         argv[argc++] = target;
@@ -1023,6 +1158,7 @@ static int run_vkmesh_postprocess_command(
 
 static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     trellis_mesh_host * mesh,
+    trellis_mesh_host * projection_mesh_out,
     const char * vkmesh_path,
     int decimation_target,
     int no_simplify) {
@@ -1032,16 +1168,24 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     }
     char input_obj[4096];
     char output_obj[4096];
+    char projection_obj[4096];
     int n0 = snprintf(input_obj, sizeof(input_obj), "/tmp/trellis2_vkmesh_in_%ld.obj", (long) getpid());
     int n1 = snprintf(output_obj, sizeof(output_obj), "/tmp/trellis2_vkmesh_out_%ld.obj", (long) getpid());
-    if (n0 < 0 || (size_t) n0 >= sizeof(input_obj) || n1 < 0 || (size_t) n1 >= sizeof(output_obj)) {
+    int n2 = snprintf(projection_obj, sizeof(projection_obj), "/tmp/trellis2_vkmesh_projection_%ld.obj", (long) getpid());
+    if (n0 < 0 || (size_t) n0 >= sizeof(input_obj) ||
+        n1 < 0 || (size_t) n1 >= sizeof(output_obj) ||
+        n2 < 0 || (size_t) n2 >= sizeof(projection_obj)) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (projection_mesh_out != NULL) {
+        memset(projection_mesh_out, 0, sizeof(*projection_mesh_out));
     }
 
     trellis_status status = trellis_pipeline_write_obj(input_obj, mesh);
     if (status != TRELLIS_STATUS_OK) {
         unlink_if_set(input_obj);
         unlink_if_set(output_obj);
+        unlink_if_set(projection_obj);
         return status;
     }
 
@@ -1050,18 +1194,38 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
         decimation_target > 0 ? decimation_target : 1000000,
         no_simplify ? 1 : 0,
         (long long) mesh->n_faces);
-    if (!run_vkmesh_postprocess_command(vkmesh_path, input_obj, output_obj, decimation_target, no_simplify)) {
+    if (!run_vkmesh_postprocess_command(
+            vkmesh_path,
+            input_obj,
+            output_obj,
+            projection_mesh_out != NULL ? projection_obj : NULL,
+            decimation_target,
+            no_simplify)) {
         TRELLIS_ERROR("mesh postprocess: vkmesh failed; pass --vkmesh /path/to/vkmesh if it is not in PATH");
         unlink_if_set(input_obj);
         unlink_if_set(output_obj);
+        unlink_if_set(projection_obj);
         return TRELLIS_STATUS_ERROR;
     }
 
     trellis_mesh_host processed;
     status = load_postprocessed_obj_mesh(output_obj, &processed);
+    if (status == TRELLIS_STATUS_OK && projection_mesh_out != NULL) {
+        status = load_postprocessed_obj_mesh(projection_obj, projection_mesh_out);
+        if (status == TRELLIS_STATUS_OK) {
+            TRELLIS_INFO(
+                "mesh postprocess: loaded projection source vertices=%lld faces=%lld",
+                (long long) projection_mesh_out->n_vertices,
+                (long long) projection_mesh_out->n_faces);
+        }
+    }
     unlink_if_set(input_obj);
     unlink_if_set(output_obj);
+    unlink_if_set(projection_obj);
     if (status != TRELLIS_STATUS_OK) {
+        if (projection_mesh_out != NULL) {
+            trellis_mesh_free(projection_mesh_out);
+        }
         return status;
     }
 
@@ -1200,14 +1364,17 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     trellis_sparse_c2s_guides shape_subs;
     trellis_pbr_voxels pbr_voxels;
     trellis_mesh_host mesh;
+    trellis_mesh_host gltf_projection_mesh;
     memset(&sparse_structure_result, 0, sizeof(sparse_structure_result));
     memset(&shape_latent, 0, sizeof(shape_latent));
     memset(&texture_latent, 0, sizeof(texture_latent));
     memset(&shape_subs, 0, sizeof(shape_subs));
     memset(&pbr_voxels, 0, sizeof(pbr_voxels));
     memset(&mesh, 0, sizeof(mesh));
+    memset(&gltf_projection_mesh, 0, sizeof(gltf_projection_mesh));
     const int want_obj = options->obj_path != NULL && options->obj_path[0] != '\0';
     const int want_gltf = options->gltf_path != NULL && options->gltf_path[0] != '\0';
+    const char * material_dump_dir = getenv("TRELLIS_MATERIAL_DUMP_DIR");
 
     TRELLIS_INFO("[1/5] SparseStructureFlowModel image -> sparse structure");
     trellis_sparse_structure_options sparse_structure;
@@ -1301,9 +1468,22 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     if (status != TRELLIS_STATUS_OK) {
         goto cleanup;
     }
+    if (material_dump_dir != NULL && material_dump_dir[0] != '\0') {
+        char raw_mesh_path[4096];
+        if (!make_material_dump_path(raw_mesh_path, sizeof(raw_mesh_path), material_dump_dir, "raw.obj")) {
+            status = TRELLIS_STATUS_INVALID_ARGUMENT;
+            goto cleanup;
+        }
+        status = trellis_pipeline_write_obj(raw_mesh_path, &mesh);
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
+        TRELLIS_INFO("pipeline: dumped raw shape mesh to %s", raw_mesh_path);
+    }
     if (options->mesh_postprocess) {
         status = trellis_pipeline_postprocess_mesh_with_vkmesh(
             &mesh,
+            want_gltf ? &gltf_projection_mesh : NULL,
             options->vkmesh_path,
             options->mesh_postprocess_decimation_target > 0 ? options->mesh_postprocess_decimation_target : 1000000,
             options->mesh_postprocess_no_simplify);
@@ -1372,6 +1552,21 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
         pbr_voxels.channels,
         pbr_voxels.resolution);
 
+    if (material_dump_dir != NULL && material_dump_dir[0] != '\0') {
+        const trellis_mesh_host * sample_mesh =
+            gltf_projection_mesh.vertices != NULL && gltf_projection_mesh.faces != NULL ?
+                &gltf_projection_mesh :
+                NULL;
+        status = trellis_pipeline_dump_material_inputs_if_requested(
+            material_dump_dir,
+            &mesh,
+            sample_mesh,
+            &pbr_voxels);
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
+    }
+
     if (want_obj) {
         TRELLIS_INFO(
             "pipeline: applying PBR voxels to OBJ vertex colors vertices=%lld voxels=%lld",
@@ -1393,7 +1588,11 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     }
     if (want_gltf) {
         const int texture_size = options->texture_size > 0 ? options->texture_size : 1024;
-        status = trellis_pipeline_write_gltf(options->gltf_path, &mesh, &pbr_voxels, texture_size);
+        const trellis_mesh_host * sample_mesh =
+            gltf_projection_mesh.vertices != NULL && gltf_projection_mesh.faces != NULL ?
+                &gltf_projection_mesh :
+                NULL;
+        status = trellis_pipeline_write_gltf(options->gltf_path, &mesh, sample_mesh, &pbr_voxels, texture_size);
         if (status != TRELLIS_STATUS_OK) {
             TRELLIS_ERROR("pipeline: glTF export failed: %s", trellis_status_string(status));
             goto cleanup;
@@ -1401,6 +1600,7 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     }
 
 cleanup:
+    trellis_mesh_free(&gltf_projection_mesh);
     trellis_mesh_free(&mesh);
     trellis_pbr_voxels_free(&pbr_voxels);
     trellis_sparse_c2s_guides_free(&shape_subs);

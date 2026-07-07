@@ -25,7 +25,7 @@ void main() {
     uint y = gl_GlobalInvocationID.y;
     if (x >= pc.texture_size || y >= pc.texture_size) return;
     uint idx = y * pc.texture_size + x;
-    if (alpha_of(base_image[idx]) != 0u) return;
+    if (alpha_of(mr_image[idx]) != 0u) return;
     base_image[idx] = 0xffccccccu;
     mr_image[idx] = 0xff00cc00u;
 }

@@ -50,30 +50,38 @@ glTF texture bake/dilate/fill shaders, live under `tools/vkmesh/shaders/`.
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
   --birefnet ../TRELLIS.2/BiRefNet/model.gguf \
   --image ../assets/example_image/T.png \
-  --gltf benchmark_outputs/output_post.gltf \
+  --gltf benchmark_outputs/output_post.glb \
   --backend vulkan \
   --mesh-postprocess \
   --mesh-postprocess-no-simplify \
-  --mesh-decimation-target 1000000 \
-  --vkmesh ../build/vkmesh
+  --mesh-decimation-target 1000000
 ```
 
 In the full pipeline, `vkmesh` cleans topology before PBR voxel baking, so the
 glTF exporter unwraps and bakes textures on the processed mesh. In Vulkan
 builds, UV-space rasterization and PBR voxel sampling run through the Vulkan
 bake pipeline, then seam dilation and empty texel fill run as compute passes.
+Use a `.glb` output path to embed geometry and PNG textures in one binary file;
+`.gltf` output paths keep writing external `.bin` and `.png` files.
 BiRefNet follows the same `--backend` and `--device` settings as the rest of the
 image-to-3D pipeline. Use standalone `vkmesh --postprocess --no-uv-unwrap` for
 geometry-only OBJ output, `--cleanup` for a single primitive cleanup pass, or
 individual flags such as `--fill-holes`, `--repair-non-manifold-edges`, and
 `--remove-small-components` when debugging one stage at a time.
+When `trellis-image-to-obj` is run from a Vulkan build tree it first looks for a
+sibling `vkmesh` executable, then falls back to `PATH`; pass `--vkmesh FILE`
+only when using a custom binary.
 CuMesh-style UV unwrap is hybrid rather than fully GPU-resident: chart
 clustering is the GPU-accelerated part, then each chart is copied to CPU xatlas
-for parameterization and packing. The vkmesh exporter now follows that shape:
-large meshes first run a Vulkan chart-key prepass and then add the resulting
-smaller chart meshes to xatlas. `TRELLIS_GLTF_UV_CHART_FACES` controls the
-target faces per chart, and `TRELLIS_GLTF_UV_CHART_GRID` can override the
-spatial grid used by the current prepass.
+for parameterization and packing. The Vulkan glTF exporter follows that shape
+with a connected, batched xatlas prepass by default: manifold face adjacency is
+used to build local chunks, then small chunks are batched up to the xatlas input
+target. Set `TRELLIS_GLTF_UV_CHARTED=0` to force the slower whole-mesh xatlas
+path. `TRELLIS_GLTF_UV_CHART_FACES` controls the target faces per xatlas input
+mesh, and `TRELLIS_GLTF_UV_CONE_DEGREES` can tighten the connected chunk growth
+from the default connectivity-only `180`.
+Set `TRELLIS_GLTF_BAKE_CPU=1` only for debugging texture bake issues; it keeps
+the same UV output but bypasses the Vulkan raster bake path.
 
 `trellis-birefnet-rgba` runs only the BiRefNet background-removal model and
 writes an RGBA PNG:
