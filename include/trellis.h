@@ -142,6 +142,13 @@ trellis_status trellis_tensor_store_load_safetensors_f32(
     bool transpose_linear_weights,
     size_t * loaded_tensors);
 
+trellis_status trellis_tensor_store_load_safetensors(
+    trellis_tensor_store * store,
+    const trellis_backend_context * backend,
+    const char * safetensors_path,
+    bool transpose_linear_weights,
+    size_t * loaded_tensors);
+
 typedef struct trellis_tensor_store_load_progress {
     const char * path;
     const char * tensor_name;
@@ -156,6 +163,15 @@ typedef void (*trellis_tensor_store_load_progress_callback)(
     void * user_data);
 
 trellis_status trellis_tensor_store_load_safetensors_f32_ex(
+    trellis_tensor_store * store,
+    const trellis_backend_context * backend,
+    const char * safetensors_path,
+    bool transpose_linear_weights,
+    size_t * loaded_tensors,
+    trellis_tensor_store_load_progress_callback progress_callback,
+    void * progress_user_data);
+
+trellis_status trellis_tensor_store_load_safetensors_ex(
     trellis_tensor_store * store,
     const trellis_backend_context * backend,
     const char * safetensors_path,
@@ -196,6 +212,15 @@ void trellis_progress_steps(
     const char * detail);
 
 int trellis_load_tensor_store_f32(
+    const trellis_backend_context * backend,
+    const char * label,
+    const char * path,
+    bool transpose_linear_weights,
+    size_t tensor_slack,
+    trellis_tensor_store * store,
+    trellis_model_load_result * result);
+
+int trellis_load_tensor_store(
     const trellis_backend_context * backend,
     const char * label,
     const char * path,

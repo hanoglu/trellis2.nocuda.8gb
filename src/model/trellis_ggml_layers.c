@@ -10,6 +10,27 @@ void trellis_ggml_set_flash_attn_enabled(int enabled) {
     g_trellis_ggml_use_flash_attn = enabled ? 1 : 0;
 }
 
+static struct ggml_tensor * trellis_ggml_cast_param_like(
+    struct ggml_context * ctx,
+    struct ggml_tensor * param,
+    const struct ggml_tensor * ref) {
+    if (ctx == NULL || param == NULL || ref == NULL || param->type == ref->type) {
+        return param;
+    }
+    if (ref->type == GGML_TYPE_F32 || ref->type == GGML_TYPE_F16) {
+        return ggml_cast(ctx, param, ref->type);
+    }
+    return param;
+}
+
+static struct ggml_tensor * trellis_ggml_repeat_param(
+    struct ggml_context * ctx,
+    struct ggml_tensor * param,
+    struct ggml_tensor * ref) {
+    param = trellis_ggml_cast_param_like(ctx, param, ref);
+    return ggml_repeat(ctx, param, ref);
+}
+
 struct ggml_tensor * trellis_ggml_linear(
     struct ggml_context * ctx,
     struct ggml_tensor * x,
@@ -17,7 +38,7 @@ struct ggml_tensor * trellis_ggml_linear(
     struct ggml_tensor * bias) {
     struct ggml_tensor * y = ggml_mul_mat(ctx, weight, x);
     if (bias != NULL) {
-        y = ggml_add(ctx, y, ggml_repeat(ctx, bias, y));
+        y = ggml_add(ctx, y, trellis_ggml_repeat_param(ctx, bias, y));
     }
     return y;
 }
@@ -30,10 +51,10 @@ struct ggml_tensor * trellis_ggml_layer_norm(
     float eps) {
     struct ggml_tensor * y = ggml_norm(ctx, x, eps);
     if (gamma != NULL) {
-        y = ggml_mul(ctx, y, ggml_repeat(ctx, gamma, y));
+        y = ggml_mul(ctx, y, trellis_ggml_repeat_param(ctx, gamma, y));
     }
     if (beta != NULL) {
-        y = ggml_add(ctx, y, ggml_repeat(ctx, beta, y));
+        y = ggml_add(ctx, y, trellis_ggml_repeat_param(ctx, beta, y));
     }
     return y;
 }
@@ -45,7 +66,7 @@ struct ggml_tensor * trellis_ggml_rms_norm(
     float eps) {
     struct ggml_tensor * y = ggml_rms_norm(ctx, x, eps);
     if (gamma != NULL) {
-        y = ggml_mul(ctx, y, ggml_repeat(ctx, gamma, y));
+        y = ggml_mul(ctx, y, trellis_ggml_repeat_param(ctx, gamma, y));
     }
     return y;
 }
@@ -83,7 +104,7 @@ struct ggml_tensor * trellis_ggml_multihead_rms_norm(
             nb_head * (size_t) gamma->ne[1],
             0);
     }
-    return ggml_mul(ctx, y, ggml_repeat(ctx, g, y));
+    return ggml_mul(ctx, y, trellis_ggml_repeat_param(ctx, g, y));
 }
 
 struct ggml_tensor * trellis_ggml_feed_forward(
@@ -394,8 +415,8 @@ static struct ggml_tensor * trellis_ggml_modulated_norm(
     struct ggml_tensor * shift,
     struct ggml_tensor * scale) {
     struct ggml_tensor * h = trellis_ggml_layer_norm(ctx, x, NULL, NULL, 1e-6f);
-    h = ggml_add(ctx, h, ggml_mul(ctx, h, ggml_repeat(ctx, scale, h)));
-    h = ggml_add(ctx, h, ggml_repeat(ctx, shift, h));
+    h = ggml_add(ctx, h, ggml_mul(ctx, h, trellis_ggml_repeat_param(ctx, scale, h)));
+    h = ggml_add(ctx, h, trellis_ggml_repeat_param(ctx, shift, h));
     return h;
 }
 
@@ -415,7 +436,7 @@ static struct ggml_tensor * trellis_ggml_modulated_cross_block_impl(
     const int64_t channels = x->ne[0];
     struct ggml_tensor * mod = mod6;
     if (params->block_modulation != NULL) {
-        mod = ggml_add(ctx, mod6, ggml_repeat(ctx, params->block_modulation, mod6));
+        mod = ggml_add(ctx, mod6, trellis_ggml_repeat_param(ctx, params->block_modulation, mod6));
     }
     if (params->emulate_bf16) {
         mod = trellis_ggml_bf16_roundtrip(ctx, mod);
@@ -464,7 +485,7 @@ static struct ggml_tensor * trellis_ggml_modulated_cross_block_impl(
     if (params->emulate_bf16) {
         h = trellis_ggml_bf16_roundtrip(ctx, h);
     }
-    h = ggml_mul(ctx, h, ggml_repeat(ctx, gate_msa, h));
+    h = ggml_mul(ctx, h, trellis_ggml_repeat_param(ctx, gate_msa, h));
     x = ggml_add(ctx, x, h);
     if (params->emulate_bf16) {
         x = trellis_ggml_bf16_roundtrip(ctx, x);
@@ -515,7 +536,7 @@ static struct ggml_tensor * trellis_ggml_modulated_cross_block_impl(
     if (params->emulate_bf16) {
         h = trellis_ggml_bf16_roundtrip(ctx, h);
     }
-    h = ggml_mul(ctx, h, ggml_repeat(ctx, gate_mlp, h));
+    h = ggml_mul(ctx, h, trellis_ggml_repeat_param(ctx, gate_mlp, h));
     x = ggml_add(ctx, x, h);
     if (params->emulate_bf16) {
         x = trellis_ggml_bf16_roundtrip(ctx, x);

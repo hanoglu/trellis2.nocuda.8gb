@@ -226,11 +226,32 @@ static struct ggml_tensor * dino_attention_out_to_tokens(
     return ggml_cont_3d(ctx, h, channels, tokens, batches);
 }
 
+static struct ggml_tensor * dino_cast_param_like(
+    struct ggml_context * ctx,
+    struct ggml_tensor * param,
+    const struct ggml_tensor * ref) {
+    if (ctx == NULL || param == NULL || ref == NULL || param->type == ref->type) {
+        return param;
+    }
+    if (ref->type == GGML_TYPE_F32 || ref->type == GGML_TYPE_F16) {
+        return ggml_cast(ctx, param, ref->type);
+    }
+    return param;
+}
+
+static struct ggml_tensor * dino_repeat_param(
+    struct ggml_context * ctx,
+    struct ggml_tensor * param,
+    struct ggml_tensor * ref) {
+    param = dino_cast_param_like(ctx, param, ref);
+    return ggml_repeat(ctx, param, ref);
+}
+
 static struct ggml_tensor * dino_layer_scale(
     struct ggml_context * ctx,
     struct ggml_tensor * x,
     struct ggml_tensor * scale) {
-    return ggml_mul(ctx, x, ggml_repeat(ctx, scale, x));
+    return ggml_mul(ctx, x, dino_repeat_param(ctx, scale, x));
 }
 
 struct ggml_tensor * trellis_dino_patch_embedding_forward(
@@ -264,7 +285,7 @@ struct ggml_tensor * trellis_dino_patch_embedding_forward(
     }
     if (weights->patch_b != NULL) {
         struct ggml_tensor * bias = ggml_reshape_4d(ctx, weights->patch_b, 1, 1, weights->hidden_size, 1);
-        patches = ggml_add(ctx, patches, ggml_repeat(ctx, bias, patches));
+        patches = ggml_add(ctx, patches, dino_repeat_param(ctx, bias, patches));
     }
 
     patches = ggml_permute(ctx, patches, 1, 2, 0, 3);

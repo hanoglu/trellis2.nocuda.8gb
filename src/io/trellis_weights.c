@@ -1,5 +1,6 @@
 #include "trellis.h"
 
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -107,10 +108,25 @@ static int is_linear_weight_name(const char * name) {
     return n >= 7 && strcmp(name + n - 7, ".weight") == 0;
 }
 
+static enum ggml_type ggml_type_for_meta(const trellis_safetensor_meta * meta, bool preserve_16bit_weights) {
+    if (!preserve_16bit_weights || meta == NULL) {
+        return GGML_TYPE_F32;
+    }
+    switch (meta->dtype) {
+        case TRELLIS_DTYPE_F16:
+            return GGML_TYPE_F16;
+        case TRELLIS_DTYPE_BF16:
+            return GGML_TYPE_BF16;
+        default:
+            return GGML_TYPE_F32;
+    }
+}
+
 static trellis_status make_tensor_for_meta(
     trellis_tensor_store * store,
     const trellis_safetensor_meta * meta,
     bool transpose_linear_weights,
+    bool preserve_16bit_weights,
     struct ggml_tensor ** out) {
     if (store == NULL || meta == NULL || out == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
@@ -128,21 +144,22 @@ static trellis_status make_tensor_for_meta(
     }
 
     struct ggml_tensor * tensor = NULL;
+    const enum ggml_type tensor_type = ggml_type_for_meta(meta, preserve_16bit_weights);
     switch (meta->n_dims) {
         case 1:
-            tensor = ggml_new_tensor_1d(store->ctx, GGML_TYPE_F32, ne[0]);
+            tensor = ggml_new_tensor_1d(store->ctx, tensor_type, ne[0]);
             break;
         case 2:
-            tensor = ggml_new_tensor_2d(store->ctx, GGML_TYPE_F32, ne[0], ne[1]);
+            tensor = ggml_new_tensor_2d(store->ctx, tensor_type, ne[0], ne[1]);
             break;
         case 3:
-            tensor = ggml_new_tensor_3d(store->ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2]);
+            tensor = ggml_new_tensor_3d(store->ctx, tensor_type, ne[0], ne[1], ne[2]);
             break;
         case 4:
-            tensor = ggml_new_tensor_4d(store->ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+            tensor = ggml_new_tensor_4d(store->ctx, tensor_type, ne[0], ne[1], ne[2], ne[3]);
             break;
         case 5:
-            tensor = ggml_new_tensor_4d(store->ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3] * ne[4]);
+            tensor = ggml_new_tensor_4d(store->ctx, tensor_type, ne[0], ne[1], ne[2], ne[3] * ne[4]);
             break;
         default:
             return TRELLIS_STATUS_NOT_IMPLEMENTED;
@@ -155,6 +172,51 @@ static trellis_status make_tensor_for_meta(
     return TRELLIS_STATUS_OK;
 }
 
+static trellis_status set_tensor_raw_data_from_meta(
+    const trellis_safetensors * st,
+    const trellis_safetensor_meta * meta,
+    struct ggml_tensor * tensor) {
+    if (st == NULL || meta == NULL || tensor == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    uint64_t n = trellis_safetensor_nelements(meta);
+    size_t elem_size = trellis_dtype_size(meta->dtype);
+    if (elem_size == 0 || n > UINT64_MAX / (uint64_t) elem_size ||
+        meta->data_end < meta->data_begin ||
+        meta->data_end - meta->data_begin != n * (uint64_t) elem_size) {
+        return TRELLIS_STATUS_PARSE_ERROR;
+    }
+    const uint64_t bytes64 = n * (uint64_t) elem_size;
+    if (bytes64 > (uint64_t) SIZE_MAX || bytes64 != (uint64_t) ggml_nbytes(tensor)) {
+        return TRELLIS_STATUS_PARSE_ERROR;
+    }
+    const size_t bytes = (size_t) bytes64;
+    void * tmp = malloc(bytes == 0 ? 1 : bytes);
+    if (tmp == NULL) {
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    FILE * f = fopen(st->path, "rb");
+    if (f == NULL) {
+        free(tmp);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+    if (fseek(f, (long) (st->data_base_offset + meta->data_begin), SEEK_SET) != 0) {
+        fclose(f);
+        free(tmp);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+    trellis_status status = TRELLIS_STATUS_OK;
+    if (bytes != 0 && fread(tmp, 1, bytes, f) != bytes) {
+        status = TRELLIS_STATUS_IO_ERROR;
+    }
+    fclose(f);
+    if (status == TRELLIS_STATUS_OK) {
+        ggml_backend_tensor_set(tensor, tmp, 0, bytes);
+    }
+    free(tmp);
+    return status;
+}
+
 static trellis_status set_tensor_data_from_meta(
     const trellis_safetensors * st,
     const trellis_safetensor_meta * meta,
@@ -162,6 +224,12 @@ static trellis_status set_tensor_data_from_meta(
     bool transpose_linear_weights) {
     if (st == NULL || meta == NULL || tensor == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if ((tensor->type == GGML_TYPE_F16 && meta->dtype == TRELLIS_DTYPE_F16) ||
+        (tensor->type == GGML_TYPE_BF16 && meta->dtype == TRELLIS_DTYPE_BF16)) {
+        /* Shape reversal handles safetensors row-major layout; the bytes stay contiguous as-is. */
+        (void) transpose_linear_weights;
+        return set_tensor_raw_data_from_meta(st, meta, tensor);
     }
     uint64_t n64 = trellis_safetensor_nelements(meta);
     if (n64 > (uint64_t) SIZE_MAX / sizeof(float)) {
@@ -191,6 +259,22 @@ trellis_status trellis_tensor_store_load_safetensors_f32(
     bool transpose_linear_weights,
     size_t * loaded_tensors) {
     return trellis_tensor_store_load_safetensors_f32_ex(
+        store,
+        backend,
+        safetensors_path,
+        transpose_linear_weights,
+        loaded_tensors,
+        NULL,
+        NULL);
+}
+
+trellis_status trellis_tensor_store_load_safetensors(
+    trellis_tensor_store * store,
+    const trellis_backend_context * backend,
+    const char * safetensors_path,
+    bool transpose_linear_weights,
+    size_t * loaded_tensors) {
+    return trellis_tensor_store_load_safetensors_ex(
         store,
         backend,
         safetensors_path,
@@ -234,11 +318,12 @@ static void emit_load_progress(
     progress_callback(&progress, progress_user_data);
 }
 
-trellis_status trellis_tensor_store_load_safetensors_f32_ex(
+static trellis_status trellis_tensor_store_load_safetensors_impl(
     trellis_tensor_store * store,
     const trellis_backend_context * backend,
     const char * safetensors_path,
     bool transpose_linear_weights,
+    bool preserve_16bit_weights,
     size_t * loaded_tensors,
     trellis_tensor_store_load_progress_callback progress_callback,
     void * progress_user_data) {
@@ -259,7 +344,7 @@ trellis_status trellis_tensor_store_load_safetensors_f32_ex(
 
     for (size_t i = 0; i < st.n_tensors; ++i) {
         struct ggml_tensor * tensor = NULL;
-        status = make_tensor_for_meta(store, &st.tensors[i], transpose_linear_weights, &tensor);
+        status = make_tensor_for_meta(store, &st.tensors[i], transpose_linear_weights, preserve_16bit_weights, &tensor);
         if (status != TRELLIS_STATUS_OK) {
             trellis_safetensors_close(&st);
             return status;
@@ -303,4 +388,42 @@ trellis_status trellis_tensor_store_load_safetensors_f32_ex(
     }
     trellis_safetensors_close(&st);
     return TRELLIS_STATUS_OK;
+}
+
+trellis_status trellis_tensor_store_load_safetensors_f32_ex(
+    trellis_tensor_store * store,
+    const trellis_backend_context * backend,
+    const char * safetensors_path,
+    bool transpose_linear_weights,
+    size_t * loaded_tensors,
+    trellis_tensor_store_load_progress_callback progress_callback,
+    void * progress_user_data) {
+    return trellis_tensor_store_load_safetensors_impl(
+        store,
+        backend,
+        safetensors_path,
+        transpose_linear_weights,
+        false,
+        loaded_tensors,
+        progress_callback,
+        progress_user_data);
+}
+
+trellis_status trellis_tensor_store_load_safetensors_ex(
+    trellis_tensor_store * store,
+    const trellis_backend_context * backend,
+    const char * safetensors_path,
+    bool transpose_linear_weights,
+    size_t * loaded_tensors,
+    trellis_tensor_store_load_progress_callback progress_callback,
+    void * progress_user_data) {
+    return trellis_tensor_store_load_safetensors_impl(
+        store,
+        backend,
+        safetensors_path,
+        transpose_linear_weights,
+        true,
+        loaded_tensors,
+        progress_callback,
+        progress_user_data);
 }

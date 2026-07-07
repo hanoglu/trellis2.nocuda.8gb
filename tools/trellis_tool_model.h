@@ -26,6 +26,15 @@ int trellis_tool_load_tensor_store_f32(
     trellis_tensor_store * store,
     trellis_tool_model_load_result * result);
 
+int trellis_tool_load_tensor_store(
+    const trellis_cuda_context * cuda,
+    const char * label,
+    const char * path,
+    bool transpose_linear_weights,
+    size_t tensor_slack,
+    trellis_tensor_store * store,
+    trellis_tool_model_load_result * result);
+
 #ifdef __cplusplus
 }
 #endif

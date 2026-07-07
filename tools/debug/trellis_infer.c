@@ -322,7 +322,7 @@ static int load_decoder_store(
     }
 
     trellis_tensor_store store;
-    if (!trellis_tool_load_tensor_store_f32(
+    if (!trellis_tool_load_tensor_store(
             cuda,
             "stage1 sparse-structure decoder",
             path,
@@ -407,7 +407,7 @@ static int load_dino_store(
     }
 
     trellis_tensor_store store;
-    if (!trellis_tool_load_tensor_store_f32(cuda, "dino", path, true, 64, &store, NULL)) {
+    if (!trellis_tool_load_tensor_store(cuda, "dino", path, true, 64, &store, NULL)) {
         return 1;
     }
 
@@ -1029,7 +1029,7 @@ static int load_flow_for_stage1(
     if (!choose_path(model_dir, "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors", path, sizeof(path))) {
         return 0;
     }
-    if (!trellis_tool_load_tensor_store_f32(
+    if (!trellis_tool_load_tensor_store(
             cuda,
             "stage1 sparse-structure flow",
             path,
@@ -1061,7 +1061,7 @@ static int load_decoder_for_stage1(
     if (!choose_path(model_dir, "ckpts/ss_dec_conv3d_16l8_fp16.safetensors", path, sizeof(path))) {
         return 0;
     }
-    if (!trellis_tool_load_tensor_store_f32(
+    if (!trellis_tool_load_tensor_store(
             cuda,
             "stage1 sparse-structure decoder",
             path,
@@ -1226,7 +1226,7 @@ static int load_dino_for_stage1(
         TRELLIS_TOOL_ERROR("stage1 image: invalid dino model path");
         return 0;
     }
-    if (!trellis_tool_load_tensor_store_f32(cuda, "stage1 dino image encoder", path, true, 64, store, NULL)) {
+    if (!trellis_tool_load_tensor_store(cuda, "stage1 dino image encoder", path, true, 64, store, NULL)) {
         return 0;
     }
     char issue[256];
@@ -2127,7 +2127,7 @@ static int load_store(
     int dry_cond_tokens,
     int dry_batch) {
     trellis_tensor_store store;
-    if (!trellis_tool_load_tensor_store_f32(cuda, label, path, true, 64, &store, NULL)) {
+    if (!trellis_tool_load_tensor_store(cuda, label, path, true, 64, &store, NULL)) {
         return 1;
     }
 

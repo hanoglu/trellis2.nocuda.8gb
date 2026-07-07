@@ -184,6 +184,94 @@ static void test_tensor_store_loader_cuda(void) {
     unlink(path);
 }
 
+static void test_tensor_store_loader_preserves_f16_cpu(void) {
+    trellis_backend_context cpu;
+    CHECK_TRUE(trellis_backend_init(&cpu, TRELLIS_BACKEND_CPU, 0) == TRELLIS_STATUS_OK);
+
+    char path[] = "/tmp/trellis2_c_weights_f16_XXXXXX";
+    int fd = mkstemp(path);
+    CHECK_TRUE(fd >= 0);
+    FILE * f = fdopen(fd, "wb");
+    CHECK_TRUE(f != NULL);
+
+    const char * header =
+        "{\"linear.weight\":{\"dtype\":\"F16\",\"shape\":[3,2],\"data_offsets\":[0,12]},"
+        "\"linear.bias\":{\"dtype\":\"BF16\",\"shape\":[3],\"data_offsets\":[12,18]}}";
+    uint64_t hlen = (uint64_t) strlen(header);
+    unsigned char hbuf[8];
+    for (int i = 0; i < 8; ++i) {
+        hbuf[i] = (unsigned char) ((hlen >> (8 * i)) & 0xff);
+    }
+    fwrite(hbuf, 1, 8, f);
+    fwrite(header, 1, strlen(header), f);
+    const float w_ref[6] = {
+        1.0f, -2.0f,
+        3.5f, -4.5f,
+        5.25f, -6.25f,
+    };
+    const float b_ref[3] = {0.25f, -0.5f, 0.75f};
+    ggml_fp16_t w_raw[6];
+    ggml_bf16_t b_raw[3];
+    for (int i = 0; i < 6; ++i) {
+        w_raw[i] = ggml_fp32_to_fp16(w_ref[i]);
+    }
+    for (int i = 0; i < 3; ++i) {
+        b_raw[i] = ggml_fp32_to_bf16(b_ref[i]);
+    }
+    fwrite(w_raw, 1, sizeof(w_raw), f);
+    fwrite(b_raw, 1, sizeof(b_raw), f);
+    fclose(f);
+
+    trellis_tensor_store store;
+    CHECK_TRUE(trellis_tensor_store_init(&store, 16, 0) == TRELLIS_STATUS_OK);
+    size_t loaded = 0;
+    CHECK_TRUE(trellis_tensor_store_load_safetensors(&store, &cpu, path, true, &loaded) == TRELLIS_STATUS_OK);
+    CHECK_TRUE(loaded == 2);
+
+    struct ggml_tensor * w = trellis_tensor_store_get(&store, "linear.weight");
+    struct ggml_tensor * b = trellis_tensor_store_get(&store, "linear.bias");
+    CHECK_TRUE(w != NULL && b != NULL);
+    CHECK_TRUE(w->type == GGML_TYPE_F16);
+    CHECK_TRUE(b->type == GGML_TYPE_BF16);
+    CHECK_TRUE(w->ne[0] == 2 && w->ne[1] == 3);
+    CHECK_TRUE(b->ne[0] == 3);
+
+    ggml_fp16_t got_w_raw[6];
+    ggml_bf16_t got_b_raw[3];
+    ggml_backend_tensor_get(w, got_w_raw, 0, ggml_nbytes(w));
+    ggml_backend_tensor_get(b, got_b_raw, 0, ggml_nbytes(b));
+    for (int i = 0; i < 6; ++i) {
+        CHECK_CLOSE(ggml_fp16_to_fp32(got_w_raw[i]), w_ref[i], 1e-3f);
+    }
+    for (int i = 0; i < 3; ++i) {
+        CHECK_CLOSE(ggml_bf16_to_fp32(got_b_raw[i]), b_ref[i], 1e-2f);
+    }
+    trellis_tensor_store_free(&store);
+
+    CHECK_TRUE(trellis_tensor_store_init(&store, 16, 0) == TRELLIS_STATUS_OK);
+    loaded = 0;
+    CHECK_TRUE(trellis_tensor_store_load_safetensors_f32(&store, &cpu, path, true, &loaded) == TRELLIS_STATUS_OK);
+    CHECK_TRUE(loaded == 2);
+    w = trellis_tensor_store_get(&store, "linear.weight");
+    b = trellis_tensor_store_get(&store, "linear.bias");
+    CHECK_TRUE(w != NULL && b != NULL);
+    CHECK_TRUE(w->type == GGML_TYPE_F32);
+    CHECK_TRUE(b->type == GGML_TYPE_F32);
+    float got_w[6] = {0};
+    float got_b[3] = {0};
+    ggml_backend_tensor_get(w, got_w, 0, ggml_nbytes(w));
+    ggml_backend_tensor_get(b, got_b, 0, ggml_nbytes(b));
+    for (int i = 0; i < 6; ++i) {
+        CHECK_CLOSE(got_w[i], w_ref[i], 1e-3f);
+    }
+    for (int i = 0; i < 3; ++i) {
+        CHECK_CLOSE(got_b[i], b_ref[i], 1e-2f);
+    }
+    trellis_tensor_store_free(&store);
+    unlink(path);
+    trellis_backend_free(&cpu);
+}
+
 static void test_linear_cuda(void) {
     struct ggml_context * ctx = make_graph_ctx();
     struct ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2, 3);
@@ -1426,6 +1514,12 @@ int main(void) {
     test_stage1_sampler_math();
     test_real_stage1_checkpoint_manifests_if_present();
     test_real_stage2_checkpoint_manifests_if_present();
+    test_tensor_store_loader_preserves_f16_cpu();
+
+    if (g_failures != 0) {
+        fprintf(stderr, "%d test failures\n", g_failures);
+        return 1;
+    }
 
     trellis_status cuda_status = trellis_cuda_init(&g_cuda, 0);
     if (cuda_status != TRELLIS_STATUS_OK) {

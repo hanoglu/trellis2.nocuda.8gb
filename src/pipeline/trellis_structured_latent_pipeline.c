@@ -224,7 +224,7 @@ static int load_slat_flow(
     trellis_dit_flow_weights * flow) {
     char load_label[128];
     snprintf(load_label, sizeof(load_label), "structured-latent %s flow", label);
-    if (!trellis_load_tensor_store_f32(backend, load_label, path, true, 64, store, NULL)) {
+    if (!trellis_load_tensor_store(backend, load_label, path, true, 64, store, NULL)) {
         return 0;
     }
     char issue[256];

@@ -340,11 +340,12 @@ static void model_load_progress(
         now_us - ctx->start_us);
 }
 
-int trellis_load_tensor_store_f32(
+static int trellis_load_tensor_store_impl(
     const trellis_backend_context * backend,
     const char * label,
     const char * path,
     bool transpose_linear_weights,
+    bool preserve_16bit_weights,
     size_t tensor_slack,
     trellis_tensor_store * store,
     trellis_model_load_result * result) {
@@ -384,14 +385,25 @@ int trellis_load_tensor_store_f32(
     model_load_progress_context progress;
     progress.label = label == NULL ? "model" : label;
     progress.start_us = ggml_time_us();
-    status = trellis_tensor_store_load_safetensors_f32_ex(
-        store,
-        backend,
-        path,
-        transpose_linear_weights,
-        &loaded,
-        model_load_progress,
-        &progress);
+    if (preserve_16bit_weights) {
+        status = trellis_tensor_store_load_safetensors_ex(
+            store,
+            backend,
+            path,
+            transpose_linear_weights,
+            &loaded,
+            model_load_progress,
+            &progress);
+    } else {
+        status = trellis_tensor_store_load_safetensors_f32_ex(
+            store,
+            backend,
+            path,
+            transpose_linear_weights,
+            &loaded,
+            model_load_progress,
+            &progress);
+    }
     const int64_t elapsed_us = ggml_time_us() - progress.start_us;
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_ERROR("%s: load failed: %s", label == NULL ? "model" : label, trellis_status_string(status));
@@ -405,10 +417,49 @@ int trellis_load_tensor_store_f32(
         result->seconds = elapsed_us <= 0 ? 0.0 : (double) elapsed_us / 1000000.0;
     }
     TRELLIS_INFO(
-        "%s: loaded %zu tensors to %s in %.2fs",
+        "%s: loaded %zu tensors to %s in %.2fs%s",
         label == NULL ? "model" : label,
         loaded,
         trellis_backend_kind_name(backend->kind),
-        elapsed_us <= 0 ? 0.0 : (double) elapsed_us / 1000000.0);
+        elapsed_us <= 0 ? 0.0 : (double) elapsed_us / 1000000.0,
+        preserve_16bit_weights ? " (native 16-bit where available)" : "");
     return 1;
+}
+
+int trellis_load_tensor_store_f32(
+    const trellis_backend_context * backend,
+    const char * label,
+    const char * path,
+    bool transpose_linear_weights,
+    size_t tensor_slack,
+    trellis_tensor_store * store,
+    trellis_model_load_result * result) {
+    return trellis_load_tensor_store_impl(
+        backend,
+        label,
+        path,
+        transpose_linear_weights,
+        false,
+        tensor_slack,
+        store,
+        result);
+}
+
+int trellis_load_tensor_store(
+    const trellis_backend_context * backend,
+    const char * label,
+    const char * path,
+    bool transpose_linear_weights,
+    size_t tensor_slack,
+    trellis_tensor_store * store,
+    trellis_model_load_result * result) {
+    return trellis_load_tensor_store_impl(
+        backend,
+        label,
+        path,
+        transpose_linear_weights,
+        true,
+        tensor_slack,
+        store,
+        result);
 }

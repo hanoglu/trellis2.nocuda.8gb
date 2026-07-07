@@ -196,7 +196,7 @@ static int load_sparse_structure_flow(
     if (!choose_path(model_dir, "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors", path, sizeof(path))) {
         return 0;
     }
-    if (!trellis_load_tensor_store_f32(
+    if (!trellis_load_tensor_store(
             backend,
             "sparse-structure flow",
             path,
@@ -228,7 +228,7 @@ static int load_sparse_structure_decoder(
     if (!choose_path(model_dir, "ckpts/ss_dec_conv3d_16l8_fp16.safetensors", path, sizeof(path))) {
         return 0;
     }
-    if (!trellis_load_tensor_store_f32(
+    if (!trellis_load_tensor_store(
             backend,
             "sparse-structure decoder",
             path,
@@ -274,7 +274,7 @@ static int load_sparse_structure_dino(
         TRELLIS_ERROR("sparse structure: invalid dino model path");
         return 0;
     }
-    if (!trellis_load_tensor_store_f32(backend, "sparse-structure dino image encoder", path, true, 64, store, NULL)) {
+    if (!trellis_load_tensor_store(backend, "sparse-structure dino image encoder", path, true, 64, store, NULL)) {
         return 0;
     }
     char issue[256];

@@ -198,6 +198,27 @@ static struct ggml_tensor * ss_decoder_bias_4d(
     return ggml_view_4d(ctx, bias, 1, 1, 1, bias->ne[0], row, row, row, 0);
 }
 
+static struct ggml_tensor * ss_decoder_cast_param_like(
+    struct ggml_context * ctx,
+    struct ggml_tensor * param,
+    const struct ggml_tensor * ref) {
+    if (ctx == NULL || param == NULL || ref == NULL || param->type == ref->type) {
+        return param;
+    }
+    if (ref->type == GGML_TYPE_F32 || ref->type == GGML_TYPE_F16) {
+        return ggml_cast(ctx, param, ref->type);
+    }
+    return param;
+}
+
+static struct ggml_tensor * ss_decoder_repeat_param(
+    struct ggml_context * ctx,
+    struct ggml_tensor * param,
+    struct ggml_tensor * ref) {
+    param = ss_decoder_cast_param_like(ctx, param, ref);
+    return ggml_repeat(ctx, param, ref);
+}
+
 static struct ggml_tensor * ss_decoder_conv3d_same(
     struct ggml_context * ctx,
     struct ggml_tensor * x,
@@ -232,7 +253,7 @@ static struct ggml_tensor * ss_decoder_conv3d_same(
     if (b4 == NULL) {
         return NULL;
     }
-    return ggml_add(ctx, y, ggml_repeat(ctx, b4, y));
+    return ggml_add(ctx, y, ss_decoder_repeat_param(ctx, b4, y));
 }
 
 static struct ggml_tensor * ss_decoder_channel_layer_norm_3d(
@@ -248,10 +269,10 @@ static struct ggml_tensor * ss_decoder_channel_layer_norm_3d(
     h = ggml_cont(ctx, h);
     h = ggml_norm(ctx, h, eps);
     if (gamma != NULL) {
-        h = ggml_mul(ctx, h, ggml_repeat(ctx, gamma, h));
+        h = ggml_mul(ctx, h, ss_decoder_repeat_param(ctx, gamma, h));
     }
     if (beta != NULL) {
-        h = ggml_add(ctx, h, ggml_repeat(ctx, beta, h));
+        h = ggml_add(ctx, h, ss_decoder_repeat_param(ctx, beta, h));
     }
     h = ggml_permute(ctx, h, 3, 0, 1, 2);
     return ggml_cont(ctx, h);

@@ -415,7 +415,7 @@ static int load_shape_flow(
         fprintf(stderr, "shape flow: store init failed: %s\n", trellis_status_string(status));
         return 0;
     }
-    status = trellis_tensor_store_load_safetensors_f32(store, cuda, path, true, NULL);
+    status = trellis_tensor_store_load_safetensors(store, cuda, path, true, NULL);
     if (status != TRELLIS_STATUS_OK) {
         fprintf(stderr, "shape flow: load failed: %s\n", trellis_status_string(status));
         return 0;
