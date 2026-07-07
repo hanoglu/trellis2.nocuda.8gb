@@ -1,5 +1,7 @@
 #include "trellis.h"
 
+#include "gguf.h"
+
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -426,4 +428,112 @@ trellis_status trellis_tensor_store_load_safetensors_ex(
         loaded_tensors,
         progress_callback,
         progress_user_data);
+}
+
+trellis_status trellis_tensor_store_load_gguf(
+    trellis_tensor_store * store,
+    const trellis_backend_context * backend,
+    const char * gguf_path,
+    size_t * loaded_tensors) {
+    if (store == NULL || backend == NULL || backend->backend == NULL || gguf_path == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (store->ctx != NULL || store->buffer != NULL || store->entries != NULL || store->n_entries != 0) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+
+    struct ggml_context * ctx = NULL;
+    struct gguf_init_params params = {
+        .no_alloc = true,
+        .ctx = &ctx,
+    };
+    struct gguf_context * gguf = gguf_init_from_file(gguf_path, params);
+    if (gguf == NULL || ctx == NULL) {
+        if (ctx != NULL) {
+            ggml_free(ctx);
+        }
+        if (gguf != NULL) {
+            gguf_free(gguf);
+        }
+        return TRELLIS_STATUS_PARSE_ERROR;
+    }
+
+    memset(store, 0, sizeof(*store));
+    store->ctx = ctx;
+
+    const int64_t n_tensors64 = gguf_get_n_tensors(gguf);
+    if (n_tensors64 < 0) {
+        gguf_free(gguf);
+        trellis_tensor_store_free(store);
+        return TRELLIS_STATUS_PARSE_ERROR;
+    }
+
+    trellis_status status = TRELLIS_STATUS_OK;
+    for (int64_t i = 0; i < n_tensors64; ++i) {
+        const char * name = gguf_get_tensor_name(gguf, i);
+        struct ggml_tensor * tensor = ggml_get_tensor(store->ctx, name);
+        if (name == NULL || tensor == NULL) {
+            status = TRELLIS_STATUS_PARSE_ERROR;
+            break;
+        }
+        status = store_append(store, name, tensor);
+        if (status != TRELLIS_STATUS_OK) {
+            break;
+        }
+    }
+    if (status != TRELLIS_STATUS_OK) {
+        gguf_free(gguf);
+        trellis_tensor_store_free(store);
+        return status;
+    }
+
+    store->buffer = ggml_backend_alloc_ctx_tensors(store->ctx, backend->backend);
+    if (store->buffer == NULL && n_tensors64 > 0) {
+        gguf_free(gguf);
+        trellis_tensor_store_free(store);
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+
+    FILE * f = fopen(gguf_path, "rb");
+    if (f == NULL) {
+        gguf_free(gguf);
+        trellis_tensor_store_free(store);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+
+    const size_t data_offset = gguf_get_data_offset(gguf);
+    for (int64_t i = 0; i < n_tensors64; ++i) {
+        struct ggml_tensor * tensor = store->entries[i].tensor;
+        const size_t tensor_offset = gguf_get_tensor_offset(gguf, i);
+        const size_t bytes = gguf_get_tensor_size(gguf, i);
+        if (bytes != ggml_nbytes(tensor)) {
+            status = TRELLIS_STATUS_PARSE_ERROR;
+            break;
+        }
+        void * tmp = malloc(bytes == 0 ? 1 : bytes);
+        if (tmp == NULL) {
+            status = TRELLIS_STATUS_OUT_OF_MEMORY;
+            break;
+        }
+        if (fseek(f, (long) (data_offset + tensor_offset), SEEK_SET) != 0 ||
+            (bytes != 0 && fread(tmp, 1, bytes, f) != bytes)) {
+            free(tmp);
+            status = TRELLIS_STATUS_IO_ERROR;
+            break;
+        }
+        ggml_backend_tensor_set(tensor, tmp, 0, bytes);
+        free(tmp);
+    }
+    fclose(f);
+
+    if (status != TRELLIS_STATUS_OK) {
+        gguf_free(gguf);
+        trellis_tensor_store_free(store);
+        return status;
+    }
+    if (loaded_tensors != NULL) {
+        *loaded_tensors = (size_t) n_tensors64;
+    }
+    gguf_free(gguf);
+    return TRELLIS_STATUS_OK;
 }

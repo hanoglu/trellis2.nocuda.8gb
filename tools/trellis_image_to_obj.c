@@ -29,6 +29,7 @@ static void usage(FILE * out, const char * argv0) {
         "Options:\n"
         "  --model DIR             TRELLIS.2 model directory containing ckpts/\n"
         "  --dino DIR              DINOv3 image encoder directory containing model.safetensors\n"
+        "  --birefnet FILE         Optional BiRefNet GGUF background-removal model\n"
         "  --image FILE            Input image. PNG/JPEG load directly; WebP is converted with ffmpeg first.\n"
         "  --obj FILE              Output OBJ path with vertex colors; no UV texture files\n"
         "  --gltf FILE             Output glTF 2.0 path; writes .gltf + .bin + PBR PNG textures\n"
@@ -150,6 +151,8 @@ int main(int argc, char ** argv) {
             options.model_dir = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--dino") == 0) {
             options.dino_dir = arg_value(argc, argv, &i);
+        } else if (strcmp(argv[i], "--birefnet") == 0) {
+            options.birefnet_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--image") == 0) {
             options.image_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--obj") == 0) {

@@ -184,6 +184,12 @@ trellis_status trellis_tensor_store_load_safetensors_ex(
     trellis_tensor_store_load_progress_callback progress_callback,
     void * progress_user_data);
 
+trellis_status trellis_tensor_store_load_gguf(
+    trellis_tensor_store * store,
+    const trellis_backend_context * backend,
+    const char * gguf_path,
+    size_t * loaded_tensors);
+
 typedef enum trellis_log_level {
     TRELLIS_LOG_DEBUG = 0,
     TRELLIS_LOG_INFO = 1,
@@ -624,6 +630,39 @@ trellis_status trellis_dino_rope_2d_phases_f32(
     float * sin_out,
     size_t phase_count);
 
+#define TRELLIS_BIREFNET_LAYERS 4
+
+typedef struct trellis_birefnet_params {
+    int image_size;
+    int image_multiple;
+    int image_w;
+    int image_h;
+    int embed_dim;
+    int window_size;
+    int layer_depths[TRELLIS_BIREFNET_LAYERS];
+    int layer_heads[TRELLIS_BIREFNET_LAYERS];
+    int layer_features[TRELLIS_BIREFNET_LAYERS];
+} trellis_birefnet_params;
+
+typedef struct trellis_birefnet_model {
+    trellis_backend_context backend;
+    trellis_tensor_store store;
+    trellis_birefnet_params params;
+} trellis_birefnet_model;
+
+trellis_status trellis_birefnet_load_gguf(
+    trellis_birefnet_model * model,
+    const char * gguf_path);
+
+void trellis_birefnet_free(trellis_birefnet_model * model);
+
+trellis_status trellis_birefnet_compute_mask_u8(
+    trellis_birefnet_model * model,
+    const unsigned char * rgba,
+    int width,
+    int height,
+    unsigned char ** mask_out);
+
 typedef struct trellis_mesh_host {
     float * vertices; /* [n_vertices, 3] */
     float * vertex_colors; /* optional [n_vertices, 3] in linear 0..1 RGB */
@@ -646,6 +685,7 @@ trellis_status trellis_flexible_dual_grid_mesh_from_decoder_logits_host(
 typedef struct trellis_image_to_obj_options {
     const char * model_dir;
     const char * dino_dir;
+    const char * birefnet_path;
     const char * image_path;
     const char * obj_path;
     const char * gltf_path;
@@ -689,6 +729,7 @@ typedef enum trellis_model_component {
     TRELLIS_COMPONENT_SHAPE_SLAT_DECODER,
     TRELLIS_COMPONENT_TEX_SLAT_DECODER,
     TRELLIS_COMPONENT_DINOV3_IMAGE_ENCODER,
+    TRELLIS_COMPONENT_BIREFNET_BACKGROUND_REMOVAL,
     TRELLIS_COMPONENT_OVOXEL_POSTPROCESS,
 } trellis_model_component;
 

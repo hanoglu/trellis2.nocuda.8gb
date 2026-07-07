@@ -87,6 +87,7 @@ set(TRELLIS2_C_SOURCES
     src/model/trellis_sparse_guides.c
     src/model/trellis_sparse_structure_decoder.c
     src/model/trellis_dino.c
+    src/model/trellis_birefnet.c
     src/mesh/trellis_flex_dual_grid.c
     src/model/trellis_slat_flow_model.c
     src/model/trellis_ggml_layers.c

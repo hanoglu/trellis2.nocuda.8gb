@@ -13,6 +13,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+extern unsigned char * stbi_load(char const * filename, int * x, int * y, int * comp, int req_comp);
+extern void stbi_image_free(void * retval_from_stbi_load);
+extern int stbi_write_png(char const * filename, int w, int h, int comp, const void * data, int stride_in_bytes);
+
 static const trellis_component_status g_status[] = {
     {
         TRELLIS_COMPONENT_SPARSE_STRUCTURE_FLOW,
@@ -55,6 +59,12 @@ static const trellis_component_status g_status[] = {
         "DINOv3 image encoder",
         true,
         "checkpoint binding, image preprocessing, and full ggml image encoder graph are implemented for CLI conditioning",
+    },
+    {
+        TRELLIS_COMPONENT_BIREFNET_BACKGROUND_REMOVAL,
+        "BiRefNet background removal",
+        true,
+        "GGUF loading, Swin/BiRefNet graph, and CLI pre-mask PNG wiring are implemented; deformable convolution currently runs through a CPU custom op",
     },
     {
         TRELLIS_COMPONENT_OVOXEL_POSTPROCESS,
@@ -147,6 +157,61 @@ static int convert_webp_to_png_ffmpeg(const char * input_path, const char * outp
         return 0;
     }
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static void unlink_if_set(const char * path) {
+    if (path != NULL && path[0] != '\0') {
+        unlink(path);
+    }
+}
+
+static trellis_status apply_birefnet_background_removal(
+    const char * input_path,
+    const char * gguf_path,
+    const char * output_path) {
+    if (input_path == NULL || gguf_path == NULL || output_path == NULL ||
+        input_path[0] == '\0' || gguf_path[0] == '\0' || output_path[0] == '\0') {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+
+    int width = 0;
+    int height = 0;
+    int comp = 0;
+    unsigned char * rgba = stbi_load(input_path, &width, &height, &comp, 4);
+    if (rgba == NULL || width <= 0 || height <= 0) {
+        TRELLIS_ERROR("BiRefNet: failed to load image %s", input_path);
+        stbi_image_free(rgba);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+
+    TRELLIS_INFO("BiRefNet: loading background-removal GGUF: %s", gguf_path);
+    trellis_birefnet_model model;
+    memset(&model, 0, sizeof(model));
+    trellis_status status = trellis_birefnet_load_gguf(&model, gguf_path);
+    unsigned char * mask = NULL;
+    if (status == TRELLIS_STATUS_OK) {
+        status = trellis_birefnet_compute_mask_u8(&model, rgba, width, height, &mask);
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const size_t i = (size_t) y * (size_t) width + (size_t) x;
+                rgba[i * 4u + 3u] = (unsigned char) (((unsigned int) rgba[i * 4u + 3u] * (unsigned int) mask[i] + 127u) / 255u);
+            }
+        }
+        if (!stbi_write_png(output_path, width, height, 4, rgba, width * 4)) {
+            status = TRELLIS_STATUS_IO_ERROR;
+        }
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        TRELLIS_INFO("BiRefNet: wrote masked PNG: %s", output_path);
+    } else {
+        TRELLIS_ERROR("BiRefNet: background removal failed: %s", trellis_status_string(status));
+    }
+    free(mask);
+    trellis_birefnet_free(&model);
+    stbi_image_free(rgba);
+    return status;
 }
 
 static int mkdir_p(const char * path) {
@@ -761,7 +826,9 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     }
 
     char temp_image[4096];
+    char temp_birefnet_image[4096];
     temp_image[0] = '\0';
+    temp_birefnet_image[0] = '\0';
     const char * sparse_structure_image_path = options->image_path;
     if (path_has_ext(options->image_path, "webp")) {
         int n = snprintf(
@@ -775,10 +842,33 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
         TRELLIS_INFO("image prep: converting WebP -> PNG via ffmpeg: %s", temp_image);
         if (!convert_webp_to_png_ffmpeg(options->image_path, temp_image)) {
             TRELLIS_ERROR("image prep: WebP conversion failed; install ffmpeg or convert the image to PNG/JPEG first");
-            unlink(temp_image);
+            unlink_if_set(temp_image);
             return TRELLIS_STATUS_IO_ERROR;
         }
         sparse_structure_image_path = temp_image;
+    }
+    trellis_status status = TRELLIS_STATUS_OK;
+    if (options->birefnet_path != NULL && options->birefnet_path[0] != '\0') {
+        int n = snprintf(
+            temp_birefnet_image,
+            sizeof(temp_birefnet_image),
+            "/tmp/trellis2_birefnet_%ld.png",
+            (long) getpid());
+        if (n < 0 || (size_t) n >= sizeof(temp_birefnet_image)) {
+            unlink_if_set(temp_image);
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
+        }
+        TRELLIS_INFO("image prep: running BiRefNet background removal -> %s", temp_birefnet_image);
+        status = apply_birefnet_background_removal(
+            sparse_structure_image_path,
+            options->birefnet_path,
+            temp_birefnet_image);
+        if (status != TRELLIS_STATUS_OK) {
+            unlink_if_set(temp_birefnet_image);
+            unlink_if_set(temp_image);
+            return status;
+        }
+        sparse_structure_image_path = temp_birefnet_image;
     }
 
     trellis_backend_context graph_backend;
@@ -790,12 +880,11 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
             options->backend :
             TRELLIS_DEFAULT_BACKEND;
     trellis_backend_kind graph_backend_kind = TRELLIS_BACKEND_CUDA;
-    trellis_status status = trellis_backend_kind_from_name(backend_name, &graph_backend_kind);
+    status = trellis_backend_kind_from_name(backend_name, &graph_backend_kind);
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_ERROR("backend: invalid backend '%s'", backend_name);
-        if (temp_image[0] != '\0') {
-            unlink(temp_image);
-        }
+        unlink_if_set(temp_birefnet_image);
+        unlink_if_set(temp_image);
         return status;
     }
     if (strcmp(trellis_backend_kind_name(graph_backend_kind), TRELLIS_DEFAULT_BACKEND) != 0) {
@@ -803,18 +892,16 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
             "backend: this binary was compiled for %s; rebuild with -DTRELLIS2_C_BACKEND=%s for that backend",
             TRELLIS_DEFAULT_BACKEND,
             trellis_backend_kind_name(graph_backend_kind));
-        if (temp_image[0] != '\0') {
-            unlink(temp_image);
-        }
+        unlink_if_set(temp_birefnet_image);
+        unlink_if_set(temp_image);
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     trellis_sparse_backend_kind sparse_backend_kind = TRELLIS_SPARSE_BACKEND_CUDA;
     status = sparse_backend_kind_from_graph_backend(graph_backend_kind, &sparse_backend_kind);
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_ERROR("backend: '%s' is not a full pipeline backend; use cuda or vulkan", backend_name);
-        if (temp_image[0] != '\0') {
-            unlink(temp_image);
-        }
+        unlink_if_set(temp_birefnet_image);
+        unlink_if_set(temp_image);
         return status;
     }
     const int graph_device = options->device;
@@ -825,9 +912,8 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
             trellis_backend_kind_name(graph_backend_kind),
             graph_device,
             trellis_status_string(status));
-        if (temp_image[0] != '\0') {
-            unlink(temp_image);
-        }
+        unlink_if_set(temp_birefnet_image);
+        unlink_if_set(temp_image);
         return status;
     }
     TRELLIS_INFO(
@@ -841,9 +927,8 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
         if (status != TRELLIS_STATUS_OK) {
             TRELLIS_ERROR("SparseUnet CUDA decoder: init device=%d failed: %s", options->device, trellis_status_string(status));
             trellis_backend_free(&graph_backend);
-            if (temp_image[0] != '\0') {
-                unlink(temp_image);
-            }
+            unlink_if_set(temp_birefnet_image);
+            unlink_if_set(temp_image);
             return status;
         }
     }
@@ -1056,8 +1141,7 @@ cleanup:
         trellis_cuda_free(&cuda);
     }
     trellis_backend_free(&graph_backend);
-    if (temp_image[0] != '\0') {
-        unlink(temp_image);
-    }
+    unlink_if_set(temp_birefnet_image);
+    unlink_if_set(temp_image);
     return status;
 }
