@@ -19,6 +19,10 @@ extern "C" {
 #define TRELLIS_DEFAULT_GGML_BACKEND "cuda"
 #endif
 
+#ifndef TRELLIS_DEFAULT_BACKEND
+#define TRELLIS_DEFAULT_BACKEND TRELLIS_DEFAULT_GGML_BACKEND
+#endif
+
 typedef enum trellis_status {
     TRELLIS_STATUS_OK = 0,
     TRELLIS_STATUS_ERROR = 1,
@@ -647,10 +651,8 @@ typedef struct trellis_image_to_obj_options {
     const char * gltf_path;
     const char * flow_override_path;
     const char * decoder_override_path;
-    const char * ggml_backend;
-    const char * sparse_backend;
+    const char * backend;
     int device;
-    int ggml_device;
     int sparse_structure_steps;
     int structured_latent_steps;
     int latent_size;

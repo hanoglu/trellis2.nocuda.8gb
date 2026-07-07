@@ -21,18 +21,6 @@ static trellis_status cuda_status_to_trellis(cudaError_t err) {
     return err == cudaSuccess ? TRELLIS_STATUS_OK : TRELLIS_STATUS_ERROR;
 }
 
-extern "C" void trellis_sparse_c2s_guides_free(trellis_sparse_c2s_guides * guides) {
-    if (guides == NULL) {
-        return;
-    }
-    for (int i = 0; i < TRELLIS_SPARSE_UNET_VAE_DECODER_UP_LEVELS; ++i) {
-        free(guides->levels[i].coords_bxyz);
-        free(guides->levels[i].parent);
-        free(guides->levels[i].subidx);
-    }
-    memset(guides, 0, sizeof(*guides));
-}
-
 static int trellis_profile_enabled(void) {
     const char * enabled = getenv("TRELLIS_PROFILE");
     return enabled != NULL && enabled[0] != '\0' && strcmp(enabled, "0") != 0;

@@ -1,39 +1,51 @@
 cmake_minimum_required(VERSION 3.18)
 
-if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
-    set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures for trellis2.c kernels" FORCE)
+if (NOT DEFINED TRELLIS2_C_BACKEND)
+    if (DEFINED TRELLIS2_C_GGML_BACKEND)
+        set(TRELLIS2_C_BACKEND "${TRELLIS2_C_GGML_BACKEND}" CACHE STRING "Unified graph+sparse backend: cuda or vulkan" FORCE)
+    else()
+        set(TRELLIS2_C_BACKEND "cuda" CACHE STRING "Unified graph+sparse backend: cuda or vulkan")
+    endif()
+endif()
+set_property(CACHE TRELLIS2_C_BACKEND PROPERTY STRINGS cuda vulkan)
+if (NOT TRELLIS2_C_BACKEND MATCHES "^(cuda|vulkan)$")
+    message(FATAL_ERROR "TRELLIS2_C_BACKEND must be one of: cuda, vulkan")
 endif()
 
-project(trellis2_c LANGUAGES C CXX CUDA)
+if (TRELLIS2_C_BACKEND STREQUAL "cuda")
+    if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+        set(CMAKE_CUDA_ARCHITECTURES 89 CACHE STRING "CUDA architectures for trellis2.c kernels" FORCE)
+    endif()
+    project(trellis2_c LANGUAGES C CXX CUDA)
+else()
+    project(trellis2_c LANGUAGES C CXX)
+endif()
+
+set(TRELLIS2_C_GGML_BACKEND "${TRELLIS2_C_BACKEND}" CACHE STRING "Deprecated; use TRELLIS2_C_BACKEND" FORCE)
+set_property(CACHE TRELLIS2_C_GGML_BACKEND PROPERTY STRINGS cuda vulkan)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+if (TRELLIS2_C_BACKEND STREQUAL "cuda")
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+endif()
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(TRELLIS2_C_BUILD_TESTS "Build trellis2.c tests" ON)
 option(TRELLIS2_C_BUILD_TOOLS "Build trellis2.c command line tools" ON)
 option(TRELLIS2_C_BUILD_RAYLIB_VIEWER "Build the raylib snapshot viewers" ON)
-set(TRELLIS2_C_GGML_BACKEND "cuda" CACHE STRING "Default ggml graph backend: cuda, vulkan, or cpu")
-set_property(CACHE TRELLIS2_C_GGML_BACKEND PROPERTY STRINGS cuda vulkan cpu)
 
-# SparseUnetVaeDecoder still uses custom CUDA kernels in this port. The dense
-# ggml graphs can use any ggml backend enabled here, similar to llama.cpp.
-set(GGML_CUDA ON CACHE BOOL "Build ggml CUDA backend")
-set(GGML_VULKAN OFF CACHE BOOL "Build ggml Vulkan backend")
+if (TRELLIS2_C_BACKEND STREQUAL "cuda")
+    set(GGML_CUDA ON CACHE BOOL "Build ggml CUDA backend" FORCE)
+    set(GGML_VULKAN OFF CACHE BOOL "Build ggml Vulkan backend" FORCE)
+else()
+    set(GGML_CUDA OFF CACHE BOOL "Build ggml CUDA backend" FORCE)
+    set(GGML_VULKAN ON CACHE BOOL "Build ggml Vulkan backend" FORCE)
+endif()
 set(GGML_NATIVE OFF CACHE BOOL "Avoid host-specific codegen in the embedded ggml build" FORCE)
 set(GGML_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
-if (TRELLIS2_C_GGML_BACKEND STREQUAL "cuda" AND NOT GGML_CUDA)
-    message(FATAL_ERROR "TRELLIS2_C_GGML_BACKEND=cuda requires -DGGML_CUDA=ON")
-endif()
-if (TRELLIS2_C_GGML_BACKEND STREQUAL "vulkan" AND NOT GGML_VULKAN)
-    message(FATAL_ERROR "TRELLIS2_C_GGML_BACKEND=vulkan requires -DGGML_VULKAN=ON")
-endif()
-if (NOT TRELLIS2_C_GGML_BACKEND MATCHES "^(cuda|vulkan|cpu)$")
-    message(FATAL_ERROR "TRELLIS2_C_GGML_BACKEND must be one of: cuda, vulkan, cpu")
-endif()
 
 if (GGML_VULKAN)
     find_package(Vulkan REQUIRED)
@@ -52,16 +64,15 @@ target_include_directories(xatlas PUBLIC
 )
 target_compile_definitions(xatlas PRIVATE XATLAS_C_API=1)
 
-if (TRELLIS2_C_BUILD_RAYLIB_VIEWER AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/3rd/raylib/CMakeLists.txt")
+if (TRELLIS2_C_BACKEND STREQUAL "cuda" AND TRELLIS2_C_BUILD_RAYLIB_VIEWER AND EXISTS "${CMAKE_CURRENT_LIST_DIR}/3rd/raylib/CMakeLists.txt")
     set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
     add_subdirectory("${CMAKE_CURRENT_LIST_DIR}/3rd/raylib" "${CMAKE_CURRENT_BINARY_DIR}/raylib")
 endif()
 
-add_library(trellis2_c
+set(TRELLIS2_C_SOURCES
     src/runtime/trellis_runtime.c
-    src/model/trellis_cuda_kernels.cu
-    src/model/trellis_cuda_forward.cu
+    src/model/trellis_sparse_guides.c
     src/model/trellis_sparse_structure_decoder.c
     src/model/trellis_dino.c
     src/mesh/trellis_flex_dual_grid.c
@@ -77,8 +88,24 @@ add_library(trellis2_c
     src/model/trellis_sparse_unet_vae_decoder.c
     src/model/trellis_sparse_unet_vae_decoder_exec.c
     src/model/sparse/trellis_sparse_cpu.c
-    src/model/sparse/trellis_sparse_vulkan.c
     src/io/trellis_weights.c
+)
+
+if (TRELLIS2_C_BACKEND STREQUAL "cuda")
+    list(APPEND TRELLIS2_C_SOURCES
+        src/model/sparse/trellis_sparse_vulkan_stubs.c
+        src/model/trellis_cuda_kernels.cu
+        src/model/trellis_cuda_forward.cu
+    )
+else()
+    list(APPEND TRELLIS2_C_SOURCES
+        src/model/sparse/trellis_sparse_vulkan.c
+        src/model/trellis_cuda_stubs.c
+    )
+endif()
+
+add_library(trellis2_c
+    ${TRELLIS2_C_SOURCES}
 )
 
 if (GGML_VULKAN)
@@ -135,8 +162,11 @@ target_include_directories(trellis2_c
         "${CMAKE_CURRENT_LIST_DIR}/3rd/xatlas/source/xatlas"
 )
 
-find_package(CUDAToolkit REQUIRED)
-target_link_libraries(trellis2_c PUBLIC ggml xatlas CUDA::cudart CUDA::cublas)
+target_link_libraries(trellis2_c PUBLIC ggml xatlas)
+if (TRELLIS2_C_BACKEND STREQUAL "cuda")
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(trellis2_c PUBLIC CUDA::cudart CUDA::cublas)
+endif()
 if (GGML_VULKAN)
     target_link_libraries(trellis2_c PRIVATE Vulkan::Vulkan)
 endif()
@@ -144,9 +174,15 @@ if (UNIX)
     target_link_libraries(trellis2_c PUBLIC m)
 endif()
 
+if (TRELLIS2_C_BACKEND STREQUAL "cuda")
+    set(TRELLIS_HAS_CUDA_DECODER_VALUE 1)
+else()
+    set(TRELLIS_HAS_CUDA_DECODER_VALUE 0)
+endif()
 target_compile_definitions(trellis2_c PUBLIC
-    TRELLIS_DEFAULT_GGML_BACKEND="${TRELLIS2_C_GGML_BACKEND}"
-    TRELLIS_HAS_CUDA_DECODER=1
+    TRELLIS_DEFAULT_BACKEND="${TRELLIS2_C_BACKEND}"
+    TRELLIS_DEFAULT_GGML_BACKEND="${TRELLIS2_C_BACKEND}"
+    TRELLIS_HAS_CUDA_DECODER=${TRELLIS_HAS_CUDA_DECODER_VALUE}
 )
 if (GGML_CUDA)
     target_compile_definitions(trellis2_c PUBLIC GGML_USE_CUDA)
@@ -158,25 +194,27 @@ endif()
 
 if (TRELLIS2_C_BUILD_TESTS)
     enable_testing()
-    add_executable(trellis2_c_tests
-        tests/test_trellis.c
-        tools/debug/trellis_checkpoint_validate.c
-        tools/debug/trellis_sparse_reference.c
-    )
-    target_compile_definitions(trellis2_c_tests PRIVATE _POSIX_C_SOURCE=200809L)
-    target_include_directories(trellis2_c_tests PRIVATE
-        "${CMAKE_CURRENT_LIST_DIR}/src/model"
-        "${CMAKE_CURRENT_LIST_DIR}/tools/debug")
-    target_link_libraries(trellis2_c_tests PRIVATE trellis2_c ggml)
-    add_test(NAME trellis2_c_tests COMMAND trellis2_c_tests)
-    set_tests_properties(trellis2_c_tests PROPERTIES SKIP_RETURN_CODE 77)
+    if (TRELLIS2_C_BACKEND STREQUAL "cuda")
+        add_executable(trellis2_c_tests
+            tests/test_trellis.c
+            tools/debug/trellis_checkpoint_validate.c
+            tools/debug/trellis_sparse_reference.c
+        )
+        target_compile_definitions(trellis2_c_tests PRIVATE _POSIX_C_SOURCE=200809L)
+        target_include_directories(trellis2_c_tests PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/src/model"
+            "${CMAKE_CURRENT_LIST_DIR}/tools/debug")
+        target_link_libraries(trellis2_c_tests PRIVATE trellis2_c ggml)
+        add_test(NAME trellis2_c_tests COMMAND trellis2_c_tests)
+        set_tests_properties(trellis2_c_tests PROPERTIES SKIP_RETURN_CODE 77)
 
-    add_executable(trellis2_c_backend_ops_tests
-        tests/test_ggml_backend_ops.c
-    )
-    target_link_libraries(trellis2_c_backend_ops_tests PRIVATE trellis2_c ggml)
-    add_test(NAME trellis2_c_backend_ops_tests COMMAND trellis2_c_backend_ops_tests)
-    set_tests_properties(trellis2_c_backend_ops_tests PROPERTIES SKIP_RETURN_CODE 77)
+        add_executable(trellis2_c_backend_ops_tests
+            tests/test_ggml_backend_ops.c
+        )
+        target_link_libraries(trellis2_c_backend_ops_tests PRIVATE trellis2_c ggml)
+        add_test(NAME trellis2_c_backend_ops_tests COMMAND trellis2_c_backend_ops_tests)
+        set_tests_properties(trellis2_c_backend_ops_tests PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 
     add_executable(trellis2_c_sparse_decoder_backend_tests
         tests/test_sparse_decoder_backend.c
@@ -186,7 +224,7 @@ if (TRELLIS2_C_BUILD_TESTS)
     target_link_libraries(trellis2_c_sparse_decoder_backend_tests PRIVATE trellis2_c ggml)
     add_test(NAME trellis2_c_sparse_decoder_backend_cpu_tests COMMAND trellis2_c_sparse_decoder_backend_tests cpu)
     set_tests_properties(trellis2_c_sparse_decoder_backend_cpu_tests PROPERTIES SKIP_RETURN_CODE 77)
-    if (GGML_VULKAN)
+    if (TRELLIS2_C_BACKEND STREQUAL "vulkan")
         add_test(NAME trellis2_c_sparse_decoder_backend_vulkan_tests COMMAND trellis2_c_sparse_decoder_backend_tests vulkan)
         set_tests_properties(trellis2_c_sparse_decoder_backend_vulkan_tests PROPERTIES SKIP_RETURN_CODE 77)
     endif()
@@ -201,21 +239,23 @@ if (TRELLIS2_C_BUILD_TOOLS)
     add_executable(trellis-info tools/trellis_info.c)
     target_link_libraries(trellis-info PRIVATE trellis2_c ggml)
 
-    add_executable(trellis-sparse-structure
-        tools/debug/trellis_sparse_structure.c
-        tools/debug/trellis_checkpoint_validate.c
-    )
-    target_link_libraries(trellis-sparse-structure PRIVATE trellis2_c ggml)
+    if (TRELLIS2_C_BACKEND STREQUAL "cuda")
+        add_executable(trellis-sparse-structure
+            tools/debug/trellis_sparse_structure.c
+            tools/debug/trellis_checkpoint_validate.c
+        )
+        target_link_libraries(trellis-sparse-structure PRIVATE trellis2_c ggml)
 
-    add_executable(trellis-structured-latent
-        tools/debug/trellis_structured_latent.c
-        tools/debug/trellis_checkpoint_validate.c
-    )
-    target_link_libraries(trellis-structured-latent PRIVATE trellis2_c ggml)
+        add_executable(trellis-structured-latent
+            tools/debug/trellis_structured_latent.c
+            tools/debug/trellis_checkpoint_validate.c
+        )
+        target_link_libraries(trellis-structured-latent PRIVATE trellis2_c ggml)
 
-    add_executable(trellis-infer tools/debug/trellis_infer.c ${TRELLIS_TOOL_COMMON_SOURCES})
-    target_include_directories(trellis-infer PRIVATE "${CMAKE_CURRENT_LIST_DIR}/tools")
-    target_link_libraries(trellis-infer PRIVATE trellis2_c ggml)
+        add_executable(trellis-infer tools/debug/trellis_infer.c ${TRELLIS_TOOL_COMMON_SOURCES})
+        target_include_directories(trellis-infer PRIVATE "${CMAKE_CURRENT_LIST_DIR}/tools")
+        target_link_libraries(trellis-infer PRIVATE trellis2_c ggml)
+    endif()
 
     add_executable(trellis-image-to-obj
         tools/trellis_image_to_obj.c

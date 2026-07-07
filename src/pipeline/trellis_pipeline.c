@@ -75,31 +75,30 @@ const trellis_component_status * trellis_component_status_at(size_t index) {
     return &g_status[index];
 }
 
-static trellis_status sparse_backend_kind_from_name(const char * name, trellis_sparse_backend_kind * kind_out) {
-    if (name == NULL || kind_out == NULL) {
-        return TRELLIS_STATUS_INVALID_ARGUMENT;
-    }
-    if (strcmp(name, "cuda") == 0) {
-        *kind_out = TRELLIS_SPARSE_BACKEND_CUDA;
-        return TRELLIS_STATUS_OK;
-    }
-    if (strcmp(name, "cpu") == 0) {
-        *kind_out = TRELLIS_SPARSE_BACKEND_CPU;
-        return TRELLIS_STATUS_OK;
-    }
-    if (strcmp(name, "vulkan") == 0 || strcmp(name, "vk") == 0) {
-        *kind_out = TRELLIS_SPARSE_BACKEND_VULKAN;
-        return TRELLIS_STATUS_OK;
-    }
-    return TRELLIS_STATUS_INVALID_ARGUMENT;
-}
-
 static const char * sparse_backend_kind_name(trellis_sparse_backend_kind kind) {
     switch (kind) {
         case TRELLIS_SPARSE_BACKEND_CUDA: return "cuda";
         case TRELLIS_SPARSE_BACKEND_CPU: return "cpu";
         case TRELLIS_SPARSE_BACKEND_VULKAN: return "vulkan";
         default: return "unknown";
+    }
+}
+
+static trellis_status sparse_backend_kind_from_graph_backend(
+    trellis_backend_kind graph_kind,
+    trellis_sparse_backend_kind * sparse_kind_out) {
+    if (sparse_kind_out == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    switch (graph_kind) {
+        case TRELLIS_BACKEND_CUDA:
+            *sparse_kind_out = TRELLIS_SPARSE_BACKEND_CUDA;
+            return TRELLIS_STATUS_OK;
+        case TRELLIS_BACKEND_VULKAN:
+            *sparse_kind_out = TRELLIS_SPARSE_BACKEND_VULKAN;
+            return TRELLIS_STATUS_OK;
+        default:
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
 }
 
@@ -786,20 +785,39 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     trellis_cuda_context cuda;
     memset(&graph_backend, 0, sizeof(graph_backend));
     memset(&cuda, 0, sizeof(cuda));
-    const char * graph_backend_name =
-        options->ggml_backend != NULL && options->ggml_backend[0] != '\0' ?
-            options->ggml_backend :
-            TRELLIS_DEFAULT_GGML_BACKEND;
+    const char * backend_name =
+        options->backend != NULL && options->backend[0] != '\0' ?
+            options->backend :
+            TRELLIS_DEFAULT_BACKEND;
     trellis_backend_kind graph_backend_kind = TRELLIS_BACKEND_CUDA;
-    trellis_status status = trellis_backend_kind_from_name(graph_backend_name, &graph_backend_kind);
+    trellis_status status = trellis_backend_kind_from_name(backend_name, &graph_backend_kind);
     if (status != TRELLIS_STATUS_OK) {
-        TRELLIS_ERROR("ggml backend: invalid backend '%s'", graph_backend_name);
+        TRELLIS_ERROR("backend: invalid backend '%s'", backend_name);
         if (temp_image[0] != '\0') {
             unlink(temp_image);
         }
         return status;
     }
-    const int graph_device = options->ggml_device >= 0 ? options->ggml_device : options->device;
+    if (strcmp(trellis_backend_kind_name(graph_backend_kind), TRELLIS_DEFAULT_BACKEND) != 0) {
+        TRELLIS_ERROR(
+            "backend: this binary was compiled for %s; rebuild with -DTRELLIS2_C_BACKEND=%s for that backend",
+            TRELLIS_DEFAULT_BACKEND,
+            trellis_backend_kind_name(graph_backend_kind));
+        if (temp_image[0] != '\0') {
+            unlink(temp_image);
+        }
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    trellis_sparse_backend_kind sparse_backend_kind = TRELLIS_SPARSE_BACKEND_CUDA;
+    status = sparse_backend_kind_from_graph_backend(graph_backend_kind, &sparse_backend_kind);
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR("backend: '%s' is not a full pipeline backend; use cuda or vulkan", backend_name);
+        if (temp_image[0] != '\0') {
+            unlink(temp_image);
+        }
+        return status;
+    }
+    const int graph_device = options->device;
     status = trellis_backend_init(&graph_backend, graph_backend_kind, graph_device);
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_ERROR(
@@ -813,24 +831,10 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
         return status;
     }
     TRELLIS_INFO(
-        "ggml backend: %s device=%d",
+        "backend: %s device=%d",
         trellis_backend_kind_name(graph_backend.kind),
         graph_backend.device);
 
-    const char * sparse_backend_name =
-        options->sparse_backend != NULL && options->sparse_backend[0] != '\0' ?
-            options->sparse_backend :
-            "cuda";
-    trellis_sparse_backend_kind sparse_backend_kind = TRELLIS_SPARSE_BACKEND_CUDA;
-    status = sparse_backend_kind_from_name(sparse_backend_name, &sparse_backend_kind);
-    if (status != TRELLIS_STATUS_OK) {
-        TRELLIS_ERROR("SparseUnet backend: invalid backend '%s'", sparse_backend_name);
-        trellis_backend_free(&graph_backend);
-        if (temp_image[0] != '\0') {
-            unlink(temp_image);
-        }
-        return status;
-    }
     const int sparse_device = options->device;
     if (sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA) {
         status = trellis_cuda_init(&cuda, options->device);
