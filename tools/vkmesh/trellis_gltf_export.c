@@ -2366,14 +2366,29 @@ static trellis_status bake_textures_vulkan(
         next_mr = tmp;
     }
 
-    desc[6] = cur_base;
-    desc[7] = cur_mr;
-    desc[8] = next_base;
-    desc[9] = next_mr;
-    if (!gltf_vk_dispatch(&vk, TRELLIS_GLTF_COMPUTE_FILL_EMPTY, desc, &push, image_groups, image_groups)) {
-        status = TRELLIS_STATUS_ERROR;
-        goto cleanup;
+    uint32_t fill_step = 1u;
+    while (fill_step < (uint32_t) texture_size) {
+        fill_step <<= 1u;
     }
+    fill_step >>= 1u;
+    for (; fill_step > 0u; fill_step >>= 1u) {
+        push.pad0 = fill_step;
+        desc[6] = cur_base;
+        desc[7] = cur_mr;
+        desc[8] = next_base;
+        desc[9] = next_mr;
+        if (!gltf_vk_dispatch(&vk, TRELLIS_GLTF_COMPUTE_FILL_EMPTY, desc, &push, image_groups, image_groups)) {
+            status = TRELLIS_STATUS_ERROR;
+            goto cleanup;
+        }
+        trellis_gltf_vk_buffer * tmp = cur_base;
+        cur_base = next_base;
+        next_base = tmp;
+        tmp = cur_mr;
+        cur_mr = next_mr;
+        next_mr = tmp;
+    }
+    push.pad0 = 0u;
 
     memcpy(base, cur_base->mapped, image_bytes);
     memcpy(mr, cur_mr->mapped, image_bytes);
