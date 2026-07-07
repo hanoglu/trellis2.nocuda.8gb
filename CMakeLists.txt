@@ -289,6 +289,36 @@ if (TRELLIS2_C_BUILD_TOOLS)
         target_link_libraries(trellis-verify PRIVATE m)
     endif()
 
+    if (GGML_VULKAN)
+        set(VKMESH_SPV "${CMAKE_CURRENT_BINARY_DIR}/vkmesh.spv")
+        set(VKMESH_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/vkmesh_spv.h")
+        add_custom_command(
+            OUTPUT "${VKMESH_SPV}"
+            COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
+                    "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh.comp"
+                    -o "${VKMESH_SPV}"
+            DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh.comp"
+            COMMENT "Compile vkmesh Vulkan shader")
+        add_custom_command(
+            OUTPUT "${VKMESH_HEADER}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+            COMMAND "${CMAKE_COMMAND}"
+                    -DINPUT="${VKMESH_SPV}"
+                    -DOUTPUT="${VKMESH_HEADER}"
+                    -DSYMBOL=vkmesh_spv
+                    -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+            DEPENDS "${VKMESH_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+            COMMENT "Generate vkmesh Vulkan shader header")
+        add_custom_target(vkmesh_shader DEPENDS "${VKMESH_HEADER}")
+        add_executable(vkmesh tools/vkmesh.c)
+        add_dependencies(vkmesh vkmesh_shader)
+        target_include_directories(vkmesh PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+        target_link_libraries(vkmesh PRIVATE Vulkan::Vulkan)
+        if (UNIX)
+            target_link_libraries(vkmesh PRIVATE m)
+        endif()
+    endif()
+
     if (TARGET raylib)
         add_executable(trellis-live
             tools/viewers/trellis_live.c
