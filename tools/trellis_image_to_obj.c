@@ -5,8 +5,22 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void usage(const char * argv0) {
-    fprintf(stderr,
+static void print_banner(void) {
+    fputs(
+        "  _______ ____  _____ _     _     ___ ____  ____    ____ \n"
+        " |__   __|  _ \\| ____| |   | |   |_ _/ ___||___ \\  / ___|\n"
+        "    | |  | |_) |  _| | |   | |    | |\\___ \\  __) || |    \n"
+        "    | |  |  _ <| |___| |___| |___ | | ___) |/ __/ | |___ \n"
+        "    |_|  |_| \\_\\_____|_____|_____|___|____/|_____(_)____|\n"
+        "\n"
+        "                 trellis2.c image-to-3D pipeline\n"
+        "\n",
+        stdout);
+    fflush(stdout);
+}
+
+static void usage(FILE * out, const char * argv0) {
+    fprintf(out,
         "Usage:\n"
         "  %s --model DIR --dino DIR --image FILE (--obj FILE | --gltf FILE) [options]\n"
         "\n"
@@ -109,6 +123,8 @@ static int parse_float_arg(const char * text, float * out) {
 }
 
 int main(int argc, char ** argv) {
+    print_banner();
+
     trellis_image_to_obj_options options;
     memset(&options, 0, sizeof(options));
     options.device = 0;
@@ -202,7 +218,7 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "--verbose") == 0) {
             trellis_set_verbose(1);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            usage(argv[0]);
+            usage(stdout, argv[0]);
             return 0;
         } else {
             TRELLIS_ERROR("unknown option: %s", argv[i]);
@@ -228,6 +244,6 @@ int main(int argc, char ** argv) {
     return 0;
 
 bad_args:
-    usage(argv[0]);
+    usage(stderr, argv[0]);
     return 2;
 }
