@@ -290,30 +290,46 @@ if (TRELLIS2_C_BUILD_TOOLS)
     endif()
 
     if (GGML_VULKAN)
-        set(VKMESH_SPV "${CMAKE_CURRENT_BINARY_DIR}/vkmesh.spv")
-        set(VKMESH_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/vkmesh_spv.h")
-        add_custom_command(
-            OUTPUT "${VKMESH_SPV}"
-            COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
-                    "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh.comp"
-                    -o "${VKMESH_SPV}"
-            DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh.comp"
-            COMMENT "Compile vkmesh Vulkan shader")
-        add_custom_command(
-            OUTPUT "${VKMESH_HEADER}"
-            COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
-            COMMAND "${CMAKE_COMMAND}"
-                    -DINPUT="${VKMESH_SPV}"
-                    -DOUTPUT="${VKMESH_HEADER}"
-                    -DSYMBOL=vkmesh_spv
-                    -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
-            DEPENDS "${VKMESH_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
-            COMMENT "Generate vkmesh Vulkan shader header")
-        add_custom_target(vkmesh_shader DEPENDS "${VKMESH_HEADER}")
+        function(add_vkmesh_shader NAME SOURCE SYMBOL)
+            set(SPV "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.spv")
+            set(HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/${SYMBOL}.h")
+            add_custom_command(
+                OUTPUT "${SPV}"
+                COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
+                        "${CMAKE_CURRENT_LIST_DIR}/${SOURCE}"
+                        -o "${SPV}"
+                DEPENDS "${CMAKE_CURRENT_LIST_DIR}/${SOURCE}"
+                COMMENT "Compile ${NAME} Vulkan shader")
+            add_custom_command(
+                OUTPUT "${HEADER}"
+                COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+                COMMAND "${CMAKE_COMMAND}"
+                        -DINPUT="${SPV}"
+                        -DOUTPUT="${HEADER}"
+                        -DSYMBOL=${SYMBOL}
+                        -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+                DEPENDS "${SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+                COMMENT "Generate ${NAME} Vulkan shader header")
+            list(APPEND VKMESH_SHADER_HEADERS "${HEADER}")
+            set(VKMESH_SHADER_HEADERS "${VKMESH_SHADER_HEADERS}" PARENT_SCOPE)
+        endfunction()
+        set(VKMESH_SHADER_HEADERS)
+        add_vkmesh_shader(vkmesh_expand_edges tools/vkmesh_expand_edges.comp vkmesh_expand_edges_spv)
+        add_vkmesh_shader(vkmesh_degenerate_faces tools/vkmesh_degenerate_faces.comp vkmesh_degenerate_faces_spv)
+        add_vkmesh_shader(vkmesh_face_keys tools/vkmesh_face_keys.comp vkmesh_face_keys_spv)
+        add_vkmesh_shader(vkmesh_sort_edges tools/vkmesh_sort_edges.comp vkmesh_sort_edges_spv)
+        add_vkmesh_shader(vkmesh_sort_face_keys tools/vkmesh_sort_face_keys.comp vkmesh_sort_face_keys_spv)
+        add_vkmesh_shader(vkmesh_mark_duplicate_faces tools/vkmesh_mark_duplicate_faces.comp vkmesh_mark_duplicate_faces_spv)
+        add_vkmesh_shader(vkmesh_mark_boundary_edges tools/vkmesh_mark_boundary_edges.comp vkmesh_mark_boundary_edges_spv)
+        add_vkmesh_shader(vkmesh_unsigned_distance tools/vkmesh_unsigned_distance.comp vkmesh_unsigned_distance_spv)
+        add_custom_target(vkmesh_shader DEPENDS ${VKMESH_SHADER_HEADERS})
         add_executable(vkmesh tools/vkmesh.c)
         add_dependencies(vkmesh vkmesh_shader)
-        target_include_directories(vkmesh PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
-        target_link_libraries(vkmesh PRIVATE Vulkan::Vulkan)
+        target_include_directories(vkmesh PRIVATE
+            "${CMAKE_CURRENT_BINARY_DIR}/generated"
+            "${CMAKE_CURRENT_LIST_DIR}/3rd/xatlas/source/xatlas")
+        target_link_libraries(vkmesh PRIVATE Vulkan::Vulkan xatlas)
+        set_target_properties(vkmesh PROPERTIES LINKER_LANGUAGE CXX)
         if (UNIX)
             target_link_libraries(vkmesh PRIVATE m)
         endif()

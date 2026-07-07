@@ -1,0 +1,50 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint aux0;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Faces {
+    int faces[];
+};
+
+layout(binding = 1) buffer Unused1 {
+    uint unused1[];
+};
+
+layout(binding = 2) buffer OutData {
+    uint out_data[];
+};
+
+layout(binding = 3) buffer AuxData {
+    uint aux_data[];
+};
+
+void sort3(inout uint a, inout uint b, inout uint c) {
+    uint t;
+    if (a > b) { t = a; a = b; b = t; }
+    if (b > c) { t = b; b = c; c = t; }
+    if (a > b) { t = a; a = b; b = t; }
+}
+
+void main() {
+    uint face_id = gl_GlobalInvocationID.x;
+    if (face_id >= p.n) return;
+    uint fbase = face_id * 3u;
+    uint a = uint(faces[fbase + 0u]);
+    uint b = uint(faces[fbase + 1u]);
+    uint c = uint(faces[fbase + 2u]);
+    sort3(a, b, c);
+    uint obase = face_id * 4u;
+    out_data[obase + 0u] = a;
+    out_data[obase + 1u] = b;
+    out_data[obase + 2u] = c;
+    out_data[obase + 3u] = face_id;
+}

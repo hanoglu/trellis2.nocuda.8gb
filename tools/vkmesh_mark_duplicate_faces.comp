@@ -1,0 +1,46 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint face_count;
+    uint aux1;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) readonly buffer Records {
+    uint records[];
+};
+
+layout(binding = 1) buffer Unused1 {
+    uint unused1[];
+};
+
+layout(binding = 2) buffer KeepFlags {
+    uint keep_flags[];
+};
+
+layout(binding = 3) buffer AuxData {
+    uint aux_data[];
+};
+
+bool same_key(uint a, uint b) {
+    uint abase = a * 4u;
+    uint bbase = b * 4u;
+    return records[abase + 0u] == records[bbase + 0u] &&
+           records[abase + 1u] == records[bbase + 1u] &&
+           records[abase + 2u] == records[bbase + 2u];
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.n) return;
+    uint base = idx * 4u;
+    uint face_id = records[base + 3u];
+    if (face_id >= p.face_count) return;
+    bool duplicate = idx > 0u && same_key(idx, idx - 1u);
+    keep_flags[face_id] = duplicate ? 0u : 1u;
+}

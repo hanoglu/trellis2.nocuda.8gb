@@ -3,11 +3,12 @@
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform Push {
-    uint op;
     uint n;
     uint aux0;
     uint aux1;
+    uint aux2;
     float eps;
+    float rel_eps;
 } p;
 
 layout(binding = 0) readonly buffer Faces {
@@ -37,7 +38,8 @@ void write_edge(uint dst, uint a, uint b, uint face_id) {
     out_data[base + 4u] = face_id;
 }
 
-void op_expand_edges(uint face_id) {
+void main() {
+    uint face_id = gl_GlobalInvocationID.x;
     if (face_id >= p.n) return;
     uint fbase = face_id * 3u;
     uint a = uint(faces[fbase + 0u]);
@@ -47,29 +49,4 @@ void op_expand_edges(uint face_id) {
     write_edge(ebase + 0u, a, b, face_id);
     write_edge(ebase + 1u, b, c, face_id);
     write_edge(ebase + 2u, c, a, face_id);
-}
-
-void op_degenerate_flags(uint face_id) {
-    if (face_id >= p.n) return;
-    uint fbase = face_id * 3u;
-    uint ia = uint(faces[fbase + 0u]);
-    uint ib = uint(faces[fbase + 1u]);
-    uint ic = uint(faces[fbase + 2u]);
-
-    vec3 a = vec3(vertices[ia * 3u + 0u], vertices[ia * 3u + 1u], vertices[ia * 3u + 2u]);
-    vec3 b = vec3(vertices[ib * 3u + 0u], vertices[ib * 3u + 1u], vertices[ib * 3u + 2u]);
-    vec3 c = vec3(vertices[ic * 3u + 0u], vertices[ic * 3u + 1u], vertices[ic * 3u + 2u]);
-    vec3 ab = b - a;
-    vec3 ac = c - a;
-    float area2 = dot(cross(ab, ac), cross(ab, ac));
-    out_data[face_id] = area2 > p.eps ? 1u : 0u;
-}
-
-void main() {
-    uint idx = gl_GlobalInvocationID.x;
-    if (p.op == 1u) {
-        op_expand_edges(idx);
-    } else if (p.op == 2u) {
-        op_degenerate_flags(idx);
-    }
 }

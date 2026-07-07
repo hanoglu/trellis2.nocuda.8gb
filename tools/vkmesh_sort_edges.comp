@@ -1,0 +1,60 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Push {
+    uint n;
+    uint k;
+    uint j;
+    uint aux2;
+    float eps;
+    float rel_eps;
+} p;
+
+layout(binding = 0) buffer Records {
+    uint records[];
+};
+
+layout(binding = 1) buffer Unused1 {
+    uint unused1[];
+};
+
+layout(binding = 2) buffer Unused2 {
+    uint unused2[];
+};
+
+layout(binding = 3) buffer Unused3 {
+    uint unused3[];
+};
+
+bool edge_less(uint a, uint b) {
+    uint abase = a * 5u;
+    uint bbase = b * 5u;
+    if (records[abase + 0u] != records[bbase + 0u]) return records[abase + 0u] < records[bbase + 0u];
+    if (records[abase + 1u] != records[bbase + 1u]) return records[abase + 1u] < records[bbase + 1u];
+    if (records[abase + 4u] != records[bbase + 4u]) return records[abase + 4u] < records[bbase + 4u];
+    if (records[abase + 2u] != records[bbase + 2u]) return records[abase + 2u] < records[bbase + 2u];
+    return records[abase + 3u] < records[bbase + 3u];
+}
+
+void swap_edge(uint a, uint b) {
+    uint abase = a * 5u;
+    uint bbase = b * 5u;
+    for (uint i = 0u; i < 5u; ++i) {
+        uint tmp = records[abase + i];
+        records[abase + i] = records[bbase + i];
+        records[bbase + i] = tmp;
+    }
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    uint ixj = i ^ p.j;
+    if (ixj <= i || ixj >= p.n) return;
+    bool ascending = (i & p.k) == 0u;
+    bool other_less = edge_less(ixj, i);
+    if ((ascending && other_less) || (!ascending && !other_less)) {
+        swap_edge(i, ixj);
+    }
+}
