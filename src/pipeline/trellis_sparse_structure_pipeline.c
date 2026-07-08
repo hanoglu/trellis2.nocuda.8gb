@@ -11,6 +11,13 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "../3rd/raylib/src/external/stb_image.h"
 
+static void trellis_perf_stage_log(const char * name, int64_t elapsed_us) {
+    TRELLIS_INFO(
+        "perf_stage name=%s ms=%.3f",
+        name != NULL ? name : "unknown",
+        elapsed_us <= 0 ? 0.0 : (double) elapsed_us / 1000.0);
+}
+
 static int choose_path(
     const char * model_dir,
     const char * rel,
@@ -115,6 +122,14 @@ void trellis_sparse_structure_result_free(trellis_sparse_structure_result * resu
         return;
     }
     free(result->coords_bxyz);
+    free(result->cond);
+    memset(result, 0, sizeof(*result));
+}
+
+void trellis_image_condition_result_free(trellis_image_condition_result * result) {
+    if (result == NULL) {
+        return;
+    }
     free(result->cond);
     memset(result, 0, sizeof(*result));
 }
@@ -460,6 +475,7 @@ static int preprocess_image_for_dino(
 
 static int run_dino_condition(
     const trellis_backend_context * backend,
+    trellis_pipeline_model_cache * cache,
     const char * dino_dir,
     const char * image_path,
     int cond_resolution,
@@ -483,11 +499,21 @@ static int run_dino_condition(
     float * output_tokens = NULL;
 
     if (dino == NULL) {
-        if (!load_sparse_structure_dino(backend, dino_dir, &dino_store, &dino_local)) {
-            goto cleanup;
+        if (cache != NULL) {
+            const trellis_dino_vit_weights * cached_dino = NULL;
+            trellis_status status = trellis_pipeline_model_cache_get_dino(cache, dino_dir, &cached_dino);
+            if (status != TRELLIS_STATUS_OK) {
+                TRELLIS_ERROR("sparse-structure dino image encoder: cache load failed: %s", trellis_status_string(status));
+                goto cleanup;
+            }
+            dino = cached_dino;
+        } else {
+            if (!load_sparse_structure_dino(backend, dino_dir, &dino_store, &dino_local)) {
+                goto cleanup;
+            }
+            dino = &dino_local;
+            owns_dino_store = 1;
         }
-        dino = &dino_local;
-        owns_dino_store = 1;
     }
     if (cond_resolution % dino->patch_size != 0) {
         fprintf(stderr, "sparse structure: --cond-resolution must be divisible by DINO patch size %d\n", dino->patch_size);
@@ -546,6 +572,7 @@ static int run_sparse_structure_image(
     int flow_block_parts_override,
     int flow_no_rope,
     float threshold,
+    trellis_pipeline_model_cache * cache,
     trellis_sparse_structure_result * result) {
     if (result != NULL) {
         memset(result, 0, sizeof(*result));
@@ -566,10 +593,14 @@ static int run_sparse_structure_image(
 
     float * context = NULL;
     int cond_tokens = 0;
-    if (!run_dino_condition(backend, dino_dir, image_path, cond_resolution, NULL, &context, &cond_tokens)) {
+    const int64_t dino_start_us = ggml_time_us();
+    if (!run_dino_condition(backend, cache, dino_dir, image_path, cond_resolution, NULL, &context, &cond_tokens)) {
         free(context);
         return 1;
     }
+    char dino_perf_name[64];
+    snprintf(dino_perf_name, sizeof(dino_perf_name), "dino_cond_%d", cond_resolution);
+    trellis_perf_stage_log(dino_perf_name, ggml_time_us() - dino_start_us);
 
     trellis_tensor_store flow_store;
     trellis_tensor_store decoder_store;
@@ -579,10 +610,15 @@ static int run_sparse_structure_image(
     trellis_ss_decoder_weights decoder;
     memset(&flow, 0, sizeof(flow));
     memset(&decoder, 0, sizeof(decoder));
+    int owns_flow_store = 0;
+    int owns_decoder_store = 0;
+    trellis_dit_flow_executor flow_executor_cfg;
     trellis_dit_flow_executor flow_executor_cond;
     trellis_dit_flow_executor flow_executor_uncond;
+    memset(&flow_executor_cfg, 0, sizeof(flow_executor_cfg));
     memset(&flow_executor_cond, 0, sizeof(flow_executor_cond));
     memset(&flow_executor_uncond, 0, sizeof(flow_executor_uncond));
+    int use_cfg_batch = 0;
     int rc = 1;
 
     float * neg_context = NULL;
@@ -596,12 +632,34 @@ static int run_sparse_structure_image(
     float * pairs = NULL;
     float * cos_phase = NULL;
     float * sin_phase = NULL;
+    int64_t voxel_denoise_us = 0;
+    int64_t voxel_decode_us = 0;
+    trellis_status status = TRELLIS_STATUS_OK;
 
-    if (!load_sparse_structure_flow(backend, model_dir, &flow_store, &flow)) {
-        goto cleanup;
-    }
-    if (!load_sparse_structure_decoder(backend, model_dir, &decoder_store, &decoder)) {
-        goto cleanup;
+    if (cache != NULL) {
+        const trellis_dit_flow_weights * cached_flow = NULL;
+        const trellis_ss_decoder_weights * cached_decoder = NULL;
+        status = trellis_pipeline_model_cache_get_sparse_structure_flow(cache, model_dir, &cached_flow);
+        if (status != TRELLIS_STATUS_OK) {
+            TRELLIS_ERROR("sparse-structure flow: cache load failed: %s", trellis_status_string(status));
+            goto cleanup;
+        }
+        status = trellis_pipeline_model_cache_get_sparse_structure_decoder(cache, model_dir, &cached_decoder);
+        if (status != TRELLIS_STATUS_OK) {
+            TRELLIS_ERROR("sparse-structure decoder: cache load failed: %s", trellis_status_string(status));
+            goto cleanup;
+        }
+        flow = *cached_flow;
+        decoder = *cached_decoder;
+    } else {
+        if (!load_sparse_structure_flow(backend, model_dir, &flow_store, &flow)) {
+            goto cleanup;
+        }
+        owns_flow_store = 1;
+        if (!load_sparse_structure_decoder(backend, model_dir, &decoder_store, &decoder)) {
+            goto cleanup;
+        }
+        owns_decoder_store = 1;
     }
     if (flow_blocks_override >= 0) {
         if (flow_blocks_override > flow.n_blocks) {
@@ -653,7 +711,7 @@ static int run_sparse_structure_image(
     }
 
     fill_gaussian_latent(latent, latent_count, seed);
-    trellis_status status = trellis_flow_timestep_pairs_f32(steps, 5.0f, pairs, (size_t) steps * 2u);
+    status = trellis_flow_timestep_pairs_f32(steps, 5.0f, pairs, (size_t) steps * 2u);
     if (status == TRELLIS_STATUS_OK) {
         status = trellis_rope_3d_phases_f32(latent_size, flow.head_dim, 1.0f, 10000.0f, cos_phase, sin_phase, phase_count);
     }
@@ -661,47 +719,76 @@ static int run_sparse_structure_image(
         fprintf(stderr, "sparse structure: schedule/rope failed: %s\n", trellis_status_string(status));
         goto cleanup;
     }
-    status = trellis_dit_flow_executor_init_single(
-        &flow_executor_cond,
+    status = trellis_dit_flow_executor_init_cfg_batch(
+        &flow_executor_cfg,
         backend,
         &flow,
         tokens,
         cond_tokens,
         context,
+        neg_context,
         cos_phase,
         sin_phase);
-    if (status == TRELLIS_STATUS_OK) {
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_WARN(
+            "sparse structure: fused CFG executor init failed (%s); falling back to separate cond/uncond graphs",
+            trellis_status_string(status));
+        trellis_dit_flow_executor_free(&flow_executor_cfg);
         status = trellis_dit_flow_executor_init_single(
-            &flow_executor_uncond,
+            &flow_executor_cond,
             backend,
             &flow,
             tokens,
             cond_tokens,
-            neg_context,
+            context,
             cos_phase,
             sin_phase);
-    }
-    if (status != TRELLIS_STATUS_OK) {
-        fprintf(stderr, "sparse structure: flow executor init failed: %s\n", trellis_status_string(status));
-        goto cleanup;
+        if (status == TRELLIS_STATUS_OK) {
+            status = trellis_dit_flow_executor_init_single(
+                &flow_executor_uncond,
+                backend,
+                &flow,
+                tokens,
+                cond_tokens,
+                neg_context,
+                cos_phase,
+                sin_phase);
+        }
+        if (status != TRELLIS_STATUS_OK) {
+            fprintf(stderr, "sparse structure: flow executor init failed: %s\n", trellis_status_string(status));
+            goto cleanup;
+        }
+    } else {
+        use_cfg_batch = 1;
     }
 
     for (int step = 0; step < steps; ++step) {
         const int64_t step_start_us = ggml_time_us();
+        const int64_t flow_start_us = ggml_time_us();
         const float t = pairs[2 * step + 0];
         const float t_prev = pairs[2 * step + 1];
-        TRELLIS_DEBUG("sparse structure: step %d/%d running reused cond/uncond flow graphs t=%.6g", step + 1, steps, t);
-        status = trellis_dit_flow_executor_run_single(
-            &flow_executor_cond,
-            latent,
-            t,
-            pred_pos);
-        if (status == TRELLIS_STATUS_OK) {
-            status = trellis_dit_flow_executor_run_single(
-                &flow_executor_uncond,
+        if (use_cfg_batch) {
+            TRELLIS_DEBUG("sparse structure: step %d/%d running fused cfg flow graph t=%.6g", step + 1, steps, t);
+            status = trellis_dit_flow_executor_run_cfg_batch(
+                &flow_executor_cfg,
                 latent,
                 t,
+                pred_pos,
                 pred_neg);
+        } else {
+            TRELLIS_DEBUG("sparse structure: step %d/%d running separate cond/uncond flow graphs t=%.6g", step + 1, steps, t);
+            status = trellis_dit_flow_executor_run_single(
+                &flow_executor_cond,
+                latent,
+                t,
+                pred_pos);
+            if (status == TRELLIS_STATUS_OK) {
+                status = trellis_dit_flow_executor_run_single(
+                    &flow_executor_uncond,
+                    latent,
+                    t,
+                    pred_neg);
+            }
         }
         if (status != TRELLIS_STATUS_OK) {
             fprintf(stderr, "sparse structure: flow step %d failed: %s\n", step + 1, trellis_status_string(status));
@@ -716,6 +803,7 @@ static int run_sparse_structure_image(
         trellis_flow_euler_step_f32(latent, pred, latent_count, 1e-5f, t, t_prev, next, x0);
         memcpy(latent, next, latent_count * sizeof(float));
         token_channels_to_ncdhw(latent, latent_ncdhw, flow.in_channels, latent_size);
+        voxel_denoise_us += ggml_time_us() - flow_start_us;
 
         const int need_decode = result != NULL && step + 1 == steps;
         if (!need_decode) {
@@ -735,6 +823,7 @@ static int run_sparse_structure_image(
             continue;
         }
 
+        const int64_t decode_start_us = ggml_time_us();
         float * logits = NULL;
         int output_size = 0;
         TRELLIS_DEBUG("sparse structure: step %d/%d decoding sparse structure", step + 1, steps);
@@ -793,6 +882,7 @@ static int run_sparse_structure_image(
         free(frame_coords);
         free(frame_logits);
         free(logits);
+        voxel_decode_us += ggml_time_us() - decode_start_us;
         char progress_detail[256];
         snprintf(
             progress_detail,
@@ -814,6 +904,8 @@ static int run_sparse_structure_image(
     }
 
     TRELLIS_INFO("sparse structure: decoded final voxel frame (threshold=%.6g)", threshold);
+    trellis_perf_stage_log("stage1_voxel_denoise", voxel_denoise_us);
+    trellis_perf_stage_log("stage1_voxel_decode", voxel_decode_us);
     rc = 0;
 
 cleanup:
@@ -832,10 +924,15 @@ cleanup:
     free(pairs);
     free(cos_phase);
     free(sin_phase);
+    trellis_dit_flow_executor_free(&flow_executor_cfg);
     trellis_dit_flow_executor_free(&flow_executor_cond);
     trellis_dit_flow_executor_free(&flow_executor_uncond);
-    trellis_tensor_store_free(&decoder_store);
-    trellis_tensor_store_free(&flow_store);
+    if (owns_decoder_store) {
+        trellis_tensor_store_free(&decoder_store);
+    }
+    if (owns_flow_store) {
+        trellis_tensor_store_free(&flow_store);
+    }
     return rc;
 }
 
@@ -863,6 +960,42 @@ trellis_status trellis_pipeline_run_sparse_structure(
         options->flow_block_parts_override,
         options->flow_no_rope,
         options->voxel_threshold,
+        options->cache,
         result);
     return rc == 0 ? TRELLIS_STATUS_OK : TRELLIS_STATUS_ERROR;
+}
+
+trellis_status trellis_pipeline_run_image_condition(
+    const trellis_image_condition_options * options,
+    trellis_image_condition_result * result) {
+    if (result != NULL) {
+        memset(result, 0, sizeof(*result));
+    }
+    if (options == NULL || result == NULL || options->dino_dir == NULL ||
+        options->image_path == NULL || options->cond_resolution <= 0) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    const trellis_backend_context * backend = options->backend != NULL ? options->backend : options->cuda;
+    if (backend == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+
+    float * cond = NULL;
+    int cond_tokens = 0;
+    if (!run_dino_condition(
+            backend,
+            options->cache,
+            options->dino_dir,
+            options->image_path,
+            options->cond_resolution,
+            NULL,
+            &cond,
+            &cond_tokens)) {
+        free(cond);
+        return TRELLIS_STATUS_ERROR;
+    }
+    result->cond = cond;
+    result->cond_tokens = cond_tokens;
+    result->resolution = options->cond_resolution;
+    return TRELLIS_STATUS_OK;
 }

@@ -697,6 +697,7 @@ typedef struct trellis_image_to_gltf_options {
     const char * flow_override_path;
     const char * decoder_override_path;
     const char * backend;
+    const char * pipeline_type;
     int device;
     int sparse_structure_steps;
     int structured_latent_steps;
@@ -718,10 +719,13 @@ typedef struct trellis_image_to_gltf_options {
     int use_ggml_flash_attn;
     int decode_max_levels;
     int64_t decode_max_input_tokens;
+    int max_num_tokens;
     int texture_size;
     int mesh_postprocess;
     int mesh_postprocess_no_simplify;
     int mesh_postprocess_decimation_target;
+    int model_cache;
+    int model_cache_budget_mib;
     const char * vkmesh_path;
 } trellis_image_to_gltf_options;
 

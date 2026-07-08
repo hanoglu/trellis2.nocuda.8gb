@@ -37,6 +37,7 @@ option(TRELLIS2_C_BUILD_TESTS "Build trellis2.c tests" ON)
 option(TRELLIS2_C_BUILD_TOOLS "Build trellis2.c command line tools" ON)
 option(TRELLIS2_C_BUILD_RAYLIB_VIEWER "Build the raylib snapshot viewers" ON)
 option(TRELLIS2_C_ENABLE_TENSOR_CORES "Prefer tensor-core capable kernels when 16-bit data and hardware support are available" ON)
+option(TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE "Build Vulkan glTF texture baking independent of the inference backend" ON)
 
 if (TRELLIS2_C_BACKEND STREQUAL "cuda")
     set(GGML_CUDA ON CACHE BOOL "Build ggml CUDA backend" FORCE)
@@ -59,7 +60,13 @@ set(GGML_NATIVE OFF CACHE BOOL "Avoid host-specific codegen in the embedded ggml
 set(GGML_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
 message(STATUS "TRELLIS2_C_ENABLE_TENSOR_CORES=${TRELLIS2_C_ENABLE_TENSOR_CORES}")
 
-if (GGML_VULKAN)
+set(TRELLIS2_C_HAS_GLTF_VULKAN_BAKE OFF)
+if (TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE)
+    set(TRELLIS2_C_HAS_GLTF_VULKAN_BAKE ON)
+endif()
+message(STATUS "TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE=${TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE}")
+
+if (GGML_VULKAN OR TRELLIS2_C_HAS_GLTF_VULKAN_BAKE)
     find_package(Vulkan REQUIRED)
     if (NOT Vulkan_GLSLC_EXECUTABLE)
         find_program(Vulkan_GLSLC_EXECUTABLE glslc REQUIRED)
@@ -92,6 +99,7 @@ set(TRELLIS2_C_SOURCES
     src/model/trellis_slat_flow_model.c
     src/model/trellis_ggml_layers.c
     src/pipeline/trellis_pipeline.c
+    src/pipeline/trellis_pipeline_model_cache.c
     src/pipeline/trellis_dit_flow_executor.c
     src/pipeline/trellis_flow_sampler.c
     src/pipeline/trellis_sparse_structure_pipeline.c
@@ -246,6 +254,91 @@ if (GGML_VULKAN)
     add_dependencies(trellis2_c trellis_gltf_vk_shader)
 endif()
 
+if (TRELLIS2_C_HAS_GLTF_VULKAN_BAKE AND NOT GGML_VULKAN)
+    set(TRELLIS_GLTF_BAKE_VERT_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_bake_vert.spv")
+    set(TRELLIS_GLTF_BAKE_VERT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_bake_vert_spv.h")
+    set(TRELLIS_GLTF_BAKE_FRAG_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_bake_frag.spv")
+    set(TRELLIS_GLTF_BAKE_FRAG_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_bake_frag_spv.h")
+    set(TRELLIS_GLTF_DILATE_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_dilate.spv")
+    set(TRELLIS_GLTF_DILATE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_dilate_spv.h")
+    set(TRELLIS_GLTF_FILL_EMPTY_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_fill_empty.spv")
+    set(TRELLIS_GLTF_FILL_EMPTY_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_fill_empty_spv.h")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_BAKE_VERT_SPV}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=vertex --target-env=vulkan1.2
+                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.vert"
+                -o "${TRELLIS_GLTF_BAKE_VERT_SPV}"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.vert"
+        COMMENT "Compile TRELLIS glTF Vulkan texture bake vertex shader")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_BAKE_FRAG_SPV}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=fragment --target-env=vulkan1.2
+                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.frag"
+                -o "${TRELLIS_GLTF_BAKE_FRAG_SPV}"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_bake.frag"
+        COMMENT "Compile TRELLIS glTF Vulkan texture bake fragment shader")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_DILATE_SPV}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
+                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_dilate.comp"
+                -o "${TRELLIS_GLTF_DILATE_SPV}"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_dilate.comp"
+        COMMENT "Compile TRELLIS glTF Vulkan texture dilation shader")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_FILL_EMPTY_SPV}"
+        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
+                "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_fill_empty.comp"
+                -o "${TRELLIS_GLTF_FILL_EMPTY_SPV}"
+        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/tools/vkmesh/shaders/trellis_gltf_fill_empty.comp"
+        COMMENT "Compile TRELLIS glTF Vulkan texture fill shader")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_BAKE_VERT_HEADER}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND "${CMAKE_COMMAND}"
+                -DINPUT="${TRELLIS_GLTF_BAKE_VERT_SPV}"
+                -DOUTPUT="${TRELLIS_GLTF_BAKE_VERT_HEADER}"
+                -DSYMBOL=trellis_gltf_bake_vert_spv
+                -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        DEPENDS "${TRELLIS_GLTF_BAKE_VERT_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        COMMENT "Generate TRELLIS glTF Vulkan texture bake vertex shader header")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_BAKE_FRAG_HEADER}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND "${CMAKE_COMMAND}"
+                -DINPUT="${TRELLIS_GLTF_BAKE_FRAG_SPV}"
+                -DOUTPUT="${TRELLIS_GLTF_BAKE_FRAG_HEADER}"
+                -DSYMBOL=trellis_gltf_bake_frag_spv
+                -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        DEPENDS "${TRELLIS_GLTF_BAKE_FRAG_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        COMMENT "Generate TRELLIS glTF Vulkan texture bake fragment shader header")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_DILATE_HEADER}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND "${CMAKE_COMMAND}"
+                -DINPUT="${TRELLIS_GLTF_DILATE_SPV}"
+                -DOUTPUT="${TRELLIS_GLTF_DILATE_HEADER}"
+                -DSYMBOL=trellis_gltf_dilate_spv
+                -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        DEPENDS "${TRELLIS_GLTF_DILATE_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        COMMENT "Generate TRELLIS glTF Vulkan texture dilation shader header")
+    add_custom_command(
+        OUTPUT "${TRELLIS_GLTF_FILL_EMPTY_HEADER}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND "${CMAKE_COMMAND}"
+                -DINPUT="${TRELLIS_GLTF_FILL_EMPTY_SPV}"
+                -DOUTPUT="${TRELLIS_GLTF_FILL_EMPTY_HEADER}"
+                -DSYMBOL=trellis_gltf_fill_empty_spv
+                -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        DEPENDS "${TRELLIS_GLTF_FILL_EMPTY_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+        COMMENT "Generate TRELLIS glTF Vulkan texture fill shader header")
+    add_custom_target(trellis_gltf_vk_shader DEPENDS
+        "${TRELLIS_GLTF_BAKE_VERT_HEADER}"
+        "${TRELLIS_GLTF_BAKE_FRAG_HEADER}"
+        "${TRELLIS_GLTF_DILATE_HEADER}"
+        "${TRELLIS_GLTF_FILL_EMPTY_HEADER}")
+    add_dependencies(trellis2_c trellis_gltf_vk_shader)
+endif()
+
 target_include_directories(trellis2_c
     PUBLIC
         "${CMAKE_CURRENT_LIST_DIR}/include"
@@ -262,7 +355,7 @@ if (TRELLIS2_C_BACKEND STREQUAL "cuda")
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(trellis2_c PUBLIC CUDA::cudart CUDA::cublas)
 endif()
-if (GGML_VULKAN)
+if (GGML_VULKAN OR TRELLIS2_C_HAS_GLTF_VULKAN_BAKE)
     target_link_libraries(trellis2_c PRIVATE Vulkan::Vulkan)
 endif()
 if (UNIX)
@@ -274,10 +367,16 @@ if (TRELLIS2_C_BACKEND STREQUAL "cuda")
 else()
     set(TRELLIS_HAS_CUDA_DECODER_VALUE 0)
 endif()
+if (TRELLIS2_C_HAS_GLTF_VULKAN_BAKE)
+    set(TRELLIS_HAS_GLTF_VULKAN_BAKE_VALUE 1)
+else()
+    set(TRELLIS_HAS_GLTF_VULKAN_BAKE_VALUE 0)
+endif()
 target_compile_definitions(trellis2_c PUBLIC
     TRELLIS_DEFAULT_BACKEND="${TRELLIS2_C_BACKEND}"
     TRELLIS_DEFAULT_GGML_BACKEND="${TRELLIS2_C_BACKEND}"
     TRELLIS_HAS_CUDA_DECODER=${TRELLIS_HAS_CUDA_DECODER_VALUE}
+    TRELLIS_HAS_GLTF_VULKAN_BAKE=${TRELLIS_HAS_GLTF_VULKAN_BAKE_VALUE}
 )
 if (GGML_CUDA)
     target_compile_definitions(trellis2_c PUBLIC GGML_USE_CUDA)

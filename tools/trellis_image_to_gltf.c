@@ -35,10 +35,14 @@ static void usage(FILE * out, const char * argv0) {
         "  --glb FILE              Alias of --gltf\n"
         "  --output FILE           Alias of --gltf\n"
         "  --texture-size N        glTF texture size, default 1024\n"
-        "  --mesh-postprocess      Run vkmesh TRELLIS topology cleanup before GLB/glTF export\n"
+        "  --pipeline NAME         512, 1024, or 1024_cascade, default 1024_cascade\n"
+        "  --mesh-postprocess      Run vkmesh TRELLIS topology cleanup before GLB/glTF export, default on\n"
+        "  --no-mesh-postprocess   Disable topology cleanup for raw/debug exports\n"
         "  --mesh-postprocess-no-simplify Skip vkmesh simplify, keeping cleanup/orientation only\n"
         "  --mesh-decimation-target N Postprocess final face target, default 1000000\n"
         "  --vkmesh FILE           vkmesh executable path; default searches sibling binary then PATH\n"
+        "  --no-model-cache        Disable persistent model weight cache\n"
+        "  --model-cache-budget-mib N GPU-resident weight cache budget; 0/unset means unlimited\n"
         "  --backend NAME          Full pipeline backend: " TRELLIS_DEFAULT_BACKEND " for this build\n"
         "  --device N              Backend device, default 0\n"
         "  --steps N               Sparse-structure and structured-latent Euler steps, default 12\n"
@@ -47,7 +51,7 @@ static void usage(FILE * out, const char * argv0) {
         "  --seed N                Sparse-structure latent seed, default 1\n"
         "  --noise-seed N          Structured-latent noise seed, default 18\n"
         "  --latent-size N         Sparse-structure latent grid edge, default 16\n"
-        "  --resolution N          Shape checkpoint/mesh resolution, 512 or 1024, default 512\n"
+        "  --resolution N          Legacy shape resolution override, 512 or 1024; --pipeline controls normal runs\n"
         "  --cond-resolution N     DINO input square edge, default 512\n"
         "  --sparse-resolution N   Sparse-structure output edge, default 32\n"
         "  --flow PATH             Override shape SLat flow safetensors path\n"
@@ -64,6 +68,7 @@ static void usage(FILE * out, const char * argv0) {
         "  --use-ggml-flash-attn   Debug: use ggml flash attention in structured-latent flow\n"
         "  --decode-max-levels N   Debug: run only first N shape decoder levels, default full\n"
         "  --decode-max-input-tokens N Debug: truncate shape decoder input tokens\n"
+        "  --max-num-tokens N      Cascade token budget hint, default 49152\n"
         "  --verbose               Print debug logs\n",
         argv0);
 }
@@ -137,7 +142,8 @@ int main(int argc, char ** argv) {
     options.sparse_structure_steps = 12;
     options.structured_latent_steps = 12;
     options.latent_size = 16;
-    options.resolution = 512;
+    options.pipeline_type = "1024_cascade";
+    options.resolution = 1024;
     options.cond_resolution = 512;
     options.sparse_resolution = 32;
     options.seed = 1u;
@@ -150,7 +156,11 @@ int main(int argc, char ** argv) {
     options.guidance_max = 1.0f;
     options.flow_blocks_override = -1;
     options.flow_block_parts_override = -1;
+    options.mesh_postprocess = 1;
     options.mesh_postprocess_decimation_target = 1000000;
+    options.max_num_tokens = 49152;
+    options.model_cache = 1;
+    options.model_cache_budget_mib = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--model") == 0) {
@@ -167,6 +177,9 @@ int main(int argc, char ** argv) {
             options.gltf_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--mesh-postprocess") == 0) {
             options.mesh_postprocess = 1;
+        } else if (strcmp(argv[i], "--no-mesh-postprocess") == 0) {
+            options.mesh_postprocess = 0;
+            options.mesh_postprocess_no_simplify = 0;
         } else if (strcmp(argv[i], "--mesh-postprocess-no-simplify") == 0) {
             options.mesh_postprocess = 1;
             options.mesh_postprocess_no_simplify = 1;
@@ -174,8 +187,16 @@ int main(int argc, char ** argv) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.mesh_postprocess_decimation_target)) goto bad_args;
         } else if (strcmp(argv[i], "--vkmesh") == 0) {
             options.vkmesh_path = arg_value(argc, argv, &i);
+        } else if (strcmp(argv[i], "--model-cache") == 0) {
+            options.model_cache = 1;
+        } else if (strcmp(argv[i], "--no-model-cache") == 0) {
+            options.model_cache = 0;
+        } else if (strcmp(argv[i], "--model-cache-budget-mib") == 0) {
+            if (!parse_int_arg(arg_value(argc, argv, &i), &options.model_cache_budget_mib)) goto bad_args;
         } else if (strcmp(argv[i], "--backend") == 0) {
             options.backend = arg_value(argc, argv, &i);
+        } else if (strcmp(argv[i], "--pipeline") == 0) {
+            options.pipeline_type = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--ggml-backend") == 0 || strcmp(argv[i], "--sparse-backend") == 0 ||
                    strcmp(argv[i], "--ggml-device") == 0) {
             fprintf(stderr, "%s is no longer supported; use --backend with a binary built for cuda or vulkan\n", argv[i]);
@@ -233,6 +254,8 @@ int main(int argc, char ** argv) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.decode_max_levels)) goto bad_args;
         } else if (strcmp(argv[i], "--decode-max-input-tokens") == 0) {
             if (!parse_i64_arg(arg_value(argc, argv, &i), &options.decode_max_input_tokens)) goto bad_args;
+        } else if (strcmp(argv[i], "--max-num-tokens") == 0) {
+            if (!parse_int_arg(arg_value(argc, argv, &i), &options.max_num_tokens)) goto bad_args;
         } else if (strcmp(argv[i], "--verbose") == 0) {
             trellis_set_verbose(1);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -253,7 +276,9 @@ int main(int argc, char ** argv) {
         options.sparse_structure_steps <= 0 || options.structured_latent_steps <= 0 ||
         options.latent_size <= 0 || options.cond_resolution <= 0 ||
         options.sparse_resolution <= 0 || options.texture_size <= 0 ||
+        options.max_num_tokens <= 0 ||
         options.mesh_postprocess_decimation_target <= 0 ||
+        options.model_cache_budget_mib < 0 ||
         (options.resolution != 512 && options.resolution != 1024)) {
         goto bad_args;
     }

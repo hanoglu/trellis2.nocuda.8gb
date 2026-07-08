@@ -20,6 +20,10 @@ typedef struct trellis_dit_flow_executor {
     float * y_host;
     int64_t tokens;
     int cond_tokens;
+    int batch;
+    size_t single_input_count;
+    size_t single_output_count;
+    size_t single_context_count;
     size_t input_count;
     size_t output_count;
     size_t context_count;
@@ -40,6 +44,24 @@ trellis_status trellis_dit_flow_executor_run_single(
     const float * latent,
     float timestep,
     float * pred);
+
+trellis_status trellis_dit_flow_executor_init_cfg_batch(
+    trellis_dit_flow_executor * executor,
+    const trellis_backend_context * backend,
+    const trellis_dit_flow_weights * weights,
+    int64_t tokens,
+    int cond_tokens,
+    const float * context,
+    const float * neg_context,
+    const float * cos_phase,
+    const float * sin_phase);
+
+trellis_status trellis_dit_flow_executor_run_cfg_batch(
+    trellis_dit_flow_executor * executor,
+    const float * latent,
+    float timestep,
+    float * pred_pos,
+    float * pred_neg);
 
 void trellis_dit_flow_executor_free(trellis_dit_flow_executor * executor);
 

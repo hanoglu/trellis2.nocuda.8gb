@@ -22,6 +22,36 @@
 #define PATH_MAX 4096
 #endif
 
+static void trellis_perf_stage_log(const char * name, int64_t elapsed_us) {
+    TRELLIS_INFO(
+        "perf_stage name=%s ms=%.3f",
+        name != NULL ? name : "unknown",
+        elapsed_us <= 0 ? 0.0 : (double) elapsed_us / 1000.0);
+}
+
+static size_t model_cache_budget_bytes_from_options(const trellis_image_to_gltf_options * options) {
+    long long mib = options != NULL ? (long long) options->model_cache_budget_mib : 0;
+    if (mib <= 0) {
+        const char * env = getenv("TRELLIS_MODEL_CACHE_BUDGET_MIB");
+        if (env != NULL && env[0] != '\0') {
+            char * end = NULL;
+            errno = 0;
+            long long parsed = strtoll(env, &end, 10);
+            if (errno == 0 && end != env && *end == '\0' && parsed > 0) {
+                mib = parsed;
+            }
+        }
+    }
+    if (mib <= 0) {
+        return 0;
+    }
+    const long long max_mib = (long long) (SIZE_MAX / (1024u * 1024u));
+    if (mib > max_mib) {
+        mib = max_mib;
+    }
+    return (size_t) mib * 1024u * 1024u;
+}
+
 extern unsigned char * stbi_load(char const * filename, int * x, int * y, int * comp, int req_comp);
 extern void stbi_image_free(void * retval_from_stbi_load);
 extern int stbi_write_png(char const * filename, int w, int h, int comp, const void * data, int stride_in_bytes);
@@ -362,26 +392,41 @@ trellis_status trellis_pipeline_decode_shape_latent_mesh(
     memset(&decoder_store, 0, sizeof(decoder_store));
     memset(&decoder, 0, sizeof(decoder));
     memset(&cpu_weights_backend, 0, sizeof(cpu_weights_backend));
+    const trellis_sparse_unet_vae_decoder_weights * decoder_ptr = &decoder;
     int32_t * out_coords = NULL;
     float * out_feats = NULL;
 
-    if (!make_shape_decoder_path(options->model_dir, options->decoder_override_path, decoder_path, sizeof(decoder_path))) {
-        TRELLIS_ERROR("pipeline mesh: failed to build shape decoder path");
-        goto cleanup;
-    }
     const trellis_backend_context * weight_backend = options->cuda;
     int owns_weight_backend = 0;
-    if (options->sparse_backend_kind != TRELLIS_SPARSE_BACKEND_CUDA) {
-        status = trellis_backend_init(&cpu_weights_backend, TRELLIS_BACKEND_CPU, 0);
+    int owns_decoder_store = 0;
+    if (options->cache != NULL) {
+        status = trellis_pipeline_model_cache_get_shape_decoder(
+            options->cache,
+            options->model_dir,
+            options->decoder_override_path,
+            &decoder_ptr);
         if (status != TRELLIS_STATUS_OK) {
-            TRELLIS_ERROR("pipeline mesh: CPU decoder weight backend init failed: %s", trellis_status_string(status));
+            TRELLIS_ERROR("pipeline mesh: cache shape decoder load failed: %s", trellis_status_string(status));
             goto cleanup;
         }
-        weight_backend = &cpu_weights_backend;
-        owns_weight_backend = 1;
-    }
-    if (!load_shape_decoder(weight_backend, decoder_path, &decoder_store, &decoder)) {
-        goto cleanup;
+    } else {
+        if (!make_shape_decoder_path(options->model_dir, options->decoder_override_path, decoder_path, sizeof(decoder_path))) {
+            TRELLIS_ERROR("pipeline mesh: failed to build shape decoder path");
+            goto cleanup;
+        }
+        if (options->sparse_backend_kind != TRELLIS_SPARSE_BACKEND_CUDA) {
+            status = trellis_backend_init(&cpu_weights_backend, TRELLIS_BACKEND_CPU, 0);
+            if (status != TRELLIS_STATUS_OK) {
+                TRELLIS_ERROR("pipeline mesh: CPU decoder weight backend init failed: %s", trellis_status_string(status));
+                goto cleanup;
+            }
+            weight_backend = &cpu_weights_backend;
+            owns_weight_backend = 1;
+        }
+        if (!load_shape_decoder(weight_backend, decoder_path, &decoder_store, &decoder)) {
+            goto cleanup;
+        }
+        owns_decoder_store = 1;
     }
 
     int64_t n_use = options->latent->n_coords;
@@ -402,7 +447,7 @@ trellis_status trellis_pipeline_decode_shape_latent_mesh(
     forward_options.max_levels = options->decode_max_levels;
     forward_options.return_subs = subs_out;
     status = trellis_sparse_unet_vae_decoder_forward_backend_f32_host(
-        &decoder,
+        decoder_ptr,
         options->latent->coords_bxyz,
         options->latent->feats,
         n_use,
@@ -432,7 +477,9 @@ trellis_status trellis_pipeline_decode_shape_latent_mesh(
 cleanup:
     free(out_coords);
     free(out_feats);
-    trellis_tensor_store_free(&decoder_store);
+    if (owns_decoder_store) {
+        trellis_tensor_store_free(&decoder_store);
+    }
     if (owns_weight_backend) {
         trellis_backend_free(&cpu_weights_backend);
     }
@@ -443,6 +490,186 @@ cleanup:
         trellis_mesh_free(mesh_out);
     }
     return status;
+}
+
+static trellis_status trellis_pipeline_decode_shape_latent_decoder_coords(
+    const trellis_pipeline_mesh_options * options,
+    int32_t ** coords_out,
+    int64_t * n_out) {
+    if (coords_out != NULL) {
+        *coords_out = NULL;
+    }
+    if (n_out != NULL) {
+        *n_out = 0;
+    }
+    if (options == NULL || coords_out == NULL || n_out == NULL ||
+        options->model_dir == NULL || options->latent == NULL ||
+        options->latent->coords_bxyz == NULL || options->latent->feats == NULL ||
+        options->latent->n_coords <= 0 || options->latent->channels != 32 ||
+        (options->sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA && options->cuda == NULL)) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+
+    trellis_status status = TRELLIS_STATUS_ERROR;
+    char decoder_path[4096];
+    trellis_tensor_store decoder_store;
+    trellis_sparse_unet_vae_decoder_weights decoder;
+    trellis_backend_context cpu_weights_backend;
+    memset(&decoder_store, 0, sizeof(decoder_store));
+    memset(&decoder, 0, sizeof(decoder));
+    memset(&cpu_weights_backend, 0, sizeof(cpu_weights_backend));
+    const trellis_sparse_unet_vae_decoder_weights * decoder_ptr = &decoder;
+    int owns_weight_backend = 0;
+    int owns_decoder_store = 0;
+    int32_t * decoder_coords = NULL;
+    float * decoder_feats = NULL;
+
+    const trellis_backend_context * weight_backend = options->cuda;
+    if (options->cache != NULL) {
+        status = trellis_pipeline_model_cache_get_shape_decoder(
+            options->cache,
+            options->model_dir,
+            options->decoder_override_path,
+            &decoder_ptr);
+        if (status != TRELLIS_STATUS_OK) {
+            TRELLIS_ERROR("cascade upsample: cache shape decoder load failed: %s", trellis_status_string(status));
+            goto cleanup;
+        }
+    } else {
+        if (!make_shape_decoder_path(options->model_dir, options->decoder_override_path, decoder_path, sizeof(decoder_path))) {
+            TRELLIS_ERROR("cascade upsample: failed to build shape decoder path");
+            goto cleanup;
+        }
+        if (options->sparse_backend_kind != TRELLIS_SPARSE_BACKEND_CUDA) {
+            status = trellis_backend_init(&cpu_weights_backend, TRELLIS_BACKEND_CPU, 0);
+            if (status != TRELLIS_STATUS_OK) {
+                TRELLIS_ERROR("cascade upsample: CPU decoder weight backend init failed: %s", trellis_status_string(status));
+                goto cleanup;
+            }
+            weight_backend = &cpu_weights_backend;
+            owns_weight_backend = 1;
+        }
+        if (!load_shape_decoder(weight_backend, decoder_path, &decoder_store, &decoder)) {
+            goto cleanup;
+        }
+        owns_decoder_store = 1;
+    }
+
+    int64_t n_use = options->latent->n_coords;
+    if (options->decode_max_input_tokens > 0 && options->decode_max_input_tokens < n_use) {
+        n_use = options->decode_max_input_tokens;
+        TRELLIS_WARN(
+            "cascade upsample: truncating decoder input tokens %lld -> %lld",
+            (long long) options->latent->n_coords,
+            (long long) n_use);
+    }
+
+    int64_t decoder_n = 0;
+    int decoder_channels = 0;
+    trellis_sparse_unet_vae_decoder_forward_options forward_options;
+    memset(&forward_options, 0, sizeof(forward_options));
+    forward_options.backend_kind = options->sparse_backend_kind;
+    forward_options.device = options->sparse_device;
+    forward_options.max_levels = options->decode_max_levels;
+    status = trellis_sparse_unet_vae_decoder_forward_backend_f32_host(
+        decoder_ptr,
+        options->latent->coords_bxyz,
+        options->latent->feats,
+        n_use,
+        &forward_options,
+        &decoder_coords,
+        &decoder_feats,
+        &decoder_n,
+        &decoder_channels);
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR("cascade upsample: decoder forward failed: %s", trellis_status_string(status));
+        goto cleanup;
+    }
+    (void) decoder_channels;
+    *coords_out = decoder_coords;
+    *n_out = decoder_n;
+    decoder_coords = NULL;
+    status = TRELLIS_STATUS_OK;
+
+cleanup:
+    free(decoder_coords);
+    free(decoder_feats);
+    if (owns_decoder_store) {
+        trellis_tensor_store_free(&decoder_store);
+    }
+    if (owns_weight_backend) {
+        trellis_backend_free(&cpu_weights_backend);
+    }
+    return status;
+}
+
+static int cmp_coord4_i32(const void * a, const void * b) {
+    const int32_t * ca = (const int32_t *) a;
+    const int32_t * cb = (const int32_t *) b;
+    for (int i = 0; i < 4; ++i) {
+        if (ca[i] < cb[i]) return -1;
+        if (ca[i] > cb[i]) return 1;
+    }
+    return 0;
+}
+
+static int same_coord4_i32(const int32_t * a, const int32_t * b) {
+    return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
+}
+
+static trellis_status quantize_cascade_coords(
+    const int32_t * decoder_coords,
+    int64_t decoder_n,
+    int lr_resolution,
+    int hr_resolution,
+    int32_t ** coords_out,
+    int64_t * n_out) {
+    if (coords_out != NULL) {
+        *coords_out = NULL;
+    }
+    if (n_out != NULL) {
+        *n_out = 0;
+    }
+    if (decoder_coords == NULL || decoder_n <= 0 || lr_resolution <= 0 ||
+        hr_resolution <= 0 || coords_out == NULL || n_out == NULL ||
+        decoder_n > INT64_MAX / 4) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    const int hr_slat_edge = hr_resolution / 16;
+    if (hr_slat_edge <= 0) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    int32_t * tmp = (int32_t *) malloc((size_t) decoder_n * 4u * sizeof(int32_t));
+    if (tmp == NULL) {
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    for (int64_t i = 0; i < decoder_n; ++i) {
+        tmp[(size_t) i * 4u + 0u] = decoder_coords[(size_t) i * 4u + 0u];
+        for (int axis = 0; axis < 3; ++axis) {
+            const int32_t c = decoder_coords[(size_t) i * 4u + 1u + (size_t) axis];
+            int q = (int) floorf((((float) c + 0.5f) / (float) lr_resolution) * (float) hr_slat_edge);
+            if (q < 0) q = 0;
+            if (q >= hr_slat_edge) q = hr_slat_edge - 1;
+            tmp[(size_t) i * 4u + 1u + (size_t) axis] = (int32_t) q;
+        }
+    }
+    qsort(tmp, (size_t) decoder_n, 4u * sizeof(int32_t), cmp_coord4_i32);
+    int64_t unique_n = 0;
+    for (int64_t i = 0; i < decoder_n; ++i) {
+        if (i == 0 || !same_coord4_i32(&tmp[(size_t) i * 4u], &tmp[(size_t) (i - 1) * 4u])) {
+            if (unique_n != i) {
+                memcpy(&tmp[(size_t) unique_n * 4u], &tmp[(size_t) i * 4u], 4u * sizeof(int32_t));
+            }
+            ++unique_n;
+        }
+    }
+    int32_t * shrunk = (int32_t *) realloc(tmp, (size_t) unique_n * 4u * sizeof(int32_t));
+    if (shrunk != NULL) {
+        tmp = shrunk;
+    }
+    *coords_out = tmp;
+    *n_out = unique_n;
+    return TRELLIS_STATUS_OK;
 }
 
 void trellis_pbr_voxels_free(trellis_pbr_voxels * voxels) {
@@ -477,24 +704,38 @@ trellis_status trellis_pipeline_decode_texture_latent_voxels(
     memset(&decoder_store, 0, sizeof(decoder_store));
     memset(&decoder, 0, sizeof(decoder));
     memset(&cpu_weights_backend, 0, sizeof(cpu_weights_backend));
+    const trellis_sparse_unet_vae_decoder_weights * decoder_ptr = &decoder;
 
-    if (!make_texture_decoder_path(options->model_dir, decoder_path, sizeof(decoder_path))) {
-        TRELLIS_ERROR("texture decode: failed to build texture decoder path");
-        goto cleanup;
-    }
     const trellis_backend_context * weight_backend = options->cuda;
     int owns_weight_backend = 0;
-    if (options->sparse_backend_kind != TRELLIS_SPARSE_BACKEND_CUDA) {
-        status = trellis_backend_init(&cpu_weights_backend, TRELLIS_BACKEND_CPU, 0);
+    int owns_decoder_store = 0;
+    if (options->cache != NULL) {
+        status = trellis_pipeline_model_cache_get_texture_decoder(
+            options->cache,
+            options->model_dir,
+            &decoder_ptr);
         if (status != TRELLIS_STATUS_OK) {
-            TRELLIS_ERROR("texture decode: CPU decoder weight backend init failed: %s", trellis_status_string(status));
+            TRELLIS_ERROR("texture decode: cache texture decoder load failed: %s", trellis_status_string(status));
             goto cleanup;
         }
-        weight_backend = &cpu_weights_backend;
-        owns_weight_backend = 1;
-    }
-    if (!load_texture_decoder(weight_backend, decoder_path, &decoder_store, &decoder)) {
-        goto cleanup;
+    } else {
+        if (!make_texture_decoder_path(options->model_dir, decoder_path, sizeof(decoder_path))) {
+            TRELLIS_ERROR("texture decode: failed to build texture decoder path");
+            goto cleanup;
+        }
+        if (options->sparse_backend_kind != TRELLIS_SPARSE_BACKEND_CUDA) {
+            status = trellis_backend_init(&cpu_weights_backend, TRELLIS_BACKEND_CPU, 0);
+            if (status != TRELLIS_STATUS_OK) {
+                TRELLIS_ERROR("texture decode: CPU decoder weight backend init failed: %s", trellis_status_string(status));
+                goto cleanup;
+            }
+            weight_backend = &cpu_weights_backend;
+            owns_weight_backend = 1;
+        }
+        if (!load_texture_decoder(weight_backend, decoder_path, &decoder_store, &decoder)) {
+            goto cleanup;
+        }
+        owns_decoder_store = 1;
     }
 
     int64_t n_use = options->latent->n_coords;
@@ -517,7 +758,7 @@ trellis_status trellis_pipeline_decode_texture_latent_voxels(
     forward_options.max_levels = options->decode_max_levels;
     forward_options.guide_subs = options->guide_subs;
     status = trellis_sparse_unet_vae_decoder_forward_backend_f32_host(
-        &decoder,
+        decoder_ptr,
         options->latent->coords_bxyz,
         options->latent->feats,
         n_use,
@@ -535,8 +776,6 @@ trellis_status trellis_pipeline_decode_texture_latent_voxels(
     for (int64_t i = 0; i < n_out; ++i) {
         for (int c = 0; c < channels_out; ++c) {
             float v = out_feats[(size_t) i * (size_t) channels_out + (size_t) c] * 0.5f + 0.5f;
-            if (v < 0.0f) v = 0.0f;
-            if (v > 1.0f) v = 1.0f;
             out_feats[(size_t) i * (size_t) channels_out + (size_t) c] = v;
         }
     }
@@ -550,7 +789,9 @@ trellis_status trellis_pipeline_decode_texture_latent_voxels(
     status = TRELLIS_STATUS_OK;
 
 cleanup:
-    trellis_tensor_store_free(&decoder_store);
+    if (owns_decoder_store) {
+        trellis_tensor_store_free(&decoder_store);
+    }
     if (owns_weight_backend) {
         trellis_backend_free(&cpu_weights_backend);
     }
@@ -1045,20 +1286,81 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     TRELLIS_INFO("SparseUnet backend: %s device=%d", sparse_backend_kind_name(sparse_backend_kind), sparse_device);
 
     trellis_sparse_structure_result sparse_structure_result;
+    trellis_image_condition_result cond_1024;
     trellis_structured_latent shape_latent;
+    trellis_structured_latent shape_latent_lr;
     trellis_structured_latent texture_latent;
     trellis_sparse_c2s_guides shape_subs;
     trellis_pbr_voxels pbr_voxels;
     trellis_mesh_host mesh;
     trellis_mesh_host gltf_projection_mesh;
+    trellis_pipeline_model_cache model_cache;
     memset(&sparse_structure_result, 0, sizeof(sparse_structure_result));
+    memset(&cond_1024, 0, sizeof(cond_1024));
     memset(&shape_latent, 0, sizeof(shape_latent));
+    memset(&shape_latent_lr, 0, sizeof(shape_latent_lr));
     memset(&texture_latent, 0, sizeof(texture_latent));
     memset(&shape_subs, 0, sizeof(shape_subs));
     memset(&pbr_voxels, 0, sizeof(pbr_voxels));
     memset(&mesh, 0, sizeof(mesh));
     memset(&gltf_projection_mesh, 0, sizeof(gltf_projection_mesh));
+    memset(&model_cache, 0, sizeof(model_cache));
+    int model_cache_initialized = 0;
+    trellis_pipeline_model_cache * model_cache_ptr = NULL;
     const char * material_dump_dir = getenv("TRELLIS_MATERIAL_DUMP_DIR");
+    int32_t * cascade_decoder_coords = NULL;
+    int64_t cascade_decoder_n = 0;
+    int32_t * cascade_coords = NULL;
+    int64_t cascade_n = 0;
+
+    const char * pipeline_type =
+        options->pipeline_type != NULL && options->pipeline_type[0] != '\0' ?
+            options->pipeline_type :
+            "";
+    int use_1024_cascade = 0;
+    int final_resolution = options->resolution > 0 ? options->resolution : 512;
+    int sparse_cond_resolution = options->cond_resolution > 0 ? options->cond_resolution : 512;
+    int sparse_output_resolution = options->sparse_resolution > 0 ? options->sparse_resolution : 32;
+    if (pipeline_type[0] != '\0') {
+        if (strcmp(pipeline_type, "512") == 0) {
+            final_resolution = 512;
+            sparse_cond_resolution = 512;
+            sparse_output_resolution = 32;
+        } else if (strcmp(pipeline_type, "1024") == 0) {
+            final_resolution = 1024;
+            sparse_cond_resolution = 1024;
+            sparse_output_resolution = 64;
+        } else if (strcmp(pipeline_type, "1024_cascade") == 0) {
+            use_1024_cascade = 1;
+            final_resolution = 1024;
+            sparse_cond_resolution = 512;
+            sparse_output_resolution = 32;
+        } else {
+            TRELLIS_ERROR("pipeline: unsupported --pipeline '%s'", pipeline_type);
+            status = TRELLIS_STATUS_INVALID_ARGUMENT;
+            goto cleanup;
+        }
+    }
+    TRELLIS_INFO(
+        "pipeline: type=%s final_resolution=%d sparse_cond=%d sparse_resolution=%d",
+        use_1024_cascade ? "1024_cascade" : (final_resolution == 1024 ? "1024" : "512"),
+        final_resolution,
+        sparse_cond_resolution,
+        sparse_output_resolution);
+
+    if (options->model_cache) {
+        const size_t model_cache_budget_bytes = model_cache_budget_bytes_from_options(options);
+        status = trellis_pipeline_model_cache_init(
+            &model_cache,
+            &graph_backend,
+            sparse_backend_kind != TRELLIS_SPARSE_BACKEND_CUDA,
+            model_cache_budget_bytes);
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
+        model_cache_initialized = 1;
+        model_cache_ptr = &model_cache;
+    }
 
     TRELLIS_INFO("[1/5] SparseStructureFlowModel image -> sparse structure");
     trellis_sparse_structure_options sparse_structure;
@@ -1068,8 +1370,8 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     sparse_structure.image_path = sparse_structure_image_path;
     sparse_structure.latent_size = options->latent_size > 0 ? options->latent_size : 16;
     sparse_structure.steps = options->sparse_structure_steps > 0 ? options->sparse_structure_steps : 12;
-    sparse_structure.cond_resolution = options->cond_resolution > 0 ? options->cond_resolution : 512;
-    sparse_structure.sparse_resolution = options->sparse_resolution > 0 ? options->sparse_resolution : 32;
+    sparse_structure.cond_resolution = sparse_cond_resolution;
+    sparse_structure.sparse_resolution = sparse_output_resolution;
     sparse_structure.seed = options->seed == 0 ? 1u : options->seed;
     sparse_structure.flow_blocks_override = options->flow_blocks_override;
     sparse_structure.flow_block_parts_override = options->flow_block_parts_override;
@@ -1077,11 +1379,15 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     sparse_structure.voxel_threshold = 0.0f;
     sparse_structure.backend = &graph_backend;
     sparse_structure.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
+    sparse_structure.cache = model_cache_ptr;
 
+    int64_t perf_start_us = ggml_time_us();
     status = trellis_pipeline_run_sparse_structure(&sparse_structure, &sparse_structure_result);
     if (status != TRELLIS_STATUS_OK) {
         goto cleanup;
     }
+    trellis_pipeline_model_cache_unpin_all(model_cache_ptr);
+    trellis_perf_stage_log("stage1_total", ggml_time_us() - perf_start_us);
     if (sparse_structure_result.n_coords <= 0 ||
         sparse_structure_result.coords_bxyz == NULL ||
         sparse_structure_result.cond == NULL) {
@@ -1091,9 +1397,10 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     }
 
     TRELLIS_INFO(
-        "[2/5] SLatFlowModel image -> shape SLat tokens=%lld cond_tokens=%d",
+        "[2/5] SLatFlowModel image -> shape SLat tokens=%lld cond_tokens=%d resolution=%d",
         (long long) sparse_structure_result.n_coords,
-        sparse_structure_result.cond_tokens);
+        sparse_structure_result.cond_tokens,
+        use_1024_cascade ? 512 : final_resolution);
     trellis_structured_latent_options structured_latent;
     memset(&structured_latent, 0, sizeof(structured_latent));
     structured_latent.model_dir = options->model_dir;
@@ -1106,7 +1413,7 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     structured_latent.cond = sparse_structure_result.cond;
     structured_latent.cond_tokens = sparse_structure_result.cond_tokens;
     structured_latent.noise_seed = options->noise_seed == 0 ? 18u : options->noise_seed;
-    structured_latent.resolution = options->resolution > 0 ? options->resolution : 512;
+    structured_latent.resolution = use_1024_cascade ? 512 : final_resolution;
     structured_latent.steps = options->structured_latent_steps > 0 ? options->structured_latent_steps : 12;
     structured_latent.rescale_t = options->rescale_t > 0.0f ? options->rescale_t : 3.0f;
     structured_latent.guidance_strength = options->guidance_strength;
@@ -1129,10 +1436,107 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     structured_latent.use_ggml_flash_attn = options->use_ggml_flash_attn;
     structured_latent.backend = &graph_backend;
     structured_latent.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
+    structured_latent.cache = model_cache_ptr;
 
+    perf_start_us = ggml_time_us();
     status = trellis_pipeline_run_structured_latent(&structured_latent, &shape_latent);
     if (status != TRELLIS_STATUS_OK) {
         goto cleanup;
+    }
+    trellis_pipeline_model_cache_unpin_all(model_cache_ptr);
+    trellis_perf_stage_log(
+        use_1024_cascade ? "shape_slat_denoise_lr512" : "shape_slat_denoise",
+        ggml_time_us() - perf_start_us);
+
+    if (use_1024_cascade) {
+        shape_latent_lr = shape_latent;
+        memset(&shape_latent, 0, sizeof(shape_latent));
+
+        TRELLIS_INFO("[2a/5] DINOv3 image encoder -> 1024 condition");
+        trellis_image_condition_options cond_options;
+        memset(&cond_options, 0, sizeof(cond_options));
+        cond_options.dino_dir = options->dino_dir;
+        cond_options.image_path = sparse_structure_image_path;
+        cond_options.cond_resolution = 1024;
+        cond_options.backend = &graph_backend;
+        cond_options.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
+        cond_options.cache = model_cache_ptr;
+        perf_start_us = ggml_time_us();
+        status = trellis_pipeline_run_image_condition(&cond_options, &cond_1024);
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
+        trellis_pipeline_model_cache_unpin_all(model_cache_ptr);
+        trellis_perf_stage_log("dino_cond_1024", ggml_time_us() - perf_start_us);
+
+        TRELLIS_INFO("[2b/5] FlexiDualGridVaeDecoder 512 shape SLat -> cascade HR coords");
+        trellis_pipeline_mesh_options cascade_upsample_options;
+        memset(&cascade_upsample_options, 0, sizeof(cascade_upsample_options));
+        cascade_upsample_options.model_dir = options->model_dir;
+        cascade_upsample_options.decoder_override_path = options->decoder_override_path;
+        cascade_upsample_options.latent = &shape_latent_lr;
+        cascade_upsample_options.resolution = 512;
+        cascade_upsample_options.decode_max_levels = 0;
+        cascade_upsample_options.decode_max_input_tokens = options->decode_max_input_tokens;
+        cascade_upsample_options.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
+        cascade_upsample_options.sparse_backend_kind = sparse_backend_kind;
+        cascade_upsample_options.sparse_device = sparse_device;
+        cascade_upsample_options.cache = model_cache_ptr;
+        perf_start_us = ggml_time_us();
+        status = trellis_pipeline_decode_shape_latent_decoder_coords(
+            &cascade_upsample_options,
+            &cascade_decoder_coords,
+            &cascade_decoder_n);
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
+        trellis_pipeline_model_cache_unpin_all(model_cache_ptr);
+        trellis_perf_stage_log("shape_cascade_decode_coords", ggml_time_us() - perf_start_us);
+        const int64_t decoded_coord_count = cascade_decoder_n;
+        status = quantize_cascade_coords(
+            cascade_decoder_coords,
+            cascade_decoder_n,
+            512,
+            1024,
+            &cascade_coords,
+            &cascade_n);
+        free(cascade_decoder_coords);
+        cascade_decoder_coords = NULL;
+        cascade_decoder_n = 0;
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
+        TRELLIS_INFO(
+            "pipeline cascade: decoder_coords=%lld quantized_shape_tokens=%lld",
+            (long long) decoded_coord_count,
+            (long long) cascade_n);
+        if (options->max_num_tokens > 0 && cascade_n > options->max_num_tokens) {
+            TRELLIS_WARN(
+                "pipeline cascade: quantized tokens %lld exceed max_num_tokens=%d; matching PyTorch 1024_cascade keeps resolution 1024",
+                (long long) cascade_n,
+                options->max_num_tokens);
+        }
+        trellis_structured_latent_free(&shape_latent_lr);
+
+        TRELLIS_INFO(
+            "[2c/5] SLatFlowModel 1024 image -> shape SLat tokens=%lld cond_tokens=%d",
+            (long long) cascade_n,
+            cond_1024.cond_tokens);
+        trellis_structured_latent_options hr_shape_options = structured_latent;
+        hr_shape_options.label = "shape1024";
+        hr_shape_options.coords_bxyz = cascade_coords;
+        hr_shape_options.n_coords = cascade_n;
+        hr_shape_options.cond = cond_1024.cond;
+        hr_shape_options.cond_tokens = cond_1024.cond_tokens;
+        hr_shape_options.noise_seed = options->noise_seed == 0 ? 19u : options->noise_seed + 1u;
+        hr_shape_options.resolution = 1024;
+        perf_start_us = ggml_time_us();
+        status = trellis_pipeline_run_structured_latent(&hr_shape_options, &shape_latent);
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
+        trellis_pipeline_model_cache_unpin_all(model_cache_ptr);
+        trellis_perf_stage_log("shape_slat_denoise_hr1024", ggml_time_us() - perf_start_us);
     }
 
     TRELLIS_INFO("[3/5] FlexiDualGridVaeDecoder shape SLat -> mesh/subdivision guides");
@@ -1141,17 +1545,21 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     mesh_options.model_dir = options->model_dir;
     mesh_options.decoder_override_path = options->decoder_override_path;
     mesh_options.latent = &shape_latent;
-    mesh_options.resolution = structured_latent.resolution;
+    mesh_options.resolution = shape_latent.resolution;
     mesh_options.decode_max_levels = options->decode_max_levels;
     mesh_options.decode_max_input_tokens = options->decode_max_input_tokens;
     mesh_options.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
     mesh_options.sparse_backend_kind = sparse_backend_kind;
     mesh_options.sparse_device = sparse_device;
+    mesh_options.cache = model_cache_ptr;
 
+    perf_start_us = ggml_time_us();
     status = trellis_pipeline_decode_shape_latent_mesh(&mesh_options, &shape_subs, &mesh);
     if (status != TRELLIS_STATUS_OK) {
         goto cleanup;
     }
+    trellis_pipeline_model_cache_unpin_all(model_cache_ptr);
+    trellis_perf_stage_log("shape_slat_decode", ggml_time_us() - perf_start_us);
     if (material_dump_dir != NULL && material_dump_dir[0] != '\0') {
         char raw_mesh_path[4096];
         if (!make_material_dump_path(raw_mesh_path, sizeof(raw_mesh_path), material_dump_dir, "raw.meshbin")) {
@@ -1177,23 +1585,24 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     }
 
     TRELLIS_INFO(
-        "[4/5] SLatFlowModel image+shape -> texture SLat tokens=%lld cond_tokens=%d",
-        (long long) sparse_structure_result.n_coords,
-        sparse_structure_result.cond_tokens);
+        "[4/5] SLatFlowModel image+shape -> texture SLat tokens=%lld cond_tokens=%d resolution=%d",
+        (long long) shape_latent.n_coords,
+        use_1024_cascade ? cond_1024.cond_tokens : sparse_structure_result.cond_tokens,
+        shape_latent.resolution);
     trellis_structured_latent_options texture_options;
     memset(&texture_options, 0, sizeof(texture_options));
     texture_options.model_dir = options->model_dir;
     texture_options.flow_component = TRELLIS_COMPONENT_TEX_SLAT_FLOW;
     texture_options.label = "texture";
     texture_options.normalization_key = "tex_slat_normalization";
-    texture_options.coords_bxyz = sparse_structure_result.coords_bxyz;
-    texture_options.n_coords = sparse_structure_result.n_coords;
-    texture_options.cond = sparse_structure_result.cond;
-    texture_options.cond_tokens = sparse_structure_result.cond_tokens;
+    texture_options.coords_bxyz = shape_latent.coords_bxyz;
+    texture_options.n_coords = shape_latent.n_coords;
+    texture_options.cond = use_1024_cascade ? cond_1024.cond : sparse_structure_result.cond;
+    texture_options.cond_tokens = use_1024_cascade ? cond_1024.cond_tokens : sparse_structure_result.cond_tokens;
     texture_options.concat_cond = shape_latent.feats;
     texture_options.concat_channels = shape_latent.channels;
-    texture_options.noise_seed = options->noise_seed == 0 ? 19u : options->noise_seed + 1u;
-    texture_options.resolution = structured_latent.resolution;
+    texture_options.noise_seed = options->noise_seed == 0 ? (use_1024_cascade ? 20u : 19u) : options->noise_seed + (use_1024_cascade ? 2u : 1u);
+    texture_options.resolution = shape_latent.resolution;
     texture_options.steps = options->structured_latent_steps > 0 ? options->structured_latent_steps : 12;
     texture_options.rescale_t = 3.0f;
     texture_options.guidance_strength = 1.0f;
@@ -1207,11 +1616,15 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     texture_options.use_ggml_flash_attn = options->use_ggml_flash_attn;
     texture_options.backend = &graph_backend;
     texture_options.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
+    texture_options.cache = model_cache_ptr;
 
+    perf_start_us = ggml_time_us();
     status = trellis_pipeline_run_structured_latent(&texture_options, &texture_latent);
     if (status != TRELLIS_STATUS_OK) {
         goto cleanup;
     }
+    trellis_pipeline_model_cache_unpin_all(model_cache_ptr);
+    trellis_perf_stage_log("tex_slat_denoise", ggml_time_us() - perf_start_us);
     trellis_sparse_structure_result_free(&sparse_structure_result);
 
     TRELLIS_INFO("[5/5] SparseUnetVaeDecoder texture SLat -> PBR voxels");
@@ -1225,11 +1638,15 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     tex_decode.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
     tex_decode.sparse_backend_kind = sparse_backend_kind;
     tex_decode.sparse_device = sparse_device;
+    tex_decode.cache = model_cache_ptr;
 
+    perf_start_us = ggml_time_us();
     status = trellis_pipeline_decode_texture_latent_voxels(&tex_decode, &pbr_voxels);
     if (status != TRELLIS_STATUS_OK) {
         goto cleanup;
     }
+    trellis_pipeline_model_cache_unpin_all(model_cache_ptr);
+    trellis_perf_stage_log("tex_slat_decode", ggml_time_us() - perf_start_us);
     TRELLIS_INFO(
         "pipeline: decoded PBR voxels=%lld channels=%d resolution=%d",
         (long long) pbr_voxels.n_coords,
@@ -1263,13 +1680,20 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     }
 
 cleanup:
+    free(cascade_decoder_coords);
+    free(cascade_coords);
     trellis_mesh_free(&gltf_projection_mesh);
     trellis_mesh_free(&mesh);
     trellis_pbr_voxels_free(&pbr_voxels);
     trellis_sparse_c2s_guides_free(&shape_subs);
     trellis_structured_latent_free(&texture_latent);
+    trellis_structured_latent_free(&shape_latent_lr);
     trellis_structured_latent_free(&shape_latent);
+    trellis_image_condition_result_free(&cond_1024);
     trellis_sparse_structure_result_free(&sparse_structure_result);
+    if (model_cache_initialized) {
+        trellis_pipeline_model_cache_free(&model_cache);
+    }
     if (sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA) {
         trellis_cuda_free(&cuda);
     }

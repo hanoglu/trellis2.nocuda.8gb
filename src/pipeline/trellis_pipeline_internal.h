@@ -3,6 +3,94 @@
 
 #include "trellis.h"
 
+typedef enum trellis_pipeline_cache_entry_kind {
+    TRELLIS_PIPELINE_CACHE_ENTRY_DINO = 0,
+    TRELLIS_PIPELINE_CACHE_ENTRY_DIT_FLOW = 1,
+    TRELLIS_PIPELINE_CACHE_ENTRY_SS_DECODER = 2,
+    TRELLIS_PIPELINE_CACHE_ENTRY_SPARSE_UNET_DECODER = 3,
+} trellis_pipeline_cache_entry_kind;
+
+typedef struct trellis_pipeline_cache_entry {
+    const char * name;
+    trellis_pipeline_cache_entry_kind kind;
+    int loaded;
+    int pinned;
+    uint64_t last_used;
+    size_t budget_bytes;
+    char path[4096];
+    trellis_tensor_store store;
+    union {
+        trellis_dino_vit_weights dino;
+        trellis_dit_flow_weights flow;
+        trellis_ss_decoder_weights ss_decoder;
+        trellis_sparse_unet_vae_decoder_weights sparse_unet_decoder;
+    } weights;
+} trellis_pipeline_cache_entry;
+
+typedef struct trellis_pipeline_model_cache {
+    const trellis_backend_context * backend;
+    const trellis_backend_context * decoder_weight_backend;
+    trellis_backend_context cpu_decoder_weight_backend;
+    int owns_cpu_decoder_weight_backend;
+    size_t budget_bytes;
+    size_t used_budget_bytes;
+    uint64_t clock;
+
+    trellis_pipeline_cache_entry dino;
+    trellis_pipeline_cache_entry sparse_structure_flow;
+    trellis_pipeline_cache_entry sparse_structure_decoder;
+    trellis_pipeline_cache_entry shape_flow_512;
+    trellis_pipeline_cache_entry shape_flow_1024;
+    trellis_pipeline_cache_entry texture_flow_512;
+    trellis_pipeline_cache_entry texture_flow_1024;
+    trellis_pipeline_cache_entry shape_decoder;
+    trellis_pipeline_cache_entry texture_decoder;
+} trellis_pipeline_model_cache;
+
+trellis_status trellis_pipeline_model_cache_init(
+    trellis_pipeline_model_cache * cache,
+    const trellis_backend_context * backend,
+    int use_cpu_decoder_weight_backend,
+    size_t budget_bytes);
+
+void trellis_pipeline_model_cache_free(trellis_pipeline_model_cache * cache);
+void trellis_pipeline_model_cache_unpin_all(trellis_pipeline_model_cache * cache);
+
+trellis_status trellis_pipeline_model_cache_get_dino(
+    trellis_pipeline_model_cache * cache,
+    const char * dino_dir,
+    const trellis_dino_vit_weights ** weights_out);
+
+trellis_status trellis_pipeline_model_cache_get_sparse_structure_flow(
+    trellis_pipeline_model_cache * cache,
+    const char * model_dir,
+    const trellis_dit_flow_weights ** weights_out);
+
+trellis_status trellis_pipeline_model_cache_get_sparse_structure_decoder(
+    trellis_pipeline_model_cache * cache,
+    const char * model_dir,
+    const trellis_ss_decoder_weights ** weights_out);
+
+trellis_status trellis_pipeline_model_cache_get_slat_flow(
+    trellis_pipeline_model_cache * cache,
+    const char * model_dir,
+    const char * override_path,
+    trellis_model_component component,
+    int resolution,
+    const char * label,
+    const trellis_dit_flow_weights ** weights_out);
+
+trellis_status trellis_pipeline_model_cache_get_shape_decoder(
+    trellis_pipeline_model_cache * cache,
+    const char * model_dir,
+    const char * override_path,
+    const trellis_sparse_unet_vae_decoder_weights ** weights_out);
+
+trellis_status trellis_pipeline_model_cache_get_texture_decoder(
+    trellis_pipeline_model_cache * cache,
+    const char * model_dir,
+    const trellis_sparse_unet_vae_decoder_weights ** weights_out);
+
 typedef struct trellis_sparse_structure_result {
     int32_t * coords_bxyz; /* [n_coords, 4] = batch, x, y, z */
     int64_t n_coords;
@@ -26,6 +114,7 @@ typedef struct trellis_sparse_structure_options {
     float voxel_threshold;
     const trellis_backend_context * backend;
     const trellis_cuda_context * cuda;
+    trellis_pipeline_model_cache * cache;
 } trellis_sparse_structure_options;
 
 void trellis_sparse_structure_result_free(trellis_sparse_structure_result * result);
@@ -33,6 +122,27 @@ void trellis_sparse_structure_result_free(trellis_sparse_structure_result * resu
 trellis_status trellis_pipeline_run_sparse_structure(
     const trellis_sparse_structure_options * options,
     trellis_sparse_structure_result * result);
+
+typedef struct trellis_image_condition_result {
+    float * cond; /* [cond_tokens, 1024] */
+    int cond_tokens;
+    int resolution;
+} trellis_image_condition_result;
+
+typedef struct trellis_image_condition_options {
+    const char * dino_dir;
+    const char * image_path;
+    int cond_resolution;
+    const trellis_backend_context * backend;
+    const trellis_cuda_context * cuda;
+    trellis_pipeline_model_cache * cache;
+} trellis_image_condition_options;
+
+void trellis_image_condition_result_free(trellis_image_condition_result * result);
+
+trellis_status trellis_pipeline_run_image_condition(
+    const trellis_image_condition_options * options,
+    trellis_image_condition_result * result);
 
 typedef struct trellis_structured_latent {
     int32_t * coords_bxyz; /* [n_coords, 4] */
@@ -78,6 +188,7 @@ typedef struct trellis_structured_latent_options {
     int use_ggml_flash_attn;
     const trellis_backend_context * backend;
     const trellis_cuda_context * cuda;
+    trellis_pipeline_model_cache * cache;
 } trellis_structured_latent_options;
 
 trellis_status trellis_pipeline_run_structured_latent(
@@ -94,6 +205,7 @@ typedef struct trellis_pipeline_mesh_options {
     const trellis_cuda_context * cuda;
     trellis_sparse_backend_kind sparse_backend_kind;
     int sparse_device;
+    trellis_pipeline_model_cache * cache;
 } trellis_pipeline_mesh_options;
 
 trellis_status trellis_pipeline_decode_shape_latent_mesh(
@@ -120,6 +232,7 @@ typedef struct trellis_pipeline_texture_options {
     const trellis_cuda_context * cuda;
     trellis_sparse_backend_kind sparse_backend_kind;
     int sparse_device;
+    trellis_pipeline_model_cache * cache;
 } trellis_pipeline_texture_options;
 
 trellis_status trellis_pipeline_decode_texture_latent_voxels(

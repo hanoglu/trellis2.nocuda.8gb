@@ -27,11 +27,13 @@ custom layout or a non-default set of files.
 ```
 
 It loads an input image, runs DINO conditioning, sparse-structure flow,
-structured-latent shape flow, shape decode, texture decode, and writes a GLB or
-glTF in one command. It does not open raylib. Sparse coords and DINO condition
-data are passed directly in memory, so no stage handoff files are written by
-default. If no output path is passed, it writes `output.glb`. WebP inputs are
-converted to a temporary PNG because the current
+structured-latent shape flow, shape decode, texture decode, TRELLIS topology
+postprocess, and writes a GLB or glTF in one command. It does not open raylib.
+Sparse coords and DINO condition data are passed directly in memory, so no stage
+handoff files are written by default. The CLI defaults to the PyTorch app-style
+`1024_cascade` pipeline and vkmesh postprocess to roughly one million faces. If
+no output path is passed, it writes `output.glb`. WebP inputs are converted to a
+temporary PNG because the current
 stb_image loader does not decode WebP directly.
 
 `trellis_image_to_gltf.c` is intentionally thin: it parses arguments and calls
@@ -59,7 +61,8 @@ glTF texture bake/dilate/fill shaders, live under `tools/vkmesh/shaders/`.
 ```
 
 In the full pipeline, `vkmesh` cleans topology before PBR voxel baking, so the
-glTF exporter unwraps and bakes textures on the processed mesh. In Vulkan
+glTF exporter unwraps and bakes textures on the processed mesh. Use
+`--no-mesh-postprocess` for raw/debug exports. In Vulkan
 builds, UV-space rasterization and PBR voxel sampling run through the Vulkan
 bake pipeline, then seam dilation and empty texel fill run as compute passes.
 Use a `.glb` output path to embed geometry and PNG textures in one binary file;

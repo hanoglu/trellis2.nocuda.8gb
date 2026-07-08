@@ -8,7 +8,11 @@
 #include "stb_image_write.h"
 #include "xatlas_c.h"
 
-#ifdef GGML_USE_VULKAN
+#ifndef TRELLIS_HAS_GLTF_VULKAN_BAKE
+#define TRELLIS_HAS_GLTF_VULKAN_BAKE 0
+#endif
+
+#if TRELLIS_HAS_GLTF_VULKAN_BAKE
 #include <vulkan/vulkan.h>
 
 #include "trellis_gltf_bake_vert_spv.h"
@@ -314,7 +318,7 @@ static trellis_status unwrap_mesh_xatlas_direct(
     return TRELLIS_STATUS_OK;
 }
 
-#ifdef GGML_USE_VULKAN
+#if TRELLIS_HAS_GLTF_VULKAN_BAKE
 typedef struct trellis_gltf_vk_buffer {
     VkBuffer buffer;
     VkDeviceMemory memory;
@@ -2102,7 +2106,7 @@ static trellis_status unwrap_mesh_xatlas(
     const trellis_mesh_host * mesh,
     int texture_size,
     trellis_gltf_mesh * out) {
-#ifdef GGML_USE_VULKAN
+#if TRELLIS_HAS_GLTF_VULKAN_BAKE
     if (mesh != NULL && mesh->n_faces >= (int64_t) gltf_uv_chart_target_faces() * 2) {
         trellis_status status = unwrap_mesh_xatlas_charted_vulkan(mesh, texture_size, out);
         if (status == TRELLIS_STATUS_OK) {
@@ -2486,7 +2490,7 @@ trellis_status trellis_pipeline_write_gltf(
     memset(&gltf_mesh, 0, sizeof(gltf_mesh));
     trellis_status status = unwrap_mesh_xatlas(mesh, texture_size, &gltf_mesh);
     if (status == TRELLIS_STATUS_OK) {
-#ifdef GGML_USE_VULKAN
+#if TRELLIS_HAS_GLTF_VULKAN_BAKE
         status = bake_textures_vulkan(&gltf_mesh, sample_mesh, voxels, texture_size, &base, &mr);
 #else
         (void) sample_mesh;

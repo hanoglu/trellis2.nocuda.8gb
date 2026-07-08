@@ -352,10 +352,14 @@ trellis_status trellis_pipeline_run_structured_latent(
     trellis_dit_flow_weights flow;
     memset(&flow_store, 0, sizeof(flow_store));
     memset(&flow, 0, sizeof(flow));
+    int owns_flow_store = 0;
+    trellis_dit_flow_executor flow_executor_cfg;
     trellis_dit_flow_executor flow_executor_cond;
     trellis_dit_flow_executor flow_executor_uncond;
+    memset(&flow_executor_cfg, 0, sizeof(flow_executor_cfg));
     memset(&flow_executor_cond, 0, sizeof(flow_executor_cond));
     memset(&flow_executor_uncond, 0, sizeof(flow_executor_uncond));
+    int use_cfg_batch = 0;
 
     float * neg_cond = NULL;
     float * latent = NULL;
@@ -390,8 +394,26 @@ trellis_status trellis_pipeline_run_structured_latent(
         (long long) options->n_coords,
         (unsigned) options->noise_seed);
 
-    if (!load_slat_flow(backend, flow_path, component, label, &flow_store, &flow)) {
-        goto cleanup;
+    if (options->cache != NULL) {
+        const trellis_dit_flow_weights * cached_flow = NULL;
+        status = trellis_pipeline_model_cache_get_slat_flow(
+            options->cache,
+            options->model_dir,
+            options->flow_override_path,
+            component,
+            resolution,
+            label,
+            &cached_flow);
+        if (status != TRELLIS_STATUS_OK) {
+            TRELLIS_ERROR("structured latent %s: cache flow load failed: %s", label, trellis_status_string(status));
+            goto cleanup;
+        }
+        flow = *cached_flow;
+    } else {
+        if (!load_slat_flow(backend, flow_path, component, label, &flow_store, &flow)) {
+            goto cleanup;
+        }
+        owns_flow_store = 1;
     }
     const int state_channels = flow.out_channels;
     if (state_channels != 32 || flow.cond_channels != 1024) {
@@ -535,29 +557,48 @@ trellis_status trellis_pipeline_run_structured_latent(
     }
 
     const float * neg_context = options->neg_cond != NULL ? options->neg_cond : neg_cond;
-    status = trellis_dit_flow_executor_init_single(
-        &flow_executor_cond,
+    status = trellis_dit_flow_executor_init_cfg_batch(
+        &flow_executor_cfg,
         backend,
         &flow,
         options->n_coords,
         options->cond_tokens,
         options->cond,
+        neg_context,
         cos_phase,
         sin_phase);
-    if (status == TRELLIS_STATUS_OK) {
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_WARN(
+            "structured latent %s: fused CFG executor init failed (%s); falling back to separate cond/uncond graphs",
+            label,
+            trellis_status_string(status));
+        trellis_dit_flow_executor_free(&flow_executor_cfg);
         status = trellis_dit_flow_executor_init_single(
-            &flow_executor_uncond,
+            &flow_executor_cond,
             backend,
             &flow,
             options->n_coords,
             options->cond_tokens,
-            neg_context,
+            options->cond,
             cos_phase,
             sin_phase);
-    }
-    if (status != TRELLIS_STATUS_OK) {
-        TRELLIS_ERROR("structured latent %s: flow executor init failed: %s", label, trellis_status_string(status));
-        goto cleanup;
+        if (status == TRELLIS_STATUS_OK) {
+            status = trellis_dit_flow_executor_init_single(
+                &flow_executor_uncond,
+                backend,
+                &flow,
+                options->n_coords,
+                options->cond_tokens,
+                neg_context,
+                cos_phase,
+                sin_phase);
+        }
+        if (status != TRELLIS_STATUS_OK) {
+            TRELLIS_ERROR("structured latent %s: flow executor init failed: %s", label, trellis_status_string(status));
+            goto cleanup;
+        }
+    } else {
+        use_cfg_batch = 1;
     }
     for (int step = 0; step < steps; ++step) {
         const int64_t step_start_us = ggml_time_us();
@@ -575,17 +616,26 @@ trellis_status trellis_pipeline_run_structured_latent(
         } else {
             memcpy(run_input, latent, state_count * sizeof(float));
         }
-        status = trellis_dit_flow_executor_run_single(
-            &flow_executor_cond,
-            run_input,
-            t,
-            pred_pos);
-        if (status == TRELLIS_STATUS_OK) {
-            status = trellis_dit_flow_executor_run_single(
-                &flow_executor_uncond,
+        if (use_cfg_batch) {
+            status = trellis_dit_flow_executor_run_cfg_batch(
+                &flow_executor_cfg,
                 run_input,
                 t,
+                pred_pos,
                 pred_neg);
+        } else {
+            status = trellis_dit_flow_executor_run_single(
+                &flow_executor_cond,
+                run_input,
+                t,
+                pred_pos);
+            if (status == TRELLIS_STATUS_OK) {
+                status = trellis_dit_flow_executor_run_single(
+                    &flow_executor_uncond,
+                    run_input,
+                    t,
+                    pred_neg);
+            }
         }
         if (status != TRELLIS_STATUS_OK) {
             TRELLIS_ERROR("structured latent %s: flow step %d failed: %s", label, step + 1, trellis_status_string(status));
@@ -643,8 +693,11 @@ cleanup:
     free(pairs);
     free(cos_phase);
     free(sin_phase);
+    trellis_dit_flow_executor_free(&flow_executor_cfg);
     trellis_dit_flow_executor_free(&flow_executor_cond);
     trellis_dit_flow_executor_free(&flow_executor_uncond);
-    trellis_tensor_store_free(&flow_store);
+    if (owns_flow_store) {
+        trellis_tensor_store_free(&flow_store);
+    }
     return status;
 }

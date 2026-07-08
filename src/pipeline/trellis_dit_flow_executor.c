@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define TRELLIS_CFG_BATCH_DEFAULT_MAX_ATTENTION_MIB 8192ull
+
 static int checked_mul_size(size_t a, size_t b, size_t * out) {
     if (out == NULL) {
         return 0;
@@ -12,6 +14,82 @@ static int checked_mul_size(size_t a, size_t b, size_t * out) {
         return 0;
     }
     *out = a * b;
+    return 1;
+}
+
+static size_t cfg_batch_attention_limit_bytes(void) {
+    const char * env = getenv("TRELLIS_CFG_BATCH_MAX_ATTENTION_MIB");
+    unsigned long long mib = TRELLIS_CFG_BATCH_DEFAULT_MAX_ATTENTION_MIB;
+    if (env != NULL && env[0] != '\0') {
+        char * end = NULL;
+        unsigned long long parsed = strtoull(env, &end, 10);
+        if (end != env && *end == '\0') {
+            mib = parsed;
+        }
+    }
+    if (mib == 0) {
+        return 0;
+    }
+    const unsigned long long max_mib = (unsigned long long) (SIZE_MAX / (1024u * 1024u));
+    if (mib > max_mib) {
+        mib = max_mib;
+    }
+    return (size_t) mib * 1024u * 1024u;
+}
+
+static int checked_attention_score_bytes(
+    int64_t tokens,
+    int cond_tokens,
+    int heads,
+    int batch,
+    size_t * bytes_out) {
+    size_t self = 0;
+    size_t cross = 0;
+    size_t tmp = 0;
+    if (tokens <= 0 || cond_tokens <= 0 || heads <= 0 || batch <= 0 || bytes_out == NULL) {
+        return 0;
+    }
+    if (!checked_mul_size((size_t) tokens, (size_t) tokens, &tmp) ||
+        !checked_mul_size(tmp, (size_t) heads, &tmp) ||
+        !checked_mul_size(tmp, (size_t) batch, &tmp) ||
+        !checked_mul_size(tmp, sizeof(float), &self)) {
+        return 0;
+    }
+    if (!checked_mul_size((size_t) tokens, (size_t) cond_tokens, &tmp) ||
+        !checked_mul_size(tmp, (size_t) heads, &tmp) ||
+        !checked_mul_size(tmp, (size_t) batch, &tmp) ||
+        !checked_mul_size(tmp, sizeof(float), &cross)) {
+        return 0;
+    }
+    *bytes_out = self > cross ? self : cross;
+    return 1;
+}
+
+static int cfg_batch_attention_is_reasonable(
+    const trellis_dit_flow_weights * weights,
+    int64_t tokens,
+    int cond_tokens,
+    int batch) {
+    if (weights == NULL) {
+        return 0;
+    }
+    const int debug_parts = weights->debug_block_parts < 0 ? 3 : weights->debug_block_parts;
+    if (weights->n_blocks <= 0 || debug_parts <= 0) {
+        return 1;
+    }
+    size_t estimate = 0;
+    if (!checked_attention_score_bytes(tokens, cond_tokens, weights->heads, batch, &estimate)) {
+        TRELLIS_WARN("DiT CFG batch: attention scratch estimate overflow; using separate cond/uncond graphs");
+        return 0;
+    }
+    const size_t limit = cfg_batch_attention_limit_bytes();
+    if (limit != 0 && estimate > limit) {
+        TRELLIS_WARN(
+            "DiT CFG batch: estimated explicit-attention scratch %.1f MiB exceeds limit %.1f MiB; using separate cond/uncond graphs",
+            (double) estimate / (1024.0 * 1024.0),
+            (double) limit / (1024.0 * 1024.0));
+        return 0;
+    }
     return 1;
 }
 
@@ -38,6 +116,7 @@ static int should_set_timestep(const trellis_dit_flow_weights * weights) {
 static int set_static_inputs(
     trellis_dit_flow_executor * executor,
     const float * context,
+    const float * neg_context,
     const float * cos_phase_data,
     const float * sin_phase_data) {
     const trellis_dit_flow_weights * weights = executor->weights;
@@ -55,7 +134,16 @@ static int set_static_inputs(
         memcpy(
             executor->context_host,
             context,
-            executor->context_count * sizeof(float));
+            executor->single_context_count * sizeof(float));
+        if (executor->batch > 1) {
+            if (neg_context == NULL) {
+                return 0;
+            }
+            memcpy(
+                executor->context_host + executor->single_context_count,
+                neg_context,
+                executor->single_context_count * sizeof(float));
+        }
         ggml_backend_tensor_set(
             executor->c,
             executor->context_host,
@@ -71,12 +159,14 @@ static trellis_status init_executor(
     const trellis_dit_flow_weights * weights,
     int64_t tokens,
     int cond_tokens,
+    int batch,
     const float * context,
+    const float * neg_context,
     const float * cos_phase_data,
     const float * sin_phase_data) {
     if (executor == NULL || backend == NULL || backend->backend == NULL || weights == NULL ||
         tokens <= 0 || cond_tokens <= 0 || weights->in_channels <= 0 ||
-        weights->cond_channels <= 0 || weights->head_dim <= 0) {
+        weights->cond_channels <= 0 || weights->head_dim <= 0 || batch <= 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
 
@@ -85,10 +175,14 @@ static trellis_status init_executor(
     executor->weights = weights;
     executor->tokens = tokens;
     executor->cond_tokens = cond_tokens;
+    executor->batch = batch;
 
-    if (!checked_mul_size((size_t) tokens, (size_t) weights->in_channels, &executor->input_count) ||
-        !checked_mul_size((size_t) tokens, (size_t) weights->out_channels, &executor->output_count) ||
-        !checked_mul_size((size_t) cond_tokens, (size_t) weights->cond_channels, &executor->context_count)) {
+    if (!checked_mul_size((size_t) tokens, (size_t) weights->in_channels, &executor->single_input_count) ||
+        !checked_mul_size((size_t) tokens, (size_t) weights->out_channels, &executor->single_output_count) ||
+        !checked_mul_size((size_t) cond_tokens, (size_t) weights->cond_channels, &executor->single_context_count) ||
+        !checked_mul_size(executor->single_input_count, (size_t) batch, &executor->input_count) ||
+        !checked_mul_size(executor->single_output_count, (size_t) batch, &executor->output_count) ||
+        !checked_mul_size(executor->single_context_count, (size_t) batch, &executor->context_count)) {
         return TRELLIS_STATUS_OUT_OF_MEMORY;
     }
 
@@ -119,14 +213,14 @@ static trellis_status init_executor(
         GGML_TYPE_F32,
         weights->in_channels,
         tokens,
-        1);
-    executor->t = ggml_new_tensor_1d(executor->ctx, GGML_TYPE_F32, 1);
+        batch);
+    executor->t = ggml_new_tensor_1d(executor->ctx, GGML_TYPE_F32, batch);
     executor->c = ggml_new_tensor_3d(
         executor->ctx,
         GGML_TYPE_F32,
         weights->cond_channels,
         cond_tokens,
-        1);
+        batch);
     executor->cos_phase = ggml_new_tensor_4d(
         executor->ctx,
         GGML_TYPE_F32,
@@ -182,7 +276,7 @@ static trellis_status init_executor(
         return TRELLIS_STATUS_OUT_OF_MEMORY;
     }
 
-    if (!set_static_inputs(executor, context, cos_phase_data, sin_phase_data)) {
+    if (!set_static_inputs(executor, context, neg_context, cos_phase_data, sin_phase_data)) {
         trellis_dit_flow_executor_free(executor);
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
@@ -205,7 +299,9 @@ trellis_status trellis_dit_flow_executor_init_single(
         weights,
         tokens,
         cond_tokens,
+        1,
         context,
+        NULL,
         cos_phase_data,
         sin_phase_data);
 }
@@ -218,7 +314,7 @@ trellis_status trellis_dit_flow_executor_run_single(
     if (executor == NULL || executor->backend == NULL || executor->weights == NULL ||
         executor->graph == NULL || executor->x == NULL || executor->y == NULL ||
         executor->x_host == NULL || executor->y_host == NULL ||
-        latent == NULL || pred == NULL) {
+        executor->batch != 1 || latent == NULL || pred == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
 
@@ -237,6 +333,74 @@ trellis_status trellis_dit_flow_executor_run_single(
 
     ggml_backend_tensor_get(executor->y, executor->y_host, 0, ggml_nbytes(executor->y));
     memcpy(pred, executor->y_host, executor->output_count * sizeof(float));
+    return TRELLIS_STATUS_OK;
+}
+
+trellis_status trellis_dit_flow_executor_init_cfg_batch(
+    trellis_dit_flow_executor * executor,
+    const trellis_backend_context * backend,
+    const trellis_dit_flow_weights * weights,
+    int64_t tokens,
+    int cond_tokens,
+    const float * context,
+    const float * neg_context,
+    const float * cos_phase_data,
+    const float * sin_phase_data) {
+    if (!cfg_batch_attention_is_reasonable(weights, tokens, cond_tokens, 2)) {
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    return init_executor(
+        executor,
+        backend,
+        weights,
+        tokens,
+        cond_tokens,
+        2,
+        context,
+        neg_context,
+        cos_phase_data,
+        sin_phase_data);
+}
+
+trellis_status trellis_dit_flow_executor_run_cfg_batch(
+    trellis_dit_flow_executor * executor,
+    const float * latent,
+    float timestep,
+    float * pred_pos,
+    float * pred_neg) {
+    if (executor == NULL || executor->backend == NULL || executor->weights == NULL ||
+        executor->graph == NULL || executor->x == NULL || executor->y == NULL ||
+        executor->x_host == NULL || executor->y_host == NULL || executor->batch != 2 ||
+        latent == NULL || pred_pos == NULL || pred_neg == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+
+    memcpy(executor->x_host, latent, executor->single_input_count * sizeof(float));
+    memcpy(
+        executor->x_host + executor->single_input_count,
+        latent,
+        executor->single_input_count * sizeof(float));
+    ggml_backend_tensor_set(executor->x, executor->x_host, 0, ggml_nbytes(executor->x));
+
+    if (should_set_timestep(executor->weights)) {
+        const float model_timestep[2] = {
+            1000.0f * timestep,
+            1000.0f * timestep,
+        };
+        ggml_backend_tensor_set(executor->t, model_timestep, 0, ggml_nbytes(executor->t));
+    }
+
+    trellis_status status = trellis_backend_compute_graph(executor->backend, executor->graph);
+    if (status != TRELLIS_STATUS_OK) {
+        return status;
+    }
+
+    ggml_backend_tensor_get(executor->y, executor->y_host, 0, ggml_nbytes(executor->y));
+    memcpy(pred_pos, executor->y_host, executor->single_output_count * sizeof(float));
+    memcpy(
+        pred_neg,
+        executor->y_host + executor->single_output_count,
+        executor->single_output_count * sizeof(float));
     return TRELLIS_STATUS_OK;
 }
 
