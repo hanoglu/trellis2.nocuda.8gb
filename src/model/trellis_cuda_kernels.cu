@@ -1,8 +1,10 @@
 #include "trellis_cuda_kernels.h"
 
 #include <cublas_v2.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cub/cub.cuh>
+#include <mma.h>
 
 #include <limits.h>
 #include <stdint.h>
@@ -11,6 +13,30 @@
 
 static trellis_status cuda_status_to_trellis(cudaError_t err) {
     return err == cudaSuccess ? TRELLIS_STATUS_OK : TRELLIS_STATUS_ERROR;
+}
+
+static int cuda_env_enabled(const char * name) {
+    const char * value = getenv(name);
+    return value != NULL && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+static int cuda_env_disabled(const char * name) {
+    const char * value = getenv(name);
+    return value != NULL && strcmp(value, "0") == 0;
+}
+
+static int cuda_device_supports_wmma(void) {
+    int device = 0;
+    cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) {
+        return 0;
+    }
+    cudaDeviceProp prop;
+    err = cudaGetDeviceProperties(&prop, device);
+    if (err != cudaSuccess) {
+        return 0;
+    }
+    return prop.major >= 7;
 }
 
 static trellis_status cublas_status_to_trellis(cublasStatus_t status) {
@@ -289,13 +315,70 @@ __global__ void trellis_sparse_rulebook_fill_kernel(
     dst_rows[pos] = (int32_t) dst;
 }
 
+__global__ void trellis_sparse_rulebook_fixed_starts_kernel(
+    int32_t * __restrict__ starts,
+    int32_t * __restrict__ counters,
+    int64_t n,
+    int k_volume) {
+    const int k = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
+    if (k >= k_volume) {
+        return;
+    }
+    const int32_t start = (int32_t) ((int64_t) k * n);
+    starts[k] = start;
+    counters[k] = start;
+}
+
+__global__ void trellis_sparse_tile_valid_kernel(
+    const int32_t * __restrict__ neighbor_map,
+    int32_t * __restrict__ valid_offsets,
+    int32_t * __restrict__ valid_counts,
+    int64_t n,
+    int k_volume,
+    int64_t total) {
+    enum { TILE_M = 16 };
+    const int64_t linear = (int64_t) blockIdx.x * (int64_t) blockDim.x + (int64_t) threadIdx.x;
+    if (linear >= total) {
+        return;
+    }
+    const int64_t tile = linear / k_volume;
+    const int offset = (int) (linear - tile * k_volume);
+    const int64_t row_start = tile * TILE_M;
+    int valid = 0;
+    for (int r = 0; r < TILE_M; ++r) {
+        const int64_t row = row_start + r;
+        if (row < n && neighbor_map[(int64_t) offset * n + row] >= 0) {
+            valid = 1;
+            break;
+        }
+    }
+    if (!valid) {
+        return;
+    }
+    int pos = 0;
+    for (int prev = 0; prev < offset; ++prev) {
+        int prev_valid = 0;
+        for (int r = 0; r < TILE_M; ++r) {
+            const int64_t row = row_start + r;
+            if (row < n && neighbor_map[(int64_t) prev * n + row] >= 0) {
+                prev_valid = 1;
+                break;
+            }
+        }
+        pos += prev_valid;
+    }
+    valid_offsets[tile * k_volume + pos] = offset;
+    atomicMax(&valid_counts[tile], pos + 1);
+}
+
 __global__ void trellis_sparse_subm_conv3d_implicit_gemm_f32_kernel(
     const float * __restrict__ feats,
     const float * __restrict__ weight,
     const int32_t * __restrict__ src_rows,
     const int32_t * __restrict__ dst_rows,
+    const int32_t * __restrict__ offset_counts,
     float * __restrict__ out,
-    int64_t pair_count,
+    int64_t pair_capacity,
     int in_channels,
     int out_channels,
     int k_volume,
@@ -303,7 +386,7 @@ __global__ void trellis_sparse_subm_conv3d_implicit_gemm_f32_kernel(
     enum {
         TILE_M = 16,
         TILE_N = 16,
-        TILE_K = 32,
+        TILE_K = 64,
     };
     __shared__ float x_tile[TILE_M][TILE_K];
     __shared__ float w_tile[TILE_N][TILE_K];
@@ -314,6 +397,10 @@ __global__ void trellis_sparse_subm_conv3d_implicit_gemm_f32_kernel(
     const int64_t pair_tile = ((int64_t) blockIdx.z * (int64_t) gridDim.y) + (int64_t) blockIdx.y;
     const int64_t pair = pair_tile * TILE_M + local_m;
     const int oc = (int) blockIdx.x * TILE_N + local_n;
+    const int64_t pair_count = offset_counts != NULL ? (int64_t) offset_counts[offset] : pair_capacity;
+    if (pair_tile * TILE_M >= pair_count) {
+        return;
+    }
     const int valid = pair < pair_count && oc < out_channels;
     float acc = 0.0f;
 
@@ -354,6 +441,172 @@ __global__ void trellis_sparse_subm_conv3d_implicit_gemm_f32_kernel(
     if (valid) {
         const int32_t dst = dst_rows[pair];
         out[(int64_t) dst * out_channels + oc] += acc;
+    }
+}
+
+__global__ void trellis_sparse_subm_conv3d_implicit_wmma_f32_kernel(
+    const float * __restrict__ feats,
+    const float * __restrict__ weight,
+    const int32_t * __restrict__ src_rows,
+    const int32_t * __restrict__ dst_rows,
+    const int32_t * __restrict__ offset_counts,
+    float * __restrict__ out,
+    int64_t pair_capacity,
+    int in_channels,
+    int out_channels,
+    int k_volume,
+    int offset) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+    enum {
+        TILE_M = 16,
+        TILE_N = 16,
+        TILE_K = 16,
+    };
+    __shared__ __half a_tile[TILE_M * TILE_K];
+    __shared__ __half b_tile[TILE_K * TILE_N];
+    __shared__ float c_tile[TILE_M * TILE_N];
+
+    const int lane = (int) threadIdx.x;
+    const int64_t pair_tile = ((int64_t) blockIdx.z * (int64_t) gridDim.y) + (int64_t) blockIdx.y;
+    const int64_t pair_count = offset_counts != NULL ? (int64_t) offset_counts[offset] : pair_capacity;
+    if (pair_tile * TILE_M >= pair_count) {
+        return;
+    }
+
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, TILE_M, TILE_N, TILE_K, __half, nvcuda::wmma::row_major> a_frag;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, TILE_M, TILE_N, TILE_K, __half, nvcuda::wmma::row_major> b_frag;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, TILE_M, TILE_N, TILE_K, float> acc_frag;
+    nvcuda::wmma::fill_fragment(acc_frag, 0.0f);
+
+    for (int c0 = 0; c0 < in_channels; c0 += TILE_K) {
+        for (int load = lane; load < TILE_M * TILE_K; load += 32) {
+            const int m = load / TILE_K;
+            const int kc = load - m * TILE_K;
+            const int64_t p = pair_tile * TILE_M + m;
+            const int c = c0 + kc;
+            float v = 0.0f;
+            if (p < pair_count && c < in_channels) {
+                const int32_t src = src_rows[p];
+                v = feats[(int64_t) src * in_channels + c];
+            }
+            a_tile[load] = __float2half_rn(v);
+        }
+        for (int load = lane; load < TILE_K * TILE_N; load += 32) {
+            const int kc = load / TILE_N;
+            const int n = load - kc * TILE_N;
+            const int out_c = (int) blockIdx.x * TILE_N + n;
+            const int c = c0 + kc;
+            float v = 0.0f;
+            if (out_c < out_channels && c < in_channels) {
+                v = weight[((int64_t) out_c * k_volume + offset) * (int64_t) in_channels + c];
+            }
+            b_tile[load] = __float2half_rn(v);
+        }
+        __syncthreads();
+        nvcuda::wmma::load_matrix_sync(a_frag, a_tile, TILE_K);
+        nvcuda::wmma::load_matrix_sync(b_frag, b_tile, TILE_N);
+        nvcuda::wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
+        __syncthreads();
+    }
+
+    nvcuda::wmma::store_matrix_sync(c_tile, acc_frag, TILE_N, nvcuda::wmma::mem_row_major);
+    __syncthreads();
+    for (int idx = lane; idx < TILE_M * TILE_N; idx += 32) {
+        const int m = idx / TILE_N;
+        const int n = idx - m * TILE_N;
+        const int64_t p = pair_tile * TILE_M + m;
+        const int oc = (int) blockIdx.x * TILE_N + n;
+        if (p < pair_count && oc < out_channels) {
+            const int32_t dst = dst_rows[p];
+            out[(int64_t) dst * out_channels + oc] += c_tile[idx];
+        }
+    }
+#else
+    (void) feats;
+    (void) weight;
+    (void) src_rows;
+    (void) dst_rows;
+    (void) offset_counts;
+    (void) out;
+    (void) pair_capacity;
+    (void) in_channels;
+    (void) out_channels;
+    (void) k_volume;
+    (void) offset;
+#endif
+}
+
+__global__ void trellis_sparse_subm_conv3d_masked_implicit_gemm_f32_kernel(
+    const float * __restrict__ feats,
+    const float * __restrict__ weight,
+    const float * __restrict__ bias,
+    const int32_t * __restrict__ neighbor_map,
+    const int32_t * __restrict__ tile_valid_offsets,
+    const int32_t * __restrict__ tile_valid_counts,
+    float * __restrict__ out,
+    int64_t n,
+    int in_channels,
+    int out_channels,
+    int k_volume) {
+    enum {
+        TILE_M = 16,
+        TILE_N = 16,
+        TILE_K = 64,
+    };
+    __shared__ float x_tile[TILE_M][TILE_K];
+    __shared__ float w_tile[TILE_N][TILE_K];
+
+    const int local_n = (int) threadIdx.x;
+    const int local_m = (int) threadIdx.y;
+    const int thread_linear = local_m * TILE_N + local_n;
+    const int64_t row_tile = ((int64_t) blockIdx.z * (int64_t) gridDim.y) + (int64_t) blockIdx.y;
+    const int64_t row = row_tile * TILE_M + local_m;
+    const int oc = (int) blockIdx.x * TILE_N + local_n;
+    const int valid = row < n && oc < out_channels;
+    float acc = valid && bias != NULL ? bias[oc] : 0.0f;
+    const int valid_count = tile_valid_counts == NULL ? k_volume : tile_valid_counts[row_tile];
+
+    for (int valid_i = 0; valid_i < valid_count; ++valid_i) {
+        const int k = tile_valid_offsets == NULL ? valid_i : tile_valid_offsets[row_tile * k_volume + valid_i];
+        for (int c0 = 0; c0 < in_channels; c0 += TILE_K) {
+            for (int load = thread_linear; load < TILE_M * TILE_K; load += TILE_M * TILE_N) {
+                const int m = load / TILE_K;
+                const int kc = load - m * TILE_K;
+                const int64_t src_row = row_tile * TILE_M + m;
+                const int c = c0 + kc;
+                float v = 0.0f;
+                if (src_row < n && c < in_channels) {
+                    const int32_t src = neighbor_map[(int64_t) k * n + src_row];
+                    if (src >= 0) {
+                        v = feats[(int64_t) src * in_channels + c];
+                    }
+                }
+                x_tile[m][kc] = v;
+            }
+            for (int load = thread_linear; load < TILE_N * TILE_K; load += TILE_M * TILE_N) {
+                const int n_local = load / TILE_K;
+                const int kc = load - n_local * TILE_K;
+                const int out_c = (int) blockIdx.x * TILE_N + n_local;
+                const int c = c0 + kc;
+                float v = 0.0f;
+                if (out_c < out_channels && c < in_channels) {
+                    v = weight[((int64_t) out_c * k_volume + k) * (int64_t) in_channels + c];
+                }
+                w_tile[n_local][kc] = v;
+            }
+            __syncthreads();
+            if (valid) {
+                #pragma unroll
+                for (int kc = 0; kc < TILE_K; ++kc) {
+                    acc += x_tile[local_m][kc] * w_tile[local_n][kc];
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (valid) {
+        out[row * out_channels + oc] = acc;
     }
 }
 
@@ -860,6 +1113,8 @@ void sparse_neighbor_map_free(sparse_neighbor_map_device * map) {
     cudaFree(map->dst_rows);
     cudaFree(map->offset_counts_dev);
     cudaFree(map->offset_starts_dev);
+    cudaFree(map->tile_valid_offsets);
+    cudaFree(map->tile_valid_counts);
     free(map->offset_counts_host);
     free(map->offset_starts_host);
     memset(map, 0, sizeof(*map));
@@ -881,7 +1136,8 @@ static int sparse_neighbor_map_matches(
 
 static int sparse_neighbor_map_has_rulebook(const sparse_neighbor_map_device * map) {
     return map != NULL && map->src_rows != NULL && map->dst_rows != NULL &&
-        map->offset_counts_host != NULL && map->offset_starts_host != NULL;
+        ((map->fixed_rulebook && map->offset_counts_dev != NULL) ||
+         (map->offset_counts_host != NULL && map->offset_starts_host != NULL));
 }
 
 static trellis_status sparse_neighbor_rulebook_build_device(sparse_neighbor_map_device * map) {
@@ -894,10 +1150,13 @@ static trellis_status sparse_neighbor_rulebook_build_device(sparse_neighbor_map_
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
 
-    map->offset_counts_host = (int32_t *) malloc((size_t) k_volume * sizeof(int32_t));
-    map->offset_starts_host = (int32_t *) malloc((size_t) k_volume * sizeof(int32_t));
-    if (map->offset_counts_host == NULL || map->offset_starts_host == NULL) {
-        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    const int use_device_rulebook = !cuda_env_disabled("TRELLIS_CUDA_SPARSE_CONV_DEVICE_RULEBOOK");
+    if (!use_device_rulebook) {
+        map->offset_counts_host = (int32_t *) malloc((size_t) k_volume * sizeof(int32_t));
+        map->offset_starts_host = (int32_t *) malloc((size_t) k_volume * sizeof(int32_t));
+        if (map->offset_counts_host == NULL || map->offset_starts_host == NULL) {
+            return TRELLIS_STATUS_OUT_OF_MEMORY;
+        }
     }
 
     trellis_status status = TRELLIS_STATUS_OK;
@@ -919,59 +1178,92 @@ static trellis_status sparse_neighbor_rulebook_build_device(sparse_neighbor_map_
     if (status != TRELLIS_STATUS_OK) {
         goto cleanup;
     }
-    status = cuda_status_to_trellis(cudaMemcpy(
-        map->offset_counts_host,
-        map->offset_counts_dev,
-        (size_t) k_volume * sizeof(int32_t),
-        cudaMemcpyDeviceToHost));
-    if (status != TRELLIS_STATUS_OK) {
-        goto cleanup;
-    }
-
-    for (int k = 0; k < k_volume; ++k) {
-        map->offset_starts_host[k] = (int32_t) total_pairs;
-        total_pairs += map->offset_counts_host[k];
-        if (total_pairs > (int64_t) INT32_MAX) {
-            status = TRELLIS_STATUS_INVALID_ARGUMENT;
+    if (use_device_rulebook) {
+        map->fixed_rulebook = 1;
+        map->total_pairs = map_total;
+        err = cudaMalloc((void **) &map->src_rows, (size_t) map_total * sizeof(int32_t));
+        if (err != cudaSuccess) {
+            status = TRELLIS_STATUS_OUT_OF_MEMORY;
             goto cleanup;
         }
-    }
-    map->total_pairs = total_pairs;
-    status = cuda_status_to_trellis(cudaMemcpy(
-        map->offset_starts_dev,
-        map->offset_starts_host,
-        (size_t) k_volume * sizeof(int32_t),
-        cudaMemcpyHostToDevice));
-    if (status != TRELLIS_STATUS_OK) {
-        goto cleanup;
-    }
-    if (total_pairs <= 0) {
-        status = TRELLIS_STATUS_ERROR;
-        goto cleanup;
-    }
+        err = cudaMalloc((void **) &map->dst_rows, (size_t) map_total * sizeof(int32_t));
+        if (err != cudaSuccess) {
+            status = TRELLIS_STATUS_OUT_OF_MEMORY;
+            goto cleanup;
+        }
+        err = cudaMalloc((void **) &counters_dev, (size_t) k_volume * sizeof(int32_t));
+        if (err != cudaSuccess) {
+            status = TRELLIS_STATUS_OUT_OF_MEMORY;
+            goto cleanup;
+        }
+        {
+            const int block = 128;
+            const int grid = (k_volume + block - 1) / block;
+            trellis_sparse_rulebook_fixed_starts_kernel<<<grid, block>>>(
+                map->offset_starts_dev,
+                counters_dev,
+                map->n,
+                k_volume);
+            status = cuda_status_to_trellis(cudaGetLastError());
+            if (status != TRELLIS_STATUS_OK) {
+                goto cleanup;
+            }
+        }
+    } else {
+        status = cuda_status_to_trellis(cudaMemcpy(
+            map->offset_counts_host,
+            map->offset_counts_dev,
+            (size_t) k_volume * sizeof(int32_t),
+            cudaMemcpyDeviceToHost));
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
 
-    err = cudaMalloc((void **) &map->src_rows, (size_t) total_pairs * sizeof(int32_t));
-    if (err != cudaSuccess) {
-        status = TRELLIS_STATUS_OUT_OF_MEMORY;
-        goto cleanup;
-    }
-    err = cudaMalloc((void **) &map->dst_rows, (size_t) total_pairs * sizeof(int32_t));
-    if (err != cudaSuccess) {
-        status = TRELLIS_STATUS_OUT_OF_MEMORY;
-        goto cleanup;
-    }
-    err = cudaMalloc((void **) &counters_dev, (size_t) k_volume * sizeof(int32_t));
-    if (err != cudaSuccess) {
-        status = TRELLIS_STATUS_OUT_OF_MEMORY;
-        goto cleanup;
-    }
-    status = cuda_status_to_trellis(cudaMemcpy(
-        counters_dev,
-        map->offset_starts_host,
-        (size_t) k_volume * sizeof(int32_t),
-        cudaMemcpyHostToDevice));
-    if (status != TRELLIS_STATUS_OK) {
-        goto cleanup;
+        for (int k = 0; k < k_volume; ++k) {
+            map->offset_starts_host[k] = (int32_t) total_pairs;
+            total_pairs += map->offset_counts_host[k];
+            if (total_pairs > (int64_t) INT32_MAX) {
+                status = TRELLIS_STATUS_INVALID_ARGUMENT;
+                goto cleanup;
+            }
+        }
+        map->total_pairs = total_pairs;
+        status = cuda_status_to_trellis(cudaMemcpy(
+            map->offset_starts_dev,
+            map->offset_starts_host,
+            (size_t) k_volume * sizeof(int32_t),
+            cudaMemcpyHostToDevice));
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
+        if (total_pairs <= 0) {
+            status = TRELLIS_STATUS_ERROR;
+            goto cleanup;
+        }
+
+        err = cudaMalloc((void **) &map->src_rows, (size_t) total_pairs * sizeof(int32_t));
+        if (err != cudaSuccess) {
+            status = TRELLIS_STATUS_OUT_OF_MEMORY;
+            goto cleanup;
+        }
+        err = cudaMalloc((void **) &map->dst_rows, (size_t) total_pairs * sizeof(int32_t));
+        if (err != cudaSuccess) {
+            status = TRELLIS_STATUS_OUT_OF_MEMORY;
+            goto cleanup;
+        }
+        err = cudaMalloc((void **) &counters_dev, (size_t) k_volume * sizeof(int32_t));
+        if (err != cudaSuccess) {
+            status = TRELLIS_STATUS_OUT_OF_MEMORY;
+            goto cleanup;
+        }
+        status = cuda_status_to_trellis(cudaMemcpy(
+            counters_dev,
+            map->offset_starts_host,
+            (size_t) k_volume * sizeof(int32_t),
+            cudaMemcpyHostToDevice));
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
     }
 
     {
@@ -1003,6 +1295,7 @@ cleanup:
         map->offset_counts_host = NULL;
         map->offset_starts_host = NULL;
         map->total_pairs = 0;
+        map->fixed_rulebook = 0;
     }
     return status;
 }
@@ -1103,6 +1396,38 @@ trellis_status sparse_neighbor_map_build_device(
         map->dilation_w = dilation_w;
         if (build_rulebook) {
             status = sparse_neighbor_rulebook_build_device(map);
+        } else {
+            const int64_t row_tiles = (n + 15) / 16;
+            const int64_t valid_slots = row_tiles * (int64_t) k_volume;
+            if (row_tiles <= 0 || valid_slots <= 0 || valid_slots > (int64_t) INT32_MAX) {
+                status = TRELLIS_STATUS_INVALID_ARGUMENT;
+            }
+            if (status == TRELLIS_STATUS_OK) {
+                err = cudaMalloc((void **) &map->tile_valid_offsets, (size_t) valid_slots * sizeof(int32_t));
+                if (err != cudaSuccess) {
+                    status = TRELLIS_STATUS_OUT_OF_MEMORY;
+                }
+            }
+            if (status == TRELLIS_STATUS_OK) {
+                err = cudaMalloc((void **) &map->tile_valid_counts, (size_t) row_tiles * sizeof(int32_t));
+                if (err != cudaSuccess) {
+                    status = TRELLIS_STATUS_OUT_OF_MEMORY;
+                }
+            }
+            if (status == TRELLIS_STATUS_OK) {
+                status = cuda_status_to_trellis(cudaMemset(map->tile_valid_counts, 0, (size_t) row_tiles * sizeof(int32_t)));
+            }
+            if (status == TRELLIS_STATUS_OK) {
+                const int grid_valid = (int) ((valid_slots + block - 1) / block);
+                trellis_sparse_tile_valid_kernel<<<grid_valid, block>>>(
+                    map->indices,
+                    map->tile_valid_offsets,
+                    map->tile_valid_counts,
+                    n,
+                    k_volume,
+                    valid_slots);
+                status = cuda_status_to_trellis(cudaGetLastError());
+            }
         }
     }
 
@@ -1130,10 +1455,56 @@ static trellis_status sparse_subm_conv3d_with_map_f32(
     int dilation_d,
     int dilation_h,
     int dilation_w) {
+    const int use_masked_implicit = cuda_env_enabled("TRELLIS_CUDA_SPARSE_CONV_MASKED");
     if (!sparse_neighbor_map_matches(map, n, kernel_d, kernel_h, kernel_w, dilation_d, dilation_h, dilation_w) ||
-        !sparse_neighbor_map_has_rulebook(map) ||
+        (!use_masked_implicit && !sparse_neighbor_map_has_rulebook(map)) ||
         feats_dev == NULL || weight_dev == NULL || out_dev == NULL || in_channels <= 0 || out_channels <= 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (use_masked_implicit) {
+        const dim3 gemm_block(16, 16);
+        const uint64_t row_tiles = (uint64_t) ((n + 15) / 16);
+        const unsigned int grid_y = row_tiles > 65535ull ? 65535u : (unsigned int) row_tiles;
+        const unsigned int grid_z = (unsigned int) ((row_tiles + (uint64_t) grid_y - 1ull) / (uint64_t) grid_y);
+        if (grid_y == 0 || grid_z == 0 || grid_z > 65535u) {
+            TRELLIS_ERROR(
+                "sparse_subm_conv3d: masked implicit grid too large rows=%lld tiles=%llu grid_y=%u grid_z=%u",
+                (long long) n,
+                (unsigned long long) row_tiles,
+                grid_y,
+                grid_z);
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
+        }
+        const dim3 gemm_grid(
+            (unsigned int) ((out_channels + 15) / 16),
+            grid_y,
+            grid_z);
+        trellis_sparse_subm_conv3d_masked_implicit_gemm_f32_kernel<<<gemm_grid, gemm_block>>>(
+            feats_dev,
+            weight_dev,
+            bias_dev,
+            map->indices,
+            map->tile_valid_offsets,
+            map->tile_valid_counts,
+            out_dev,
+            n,
+            in_channels,
+            out_channels,
+            map->k_volume);
+        cudaError_t err = cudaGetLastError();
+        trellis_status status = cuda_status_to_trellis(err);
+        if (status != TRELLIS_STATUS_OK) {
+            TRELLIS_ERROR(
+                "sparse_subm_conv3d: masked implicit launch failed: %s n=%lld in=%d out=%d grid=(%u,%u,%u)",
+                cudaGetErrorString(err),
+                (long long) n,
+                in_channels,
+                out_channels,
+                gemm_grid.x,
+                gemm_grid.y,
+                gemm_grid.z);
+        }
+        return status;
     }
     const int64_t total = n * (int64_t) out_channels;
     const int block = 256;
@@ -1152,7 +1523,77 @@ static trellis_status sparse_subm_conv3d_with_map_f32(
         return status;
     }
 
+    const int use_wmma =
+        cuda_env_enabled("TRELLIS_CUDA_SPARSE_CONV_WMMA") &&
+        (in_channels % 16) == 0 &&
+        (out_channels % 16) == 0 &&
+        cuda_device_supports_wmma();
     const dim3 gemm_block(16, 16);
+    const dim3 wmma_block(32, 1, 1);
+    if (map->fixed_rulebook) {
+        const int64_t pair_capacity = n;
+        const uint64_t pair_tiles = (uint64_t) ((pair_capacity + 15) / 16);
+        const unsigned int grid_y = pair_tiles > 65535ull ? 65535u : (unsigned int) pair_tiles;
+        const unsigned int grid_z = (unsigned int) ((pair_tiles + (uint64_t) grid_y - 1ull) / (uint64_t) grid_y);
+        if (grid_y == 0 || grid_z == 0 || grid_z > 65535u) {
+            TRELLIS_ERROR(
+                "sparse_subm_conv3d: device rulebook grid too large rows=%lld tiles=%llu grid_y=%u grid_z=%u",
+                (long long) n,
+                (unsigned long long) pair_tiles,
+                grid_y,
+                grid_z);
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
+        }
+        const dim3 gemm_grid(
+            (unsigned int) ((out_channels + 15) / 16),
+            grid_y,
+            grid_z);
+        for (int k = 0; status == TRELLIS_STATUS_OK && k < map->k_volume; ++k) {
+            const int64_t start = (int64_t) k * n;
+            if (use_wmma) {
+                trellis_sparse_subm_conv3d_implicit_wmma_f32_kernel<<<gemm_grid, wmma_block>>>(
+                    feats_dev,
+                    weight_dev,
+                    map->src_rows + start,
+                    map->dst_rows + start,
+                    map->offset_counts_dev,
+                    out_dev,
+                    pair_capacity,
+                    in_channels,
+                    out_channels,
+                    map->k_volume,
+                    k);
+            } else {
+                trellis_sparse_subm_conv3d_implicit_gemm_f32_kernel<<<gemm_grid, gemm_block>>>(
+                    feats_dev,
+                    weight_dev,
+                    map->src_rows + start,
+                    map->dst_rows + start,
+                    map->offset_counts_dev,
+                    out_dev,
+                    pair_capacity,
+                    in_channels,
+                    out_channels,
+                    map->k_volume,
+                    k);
+            }
+            cudaError_t err = cudaGetLastError();
+            status = cuda_status_to_trellis(err);
+            if (status != TRELLIS_STATUS_OK) {
+                TRELLIS_ERROR(
+                    "sparse_subm_conv3d: device rulebook launch failed: %s k=%d n=%lld in=%d out=%d grid=(%u,%u,%u)",
+                    cudaGetErrorString(err),
+                    k,
+                    (long long) n,
+                    in_channels,
+                    out_channels,
+                    gemm_grid.x,
+                    gemm_grid.y,
+                    gemm_grid.z);
+            }
+        }
+        return status;
+    }
     for (int k = 0; status == TRELLIS_STATUS_OK && k < map->k_volume; ++k) {
         const int64_t pair_count = map->offset_counts_host[k];
         if (pair_count <= 0) {
@@ -1177,17 +1618,33 @@ static trellis_status sparse_subm_conv3d_with_map_f32(
             (unsigned int) ((out_channels + 15) / 16),
             grid_y,
             grid_z);
-        trellis_sparse_subm_conv3d_implicit_gemm_f32_kernel<<<gemm_grid, gemm_block>>>(
-            feats_dev,
-            weight_dev,
-            map->src_rows + start,
-            map->dst_rows + start,
-            out_dev,
-            pair_count,
-            in_channels,
-            out_channels,
-            map->k_volume,
-            k);
+        if (use_wmma) {
+            trellis_sparse_subm_conv3d_implicit_wmma_f32_kernel<<<gemm_grid, wmma_block>>>(
+                feats_dev,
+                weight_dev,
+                map->src_rows + start,
+                map->dst_rows + start,
+                NULL,
+                out_dev,
+                pair_count,
+                in_channels,
+                out_channels,
+                map->k_volume,
+                k);
+        } else {
+            trellis_sparse_subm_conv3d_implicit_gemm_f32_kernel<<<gemm_grid, gemm_block>>>(
+                feats_dev,
+                weight_dev,
+                map->src_rows + start,
+                map->dst_rows + start,
+                NULL,
+                out_dev,
+                pair_count,
+                in_channels,
+                out_channels,
+                map->k_volume,
+                k);
+        }
         cudaError_t err = cudaGetLastError();
         status = cuda_status_to_trellis(err);
         if (status != TRELLIS_STATUS_OK) {
@@ -1227,6 +1684,7 @@ trellis_status sparse_subm_conv3d_device_build(
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     memset(conv, 0, sizeof(*conv));
+    const int build_rulebook = !cuda_env_enabled("TRELLIS_CUDA_SPARSE_CONV_MASKED");
     return sparse_neighbor_map_build_device(
         coords_dev,
         n,
@@ -1236,7 +1694,7 @@ trellis_status sparse_subm_conv3d_device_build(
         dilation_d,
         dilation_h,
         dilation_w,
-        1,
+        build_rulebook,
         &conv->neighbor_map);
 }
 
@@ -1292,6 +1750,7 @@ extern "C" trellis_status trellis_cuda_sparse_subm_conv3d_f32(
     }
     sparse_neighbor_map_device map;
     memset(&map, 0, sizeof(map));
+    const int build_rulebook = !cuda_env_enabled("TRELLIS_CUDA_SPARSE_CONV_MASKED");
     trellis_status status = sparse_neighbor_map_build_device(
         coords_dev,
         n,
@@ -1301,7 +1760,7 @@ extern "C" trellis_status trellis_cuda_sparse_subm_conv3d_f32(
         dilation_d,
         dilation_h,
         dilation_w,
-        1,
+        build_rulebook,
         &map);
     if (status == TRELLIS_STATUS_OK) {
         status = sparse_subm_conv3d_with_map_f32(

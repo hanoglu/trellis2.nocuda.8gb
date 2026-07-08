@@ -1,0 +1,15 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "sparse_common.inc"
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.total) return;
+    uint c = idx % p.out_channels;
+    uint row = idx / p.out_channels;
+    int parent = i0[row];
+    int subidx = i1[row];
+    f3[idx] = f0[(uint(parent) * 8u + uint(subidx)) * p.out_channels + c];
+}

@@ -206,6 +206,7 @@ typedef struct trellis_pipeline_mesh_options {
     const trellis_cuda_context * cuda;
     trellis_sparse_backend_kind sparse_backend_kind;
     int sparse_device;
+    void * sparse_backend;
     trellis_pipeline_model_cache * cache;
 } trellis_pipeline_mesh_options;
 
@@ -233,6 +234,7 @@ typedef struct trellis_pipeline_texture_options {
     const trellis_cuda_context * cuda;
     trellis_sparse_backend_kind sparse_backend_kind;
     int sparse_device;
+    void * sparse_backend;
     trellis_pipeline_model_cache * cache;
 } trellis_pipeline_texture_options;
 

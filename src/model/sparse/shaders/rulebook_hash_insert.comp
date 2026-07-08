@@ -1,0 +1,24 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "sparse_common.inc"
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= p.n) return;
+    int b = i0[4u * row + 0u];
+    int x = i0[4u * row + 1u];
+    int y = i0[4u * row + 2u];
+    int z = i0[4u * row + 3u];
+    uint key = pack_coord_key(b, x, y, z);
+    uint slot = hash_u32(key) & p.table_mask;
+    for (uint probe = 0; probe <= p.table_mask; ++probe) {
+        uint old = atomicCompSwap(u0[RULEBOOK_HASH_BASE + slot], 0u, key);
+        if (old == 0u || old == key) {
+            i1[slot] = int(row);
+            return;
+        }
+        slot = (slot + 1u) & p.table_mask;
+    }
+}

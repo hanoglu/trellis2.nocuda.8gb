@@ -1,0 +1,38 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "sparse_common.inc"
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.total) return;
+    uint tile = idx / 27u;
+    uint offset = idx - tile * 27u;
+    uint row_start = tile * 16u;
+    bool valid = false;
+    for (uint r = 0u; r < 16u; ++r) {
+        uint row = row_start + r;
+        if (row < p.n && i4[row * 27u + offset] >= 0) {
+            valid = true;
+        }
+    }
+    if (!valid) {
+        return;
+    }
+    uint pos = 0u;
+    for (uint prev = 0u; prev < offset; ++prev) {
+        bool prev_valid = false;
+        for (uint r = 0u; r < 16u; ++r) {
+            uint row = row_start + r;
+            if (row < p.n && i4[row * 27u + prev] >= 0) {
+                prev_valid = true;
+            }
+        }
+        if (prev_valid) {
+            ++pos;
+        }
+    }
+    i1[tile * 27u + pos] = int(offset);
+    atomicMax(u0[tile], pos + 1u);
+}

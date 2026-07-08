@@ -3,6 +3,7 @@
 #endif
 
 #include "trellis.h"
+#include "sparse/trellis_sparse_backend.h"
 #include "trellis_pipeline_internal.h"
 
 #include <ctype.h>
@@ -445,6 +446,7 @@ trellis_status trellis_pipeline_decode_shape_latent_mesh(
     forward_options.backend_kind = options->sparse_backend_kind;
     forward_options.device = options->sparse_device;
     forward_options.max_levels = options->decode_max_levels;
+    forward_options.sparse_backend = options->sparse_backend;
     forward_options.return_subs = subs_out;
     status = trellis_sparse_unet_vae_decoder_forward_backend_f32_host(
         decoder_ptr,
@@ -571,6 +573,7 @@ static trellis_status trellis_pipeline_decode_shape_latent_decoder_coords(
     forward_options.backend_kind = options->sparse_backend_kind;
     forward_options.device = options->sparse_device;
     forward_options.max_levels = options->decode_max_levels;
+    forward_options.sparse_backend = options->sparse_backend;
     status = trellis_sparse_unet_vae_decoder_forward_backend_f32_host(
         decoder_ptr,
         options->latent->coords_bxyz,
@@ -756,6 +759,7 @@ trellis_status trellis_pipeline_decode_texture_latent_voxels(
     forward_options.backend_kind = options->sparse_backend_kind;
     forward_options.device = options->sparse_device;
     forward_options.max_levels = options->decode_max_levels;
+    forward_options.sparse_backend = options->sparse_backend;
     forward_options.guide_subs = options->guide_subs;
     status = trellis_sparse_unet_vae_decoder_forward_backend_f32_host(
         decoder_ptr,
@@ -1245,6 +1249,7 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
 
     trellis_backend_context graph_backend;
     trellis_cuda_context cuda;
+    trellis_sparse_backend * shared_sparse_backend = NULL;
     memset(&graph_backend, 0, sizeof(graph_backend));
     memset(&cuda, 0, sizeof(cuda));
     trellis_sparse_backend_kind sparse_backend_kind = TRELLIS_SPARSE_BACKEND_CUDA;
@@ -1277,6 +1282,18 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
         status = trellis_cuda_init(&cuda, options->device);
         if (status != TRELLIS_STATUS_OK) {
             TRELLIS_ERROR("SparseUnet CUDA decoder: init device=%d failed: %s", options->device, trellis_status_string(status));
+            trellis_backend_free(&graph_backend);
+            unlink_if_set(temp_birefnet_image);
+            unlink_if_set(temp_image);
+            return status;
+        }
+    } else if (sparse_backend_kind == TRELLIS_SPARSE_BACKEND_VULKAN) {
+        status = trellis_sparse_vulkan_backend_create(sparse_device, &shared_sparse_backend);
+        if (status != TRELLIS_STATUS_OK) {
+            TRELLIS_ERROR(
+                "SparseUnet Vulkan decoder backend: init device=%d failed: %s",
+                sparse_device,
+                trellis_status_string(status));
             trellis_backend_free(&graph_backend);
             unlink_if_set(temp_birefnet_image);
             unlink_if_set(temp_image);
@@ -1487,6 +1504,7 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
         cascade_upsample_options.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
         cascade_upsample_options.sparse_backend_kind = sparse_backend_kind;
         cascade_upsample_options.sparse_device = sparse_device;
+        cascade_upsample_options.sparse_backend = shared_sparse_backend;
         cascade_upsample_options.cache = model_cache_ptr;
         perf_start_us = ggml_time_us();
         status = trellis_pipeline_decode_shape_latent_decoder_coords(
@@ -1557,6 +1575,7 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     mesh_options.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
     mesh_options.sparse_backend_kind = sparse_backend_kind;
     mesh_options.sparse_device = sparse_device;
+    mesh_options.sparse_backend = shared_sparse_backend;
     mesh_options.cache = model_cache_ptr;
 
     perf_start_us = ggml_time_us();
@@ -1644,6 +1663,7 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     tex_decode.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
     tex_decode.sparse_backend_kind = sparse_backend_kind;
     tex_decode.sparse_device = sparse_device;
+    tex_decode.sparse_backend = shared_sparse_backend;
     tex_decode.cache = model_cache_ptr;
 
     perf_start_us = ggml_time_us();
@@ -1703,6 +1723,7 @@ cleanup:
     if (sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA) {
         trellis_cuda_free(&cuda);
     }
+    trellis_sparse_backend_destroy(shared_sparse_backend);
     trellis_backend_free(&graph_backend);
     unlink_if_set(temp_birefnet_image);
     unlink_if_set(temp_image);

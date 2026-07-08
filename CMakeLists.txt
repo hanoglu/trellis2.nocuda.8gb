@@ -130,10 +130,66 @@ add_library(trellis2_c
 )
 
 if (GGML_VULKAN)
-    set(TRELLIS_SPARSE_VK_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_sparse_vk.spv")
-    set(TRELLIS_SPARSE_VK_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_sparse_vk_spv.h")
-    set(TRELLIS_SPARSE_VK_MAT_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_sparse_vk_mat.spv")
-    set(TRELLIS_SPARSE_VK_MAT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_sparse_vk_mat_spv.h")
+    set(TRELLIS_SPARSE_SHADER_DIR "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse/shaders")
+    set(TRELLIS_SPARSE_SHADER_COMMON_DEPS
+        "${TRELLIS_SPARSE_SHADER_DIR}/sparse_common.inc"
+        "${TRELLIS_SPARSE_SHADER_DIR}/sparse_mat_common.inc"
+        "${TRELLIS_SPARSE_SHADER_DIR}/sparse_coop_common.inc")
+    set(TRELLIS_SPARSE_VK_HEADERS)
+    function(add_trellis_sparse_vk_shader NAME SOURCE SYMBOL TARGET_ENV)
+        set(SPV "${CMAKE_CURRENT_BINARY_DIR}/${NAME}.spv")
+        set(HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/${SYMBOL}.h")
+        add_custom_command(
+            OUTPUT "${SPV}"
+            COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=${TARGET_ENV}
+                    -I "${TRELLIS_SPARSE_SHADER_DIR}"
+                    "${CMAKE_CURRENT_LIST_DIR}/${SOURCE}"
+                    -o "${SPV}"
+            DEPENDS "${CMAKE_CURRENT_LIST_DIR}/${SOURCE}" ${TRELLIS_SPARSE_SHADER_COMMON_DEPS}
+            COMMENT "Compile ${NAME} Vulkan shader")
+        add_custom_command(
+            OUTPUT "${HEADER}"
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+            COMMAND "${CMAKE_COMMAND}"
+                    -DINPUT="${SPV}"
+                    -DOUTPUT="${HEADER}"
+                    -DSYMBOL=${SYMBOL}
+                    -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+            DEPENDS "${SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
+            COMMENT "Generate ${NAME} Vulkan shader header")
+        list(APPEND TRELLIS_SPARSE_VK_HEADERS "${HEADER}")
+        set(TRELLIS_SPARSE_VK_HEADERS "${TRELLIS_SPARSE_VK_HEADERS}" PARENT_SCOPE)
+    endfunction()
+
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_row_norm src/model/sparse/shaders/row_norm.comp trellis_sparse_vk_row_norm_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_row_norm_silu src/model/sparse/shaders/row_norm_silu.comp trellis_sparse_vk_row_norm_silu_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_silu src/model/sparse/shaders/silu.comp trellis_sparse_vk_silu_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_add src/model/sparse/shaders/add.comp trellis_sparse_vk_add_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_c2s_gather src/model/sparse/shaders/c2s_gather.comp trellis_sparse_vk_c2s_gather_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_skip_repeat src/model/sparse/shaders/skip_repeat.comp trellis_sparse_vk_skip_repeat_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_fill_bias src/model/sparse/shaders/fill_bias.comp trellis_sparse_vk_fill_bias_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_hash_insert src/model/sparse/shaders/rulebook_hash_insert.comp trellis_sparse_vk_rulebook_hash_insert_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_fill src/model/sparse/shaders/rulebook_fill.comp trellis_sparse_vk_rulebook_fill_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_c2s_count src/model/sparse/shaders/c2s_count.comp trellis_sparse_vk_c2s_count_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_c2s_fill src/model/sparse/shaders/c2s_fill.comp trellis_sparse_vk_c2s_fill_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_scan_i32_stride src/model/sparse/shaders/scan_i32_stride.comp trellis_sparse_vk_scan_i32_stride_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_scan_i32_block src/model/sparse/shaders/scan_i32_block.comp trellis_sparse_vk_scan_i32_block_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_scan_i32_add_block_offsets src/model/sparse/shaders/scan_i32_add_block_offsets.comp trellis_sparse_vk_scan_i32_add_block_offsets_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_dispatch src/model/sparse/shaders/rulebook_dispatch.comp trellis_sparse_vk_rulebook_dispatch_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_tile_valid src/model/sparse/shaders/rulebook_tile_valid.comp trellis_sparse_vk_rulebook_tile_valid_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_mask_init src/model/sparse/shaders/rulebook_mask_init.comp trellis_sparse_vk_rulebook_mask_init_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_sort_bitonic src/model/sparse/shaders/sort_bitonic.comp trellis_sparse_vk_sort_bitonic_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_valid_sorted_count src/model/sparse/shaders/rulebook_valid_sorted_count.comp trellis_sparse_vk_rulebook_valid_sorted_count_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_rulebook_valid_sorted_scatter src/model/sparse/shaders/rulebook_valid_sorted_scatter.comp trellis_sparse_vk_rulebook_valid_sorted_scatter_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_linear_mat src/model/sparse/shaders/linear_mat.comp trellis_sparse_vk_linear_mat_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_linear_silu_mat src/model/sparse/shaders/linear_silu_mat.comp trellis_sparse_vk_linear_silu_mat_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_sparse_conv_offset_mat src/model/sparse/shaders/sparse_conv_offset_mat.comp trellis_sparse_vk_sparse_conv_offset_mat_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_sparse_conv_masked_mat src/model/sparse/shaders/sparse_conv_masked_mat.comp trellis_sparse_vk_sparse_conv_masked_mat_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_sparse_conv_masked_sorted_mat src/model/sparse/shaders/sparse_conv_masked_sorted_mat.comp trellis_sparse_vk_sparse_conv_masked_sorted_mat_spv vulkan1.2)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_linear_coop src/model/sparse/shaders/linear_coop.comp trellis_sparse_vk_linear_coop_spv vulkan1.3)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_linear_silu_coop src/model/sparse/shaders/linear_silu_coop.comp trellis_sparse_vk_linear_silu_coop_spv vulkan1.3)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_sparse_conv_offset_coop src/model/sparse/shaders/sparse_conv_offset_coop.comp trellis_sparse_vk_sparse_conv_offset_coop_spv vulkan1.3)
+
     set(TRELLIS_GLTF_BAKE_VERT_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_bake_vert.spv")
     set(TRELLIS_GLTF_BAKE_VERT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_bake_vert_spv.h")
     set(TRELLIS_GLTF_BAKE_FRAG_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_bake_frag.spv")
@@ -142,40 +198,6 @@ if (GGML_VULKAN)
     set(TRELLIS_GLTF_DILATE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_dilate_spv.h")
     set(TRELLIS_GLTF_FILL_EMPTY_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_fill_empty.spv")
     set(TRELLIS_GLTF_FILL_EMPTY_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_fill_empty_spv.h")
-    add_custom_command(
-        OUTPUT "${TRELLIS_SPARSE_VK_SPV}"
-        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
-                "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse/trellis_sparse_vk.comp"
-                -o "${TRELLIS_SPARSE_VK_SPV}"
-        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse/trellis_sparse_vk.comp"
-        COMMENT "Compile TRELLIS sparse Vulkan shader")
-    add_custom_command(
-        OUTPUT "${TRELLIS_SPARSE_VK_MAT_SPV}"
-        COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=vulkan1.2
-                "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse/trellis_sparse_vk_mat.comp"
-                -o "${TRELLIS_SPARSE_VK_MAT_SPV}"
-        DEPENDS "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse/trellis_sparse_vk_mat.comp"
-        COMMENT "Compile TRELLIS sparse Vulkan tiled matmul shader")
-    add_custom_command(
-        OUTPUT "${TRELLIS_SPARSE_VK_HEADER}"
-        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
-        COMMAND "${CMAKE_COMMAND}"
-                -DINPUT="${TRELLIS_SPARSE_VK_SPV}"
-                -DOUTPUT="${TRELLIS_SPARSE_VK_HEADER}"
-                -DSYMBOL=trellis_sparse_vk_spv
-                -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
-        DEPENDS "${TRELLIS_SPARSE_VK_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
-        COMMENT "Generate TRELLIS sparse Vulkan shader header")
-    add_custom_command(
-        OUTPUT "${TRELLIS_SPARSE_VK_MAT_HEADER}"
-        COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
-        COMMAND "${CMAKE_COMMAND}"
-                -DINPUT="${TRELLIS_SPARSE_VK_MAT_SPV}"
-                -DOUTPUT="${TRELLIS_SPARSE_VK_MAT_HEADER}"
-                -DSYMBOL=trellis_sparse_vk_mat_spv
-                -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
-        DEPENDS "${TRELLIS_SPARSE_VK_MAT_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
-        COMMENT "Generate TRELLIS sparse Vulkan tiled matmul shader header")
     add_custom_command(
         OUTPUT "${TRELLIS_GLTF_BAKE_VERT_SPV}"
         COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=vertex --target-env=vulkan1.2
@@ -244,7 +266,8 @@ if (GGML_VULKAN)
                 -P "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
         DEPENDS "${TRELLIS_GLTF_FILL_EMPTY_SPV}" "${CMAKE_CURRENT_LIST_DIR}/cmake/bin2c.cmake"
         COMMENT "Generate TRELLIS glTF Vulkan texture fill shader header")
-    add_custom_target(trellis_sparse_vk_shader DEPENDS "${TRELLIS_SPARSE_VK_HEADER}" "${TRELLIS_SPARSE_VK_MAT_HEADER}")
+    add_custom_target(trellis_sparse_vk_shader DEPENDS
+        ${TRELLIS_SPARSE_VK_HEADERS})
     add_custom_target(trellis_gltf_vk_shader DEPENDS
         "${TRELLIS_GLTF_BAKE_VERT_HEADER}"
         "${TRELLIS_GLTF_BAKE_FRAG_HEADER}"

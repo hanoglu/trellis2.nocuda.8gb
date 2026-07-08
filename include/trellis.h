@@ -23,6 +23,10 @@ extern "C" {
 #define TRELLIS_DEFAULT_BACKEND TRELLIS_DEFAULT_GGML_BACKEND
 #endif
 
+#ifndef TRELLIS_HAS_VKMESH_C_API
+#define TRELLIS_HAS_VKMESH_C_API 0
+#endif
+
 typedef enum trellis_status {
     TRELLIS_STATUS_OK = 0,
     TRELLIS_STATUS_ERROR = 1,
@@ -444,6 +448,9 @@ typedef struct trellis_sparse_c2s_guide_level {
     int32_t * coords_bxyz; /* [n_coords, 4] */
     int32_t * parent;      /* [n_coords] row in previous level */
     int32_t * subidx;      /* [n_coords] channel-to-spatial child index [0, 7] */
+    void * device_map;     /* Optional backend-owned device-resident map. */
+    trellis_sparse_backend_kind device_backend_kind;
+    int device;
     int64_t n_coords;
 } trellis_sparse_c2s_guide_level;
 
@@ -502,6 +509,7 @@ typedef struct trellis_sparse_unet_vae_decoder_forward_options {
     trellis_sparse_backend_kind backend_kind;
     int device;
     int max_levels;
+    void * sparse_backend;
     const trellis_sparse_c2s_guides * guide_subs;
     trellis_sparse_c2s_guides * return_subs;
 } trellis_sparse_unet_vae_decoder_forward_options;
@@ -678,6 +686,26 @@ typedef struct trellis_mesh_host {
 } trellis_mesh_host;
 
 void trellis_mesh_free(trellis_mesh_host * mesh);
+
+typedef struct trellis_vkmesh_postprocess_options {
+    int decimation_target;       /* default 1000000 */
+    int no_simplify;             /* skip simplify passes, matching vkmesh --no-simplify */
+    int run_degenerate_cleanup;  /* default 0, matching current TRELLIS pipeline */
+    int simplify_steps;          /* 0 means vkmesh default/unbounded */
+    float max_hole_perimeter;    /* default 0.03 */
+    float degenerate_abs;        /* default 1e-24 */
+    float degenerate_rel;        /* default 1e-12 */
+    float min_component_area;    /* default 1e-5 */
+    float lambda_edge_length;    /* default 1e-2 */
+    float lambda_skinny;         /* default 1e-3 */
+    float simplify_threshold;    /* default 1e-8 */
+} trellis_vkmesh_postprocess_options;
+
+trellis_status trellis_vkmesh_postprocess(
+    const trellis_mesh_host * mesh,
+    trellis_mesh_host * mesh_out,
+    trellis_mesh_host * projection_mesh_out,
+    const trellis_vkmesh_postprocess_options * options);
 
 /* Extracts a mesh from FlexiDualGrid decoder logits. */
 trellis_status trellis_flexible_dual_grid_mesh_from_decoder_logits_host(

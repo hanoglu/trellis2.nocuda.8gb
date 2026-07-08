@@ -1,5 +1,9 @@
 #include <vulkan/vulkan.h>
 
+#ifdef TRELLIS_VKMESH_LIBRARY
+#include "trellis.h"
+#endif
+
 #include "vkmesh_accumulate_hole_components_spv.h"
 #include "vkmesh_apply_orientation_flips_spv.h"
 #include "vkmesh_assign_vertex_map_spv.h"
@@ -273,6 +277,45 @@ static void mesh_free(vkmesh_mesh * mesh) {
     free(mesh->uvs);
     free(mesh->faces);
     memset(mesh, 0, sizeof(*mesh));
+}
+
+static int mesh_clone(const vkmesh_mesh * src, vkmesh_mesh * dst) {
+    if (src == NULL || dst == NULL || src->vertices == NULL || src->faces == NULL ||
+        src->n_vertices <= 0 || src->n_faces <= 0 ||
+        src->n_vertices > INT64_MAX / 3 || src->n_faces > INT64_MAX / 3 ||
+        (uint64_t) src->n_vertices > (uint64_t) SIZE_MAX / (3u * sizeof(float)) ||
+        (uint64_t) src->n_faces > (uint64_t) SIZE_MAX / (3u * sizeof(int32_t))) {
+        return 0;
+    }
+    vkmesh_mesh out;
+    memset(&out, 0, sizeof(out));
+    const size_t vertex_count = (size_t) src->n_vertices * 3u;
+    const size_t face_count = (size_t) src->n_faces * 3u;
+    out.vertices = (float *) malloc(vertex_count * sizeof(float));
+    out.faces = (int32_t *) malloc(face_count * sizeof(int32_t));
+    if (src->has_uvs && src->uvs != NULL) {
+        if ((uint64_t) src->n_vertices > (uint64_t) SIZE_MAX / (2u * sizeof(float))) {
+            mesh_free(&out);
+            return 0;
+        }
+        out.uvs = (float *) malloc((size_t) src->n_vertices * 2u * sizeof(float));
+    }
+    if (out.vertices == NULL || out.faces == NULL || (src->has_uvs && src->uvs != NULL && out.uvs == NULL)) {
+        mesh_free(&out);
+        return 0;
+    }
+    memcpy(out.vertices, src->vertices, vertex_count * sizeof(float));
+    memcpy(out.faces, src->faces, face_count * sizeof(int32_t));
+    if (out.uvs != NULL) {
+        memcpy(out.uvs, src->uvs, (size_t) src->n_vertices * 2u * sizeof(float));
+        out.has_uvs = 1;
+    }
+    out.n_vertices = src->n_vertices;
+    out.n_faces = src->n_faces;
+    out.vertex_capacity = src->n_vertices;
+    out.face_capacity = src->n_faces;
+    *dst = out;
+    return 1;
 }
 
 static int mesh_reserve_vertices(vkmesh_mesh * mesh, int64_t need) {
@@ -6426,6 +6469,7 @@ cleanup:
 static int vkmesh_trellis_postprocess_device_inner(
     vkmesh_mesh * mesh,
     const char * projection_output,
+    vkmesh_mesh * projection_mesh_out,
     int decimation_target,
     float max_hole_perimeter,
     float degenerate_abs,
@@ -6449,6 +6493,8 @@ static int vkmesh_trellis_postprocess_device_inner(
 
     vkmesh_device_mesh dm;
     memset(&dm, 0, sizeof(dm));
+    vkmesh_mesh projection_candidate;
+    memset(&projection_candidate, 0, sizeof(projection_candidate));
     int ok = 0;
     if (!vkmesh_device_mesh_upload(vk, mesh, &dm)) goto cleanup;
 
@@ -6470,21 +6516,19 @@ static int vkmesh_trellis_postprocess_device_inner(
         added_faces,
         before_f,
         dm.n_faces);
-    if (projection_output != NULL && projection_output[0] != '\0') {
-        vkmesh_mesh projection_mesh;
-        memset(&projection_mesh, 0, sizeof(projection_mesh));
-        if (!vkmesh_device_mesh_download(&dm, &projection_mesh)) {
-            mesh_free(&projection_mesh);
+    if ((projection_output != NULL && projection_output[0] != '\0') || projection_mesh_out != NULL) {
+        if (!vkmesh_device_mesh_download(&dm, &projection_candidate)) {
             goto cleanup;
         }
-        int wrote_projection = write_meshbin(projection_output, &projection_mesh);
-        fprintf(stderr,
-            "vkmesh: trellis.pre projection_mesh_output %s vertices=%" PRId64 " faces=%" PRId64 "\n",
-            projection_output,
-            projection_mesh.n_vertices,
-            projection_mesh.n_faces);
-        mesh_free(&projection_mesh);
-        if (!wrote_projection) goto cleanup;
+        if (projection_output != NULL && projection_output[0] != '\0') {
+            int wrote_projection = write_meshbin(projection_output, &projection_candidate);
+            fprintf(stderr,
+                "vkmesh: trellis.pre projection_mesh_output %s vertices=%" PRId64 " faces=%" PRId64 "\n",
+                projection_output,
+                projection_candidate.n_vertices,
+                projection_candidate.n_faces);
+            if (!wrote_projection) goto cleanup;
+        }
     }
 
     int64_t first_target = (int64_t) decimation_target * 3;
@@ -6570,10 +6614,15 @@ static int vkmesh_trellis_postprocess_device_inner(
     vkmesh_log_trellis_cleanup_stats("trellis.pass2", run_degenerate_cleanup, 1, "trellis.final", &pass2_stats);
 
     if (!vkmesh_device_mesh_download(&dm, mesh)) goto cleanup;
+    if (projection_mesh_out != NULL && projection_candidate.vertices != NULL) {
+        *projection_mesh_out = projection_candidate;
+        memset(&projection_candidate, 0, sizeof(projection_candidate));
+    }
     fprintf(stderr, "vkmesh: trellis_postprocess done vertices=%" PRId64 " faces=%" PRId64 "\n", mesh->n_vertices, mesh->n_faces);
     ok = 1;
 
 cleanup:
+    mesh_free(&projection_candidate);
     vkmesh_device_mesh_destroy(&dm);
     if (owns_vk) vkmesh_vk_destroy(vk);
     return ok;
@@ -6627,6 +6676,7 @@ static int vkmesh_log_simplify(
 static int vkmesh_trellis_postprocess_inner(
     vkmesh_mesh * mesh,
     const char * projection_output,
+    vkmesh_mesh * projection_mesh_out,
     int decimation_target,
     float max_hole_perimeter,
     float degenerate_abs,
@@ -6640,6 +6690,7 @@ static int vkmesh_trellis_postprocess_inner(
     if (vkmesh_trellis_postprocess_device_inner(
             mesh,
             projection_output,
+            projection_mesh_out,
             decimation_target,
             max_hole_perimeter,
             degenerate_abs,
@@ -6661,13 +6712,16 @@ static int vkmesh_trellis_postprocess_inner(
         min_component_area);
 
     if (!vkmesh_log_fill_holes(mesh, max_hole_perimeter, "trellis.pre")) return 0;
-    if (projection_output != NULL && projection_output[0] != '\0') {
-        if (!write_meshbin(projection_output, mesh)) return 0;
-        fprintf(stderr,
-            "vkmesh: trellis.pre projection_mesh_output %s vertices=%" PRId64 " faces=%" PRId64 "\n",
-            projection_output,
-            mesh->n_vertices,
-            mesh->n_faces);
+    if ((projection_output != NULL && projection_output[0] != '\0') || projection_mesh_out != NULL) {
+        if (projection_output != NULL && projection_output[0] != '\0') {
+            if (!write_meshbin(projection_output, mesh)) return 0;
+            fprintf(stderr,
+                "vkmesh: trellis.pre projection_mesh_output %s vertices=%" PRId64 " faces=%" PRId64 "\n",
+                projection_output,
+                mesh->n_vertices,
+                mesh->n_faces);
+        }
+        if (projection_mesh_out != NULL && !mesh_clone(mesh, projection_mesh_out)) return 0;
     }
 
     int64_t first_target = (int64_t) decimation_target * 3;
@@ -6761,6 +6815,7 @@ static int vkmesh_trellis_postprocess_inner(
 static int vkmesh_trellis_postprocess(
     vkmesh_mesh * mesh,
     const char * projection_output,
+    vkmesh_mesh * projection_mesh_out,
     int decimation_target,
     float max_hole_perimeter,
     float degenerate_abs,
@@ -6775,6 +6830,7 @@ static int vkmesh_trellis_postprocess(
         return vkmesh_trellis_postprocess_inner(
             mesh,
             projection_output,
+            projection_mesh_out,
             decimation_target,
             max_hole_perimeter,
             degenerate_abs,
@@ -6797,6 +6853,7 @@ static int vkmesh_trellis_postprocess(
     int ok = vkmesh_trellis_postprocess_inner(
         mesh,
         projection_output,
+        projection_mesh_out,
         decimation_target,
         max_hole_perimeter,
         degenerate_abs,
@@ -6976,6 +7033,7 @@ int main(int argc, char ** argv) {
         if (!vkmesh_trellis_postprocess(
                 &mesh,
                 projection_output,
+                NULL,
                 decimation_target,
                 max_hole_perimeter,
                 degenerate_abs,

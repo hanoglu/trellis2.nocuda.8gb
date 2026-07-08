@@ -1,0 +1,18 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "sparse_common.inc"
+
+void main() {
+    uint block = gl_GlobalInvocationID.x;
+    if (block >= p.total) return;
+    uint code = uint(i0[block]);
+    uint out_pos = uint(i1[block]);
+    for (uint v = 0u; v < KERNEL_VOLUME; ++v) {
+        if ((code & (1u << v)) != 0u) {
+            i2[out_pos] = int(v);
+            ++out_pos;
+        }
+    }
+}

@@ -1,0 +1,30 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "sparse_common.inc"
+
+shared int scan_block_values[128];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint block = gl_WorkGroupID.x;
+    uint start = block * SCAN_BLOCK_SIZE;
+    uint idx = start + lid;
+    int value = idx < p.n ? i0[idx] : 0;
+    scan_block_values[lid] = value;
+    barrier();
+    for (uint stride = 1u; stride < SCAN_BLOCK_SIZE; stride <<= 1u) {
+        int add = lid >= stride ? scan_block_values[lid - stride] : 0;
+        barrier();
+        scan_block_values[lid] += add;
+        barrier();
+    }
+    if (idx < p.n) {
+        i1[idx] = scan_block_values[lid];
+    }
+    uint valid = p.n > start ? min(SCAN_BLOCK_SIZE, p.n - start) : 0u;
+    if (valid != 0u && lid == valid - 1u) {
+        i2[block] = scan_block_values[lid];
+    }
+}

@@ -1,0 +1,26 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "sparse_common.inc"
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.total) return;
+    uint j = p.table_mask;
+    uint k = p.flags;
+    uint ixj = idx ^ j;
+    if (ixj <= idx || ixj >= p.total) return;
+
+    uint key_a = u0[idx];
+    uint key_b = u0[ixj];
+    int idx_a = i1[idx];
+    int idx_b = i1[ixj];
+    bool ascending = (idx & k) == 0u;
+    if (sort_pair_should_swap(key_a, idx_a, key_b, idx_b, ascending)) {
+        u0[idx] = key_b;
+        u0[ixj] = key_a;
+        i1[idx] = idx_b;
+        i1[ixj] = idx_a;
+    }
+}

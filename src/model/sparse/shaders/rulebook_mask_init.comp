@@ -1,0 +1,25 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "sparse_common.inc"
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.total) return;
+    if (idx < p.n) {
+        uint gray = 0u;
+        for (uint v = 0u; v < KERNEL_VOLUME; ++v) {
+            if (i4[idx * KERNEL_VOLUME + v] >= 0) {
+                gray |= 1u << v;
+            }
+        }
+        i2[idx] = int(gray);
+        u0[idx] = gray_to_binary(gray);
+        i1[idx] = int(idx);
+    } else {
+        i2[idx] = 0;
+        u0[idx] = 0xffffffffu;
+        i1[idx] = int(idx);
+    }
+}

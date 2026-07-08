@@ -1,0 +1,18 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "sparse_common.inc"
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= p.n) return;
+    int count = 0;
+    uint base = row * 8u;
+    for (uint s = 0u; s < 8u; ++s) {
+        if (f0[base + s] > 0.0) {
+            ++count;
+        }
+    }
+    i1[row] = count;
+}

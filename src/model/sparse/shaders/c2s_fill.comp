@@ -1,0 +1,37 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "sparse_common.inc"
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.total) return;
+    uint row = idx / 8u;
+    uint sub = idx - row * 8u;
+    uint base = row * 8u;
+    if (f0[base + sub] <= 0.0) return;
+    int local = 0;
+    int row_count = 0;
+    for (uint s = 0u; s < sub; ++s) {
+        if (f0[base + s] > 0.0) {
+            ++local;
+        }
+    }
+    for (uint s = 0u; s < 8u; ++s) {
+        if (f0[base + s] > 0.0) {
+            ++row_count;
+        }
+    }
+    uint pos = uint(i1[row] - row_count + local);
+    int b = i0[4u * row + 0u];
+    int x = i0[4u * row + 1u];
+    int y = i0[4u * row + 2u];
+    int z = i0[4u * row + 3u];
+    i2[4u * pos + 0u] = b;
+    i2[4u * pos + 1u] = x * 2 + int(sub & 1u);
+    i2[4u * pos + 2u] = y * 2 + int((sub >> 1u) & 1u);
+    i2[4u * pos + 3u] = z * 2 + int((sub >> 2u) & 1u);
+    i3[pos] = int(row);
+    i4[pos] = int(sub);
+}

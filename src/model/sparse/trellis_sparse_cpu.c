@@ -458,6 +458,7 @@ static const trellis_sparse_backend_ops g_cpu_ops = {
     cpu_c2s_gather,
     cpu_skip_repeat,
     NULL,
+    NULL,
 };
 
 trellis_status trellis_sparse_cpu_backend_create(trellis_sparse_backend ** out) {

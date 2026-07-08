@@ -86,8 +86,11 @@ typedef struct sparse_neighbor_map_device {
     int32_t * offset_starts_dev;
     int32_t * offset_counts_host;
     int32_t * offset_starts_host;
+    int32_t * tile_valid_offsets;
+    int32_t * tile_valid_counts;
     int64_t n;
     int64_t total_pairs;
+    int fixed_rulebook;
     int k_volume;
     int kernel_d;
     int kernel_h;

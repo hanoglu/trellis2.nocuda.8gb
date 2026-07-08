@@ -1,0 +1,25 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "sparse_common.inc"
+
+void main() {
+    uint block = gl_GlobalInvocationID.x;
+    if (block >= p.total) return;
+    uint block_size = p.flags == 0u ? 16u : p.flags;
+    uint code = 0u;
+    uint start = block * block_size;
+    for (uint r = 0u; r < block_size; ++r) {
+        uint pos = start + r;
+        if (pos < p.n) {
+            uint row = uint(i0[pos]);
+            code |= uint(i1[row]);
+        }
+    }
+    i2[block] = int(code);
+    i3[block + 1u] = int(bitCount(code));
+    if (block == 0u) {
+        i3[0] = 0;
+    }
+}

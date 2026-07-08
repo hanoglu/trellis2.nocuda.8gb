@@ -1,0 +1,29 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "sparse_common.inc"
+
+void main() {
+    uint offset = gl_GlobalInvocationID.x;
+    if (offset >= 27u) return;
+    uint count = u0[offset];
+    uint row_tiles = (count + 15u) / 16u;
+    if (row_tiles == 0u) {
+        row_tiles = 1u;
+    }
+    uint max_y = p.table_mask;
+    if (max_y == 0u) {
+        max_y = row_tiles;
+    }
+    uint groups_y = row_tiles;
+    uint groups_z = 1u;
+    if (groups_y > max_y) {
+        groups_y = max_y;
+        groups_z = (row_tiles + max_y - 1u) / max_y;
+    }
+    uint groups_x = (p.in_channels + 15u) / 16u;
+    i2[3u * offset + 0u] = int(groups_x);
+    i2[3u * offset + 1u] = int(groups_y);
+    i2[3u * offset + 2u] = int(groups_z);
+}

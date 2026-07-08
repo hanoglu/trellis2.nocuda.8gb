@@ -1,0 +1,29 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "sparse_common.inc"
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.total) return;
+    uint row = idx / 27u;
+    uint offset = idx - row * 27u;
+    int b = i0[4u * row + 0u];
+    int x = i0[4u * row + 1u];
+    int y = i0[4u * row + 2u];
+    int z = i0[4u * row + 3u];
+    uint kd = offset / 9u;
+    uint rem = offset - kd * 9u;
+    uint kh = rem / 3u;
+    uint kw = rem - kh * 3u;
+    int src = find_coord_key(b, x + int(kd) - 1, y + int(kh) - 1, z + int(kw) - 1);
+    if (src < 0) return;
+    if ((p.flags & 1u) != 0u) {
+        i4[row * 27u + offset] = src;
+    }
+    uint pos = atomicAdd(u0[offset], 1u);
+    uint out_idx = offset * p.n + pos;
+    i2[out_idx] = src;
+    i3[out_idx] = int(row);
+}

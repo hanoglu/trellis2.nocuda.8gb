@@ -1,0 +1,56 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+#include "sparse_mat_common.inc"
+
+void main() {
+    uint oc = gl_GlobalInvocationID.x;
+    uint row_tile = gl_WorkGroupID.z * gl_NumWorkGroups.y + gl_WorkGroupID.y;
+    uint sorted_row = row_tile * 16u + gl_LocalInvocationID.y;
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint local_index = ly * 16u + lx;
+    uint dst_row = sorted_row < p.n ? u0[sorted_row] : 0u;
+    float acc = ((p.flags & 1u) != 0u && oc < p.out_channels) ? f2[oc] : 0.0;
+
+    uint seg_start = uint(i2[row_tile]);
+    uint seg_end = uint(i2[row_tile + 1u]);
+    for (uint valid_i = seg_start; valid_i < seg_end; ++valid_i) {
+        uint offset = uint(i1[valid_i]);
+        for (uint c0 = 0u; c0 < p.in_channels; c0 += TILE_K) {
+            for (uint load = local_index; load < 16u * TILE_K; load += 16u * 16u) {
+                uint r = load / TILE_K;
+                uint kc = load - r * TILE_K;
+                uint sorted_src_row = row_tile * 16u + r;
+                uint c = c0 + kc;
+                int src = -1;
+                if (sorted_src_row < p.n) {
+                    uint original_row = u0[sorted_src_row];
+                    src = i0[original_row * 27u + offset];
+                }
+                x_tile[r][kc] = (src >= 0 && c < p.in_channels) ?
+                    f0[uint(src) * p.in_channels + c] : 0.0;
+            }
+            for (uint load = local_index; load < 16u * TILE_K; load += 16u * 16u) {
+                uint o = load / TILE_K;
+                uint kc = load - o * TILE_K;
+                uint src_oc = gl_WorkGroupID.x * 16u + o;
+                uint c = c0 + kc;
+                w_tile[o][kc] = (src_oc < p.out_channels && c < p.in_channels) ?
+                    f1[(src_oc * 27u + offset) * p.in_channels + c] : 0.0;
+            }
+            barrier();
+            if (sorted_row < p.n && oc < p.out_channels) {
+                for (uint kc = 0u; kc < TILE_K; ++kc) {
+                    acc += x_tile[ly][kc] * w_tile[lx][kc];
+                }
+            }
+            barrier();
+        }
+    }
+
+    if (sorted_row < p.n && oc < p.out_channels) {
+        f3[dst_row * p.out_channels + oc] = acc;
+    }
+}

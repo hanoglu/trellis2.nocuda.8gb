@@ -8,6 +8,7 @@
 
 typedef struct trellis_sparse_buffer trellis_sparse_buffer;
 typedef struct trellis_sparse_rulebook trellis_sparse_rulebook;
+typedef struct trellis_sparse_c2s_device_map trellis_sparse_c2s_device_map;
 typedef struct trellis_sparse_backend trellis_sparse_backend;
 
 typedef struct trellis_sparse_backend_ops {
@@ -114,6 +115,61 @@ typedef struct trellis_sparse_backend_ops {
         int32_t ** parent_out,
         int32_t ** subidx_out,
         int64_t * n_out);
+
+    trellis_status (*alias_c2s_map)(
+        trellis_sparse_backend * backend,
+        const int32_t * coords_bxyz,
+        const int32_t * parent,
+        const int32_t * subidx,
+        int64_t n,
+        const int32_t * alias_coords_bxyz,
+        const int32_t * alias_parent,
+        const int32_t * alias_subidx);
+
+    trellis_status (*build_c2s_map_device)(
+        trellis_sparse_backend * backend,
+        const int32_t * coords_bxyz,
+        const trellis_sparse_c2s_device_map * coords_map,
+        const trellis_sparse_buffer * logits,
+        int64_t n,
+        trellis_sparse_c2s_device_map ** map_out,
+        int64_t * n_out);
+
+    trellis_status (*build_rulebook_for_c2s_map)(
+        trellis_sparse_backend * backend,
+        const trellis_sparse_c2s_device_map * map,
+        trellis_sparse_rulebook ** out);
+
+    trellis_status (*c2s_gather_device)(
+        trellis_sparse_backend * backend,
+        const trellis_sparse_buffer * x,
+        const trellis_sparse_c2s_device_map * map,
+        trellis_sparse_buffer * y,
+        int64_t n_out,
+        int out_channels);
+
+    trellis_status (*skip_repeat_device)(
+        trellis_sparse_backend * backend,
+        const trellis_sparse_buffer * x,
+        const trellis_sparse_c2s_device_map * map,
+        trellis_sparse_buffer * y,
+        int64_t n_out,
+        int in_channels,
+        int out_channels);
+
+    trellis_status (*download_c2s_coords)(
+        trellis_sparse_backend * backend,
+        const trellis_sparse_c2s_device_map * map,
+        int32_t * coords_out,
+        int64_t n);
+
+    trellis_status (*download_c2s_map)(
+        trellis_sparse_backend * backend,
+        const trellis_sparse_c2s_device_map * map,
+        int32_t * coords_out,
+        int32_t * parent_out,
+        int32_t * subidx_out,
+        int64_t n);
 } trellis_sparse_backend_ops;
 
 struct trellis_sparse_backend {

@@ -1,0 +1,28 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "sparse_common.inc"
+
+void main() {
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= p.n) return;
+    uint base = row * p.in_channels;
+    float mean = 0.0;
+    for (uint c = 0; c < p.in_channels; ++c) {
+        mean += f0[base + c];
+    }
+    mean /= float(p.in_channels);
+    float var = 0.0;
+    for (uint c = 0; c < p.in_channels; ++c) {
+        float d = f0[base + c] - mean;
+        var += d * d;
+    }
+    float inv_std = inversesqrt(var / float(p.in_channels) + p.eps);
+    for (uint c = 0; c < p.in_channels; ++c) {
+        float v = (f0[base + c] - mean) * inv_std;
+        if ((p.flags & 1u) != 0u) v *= f1[c];
+        if ((p.flags & 2u) != 0u) v += f2[c];
+        f3[base + c] = v;
+    }
+}

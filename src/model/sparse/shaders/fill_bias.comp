@@ -1,0 +1,12 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "sparse_common.inc"
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.total) return;
+    uint oc = idx % p.out_channels;
+    f3[idx] = (p.flags & 1u) != 0u ? f2[oc] : 0.0;
+}

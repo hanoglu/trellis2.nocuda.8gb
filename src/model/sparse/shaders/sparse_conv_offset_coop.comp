@@ -1,0 +1,54 @@
+#version 450
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#include "sparse_coop_common.inc"
+
+void main() {
+    const uint pair_tile = row_tile_id();
+    const uint pair_base = p.flags;
+    const uint offset = p.table_mask;
+    const uint pair_count = u0[offset];
+    if (pair_tile * BLOCK_M >= pair_count) {
+        return;
+    }
+
+    const uint subgroup = gl_SubgroupID;
+    const uint frag_r = subgroup >> 1u;
+    const uint frag_c = subgroup & 1u;
+    const uint a_off = frag_r * FRAG * TILE_K;
+    const uint b_off = frag_c * FRAG;
+    const uint c_off = frag_r * FRAG * BLOCK_N + frag_c * FRAG;
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    for (uint c0 = 0u; c0 < p.in_channels; c0 += TILE_K) {
+        load_a_from_src_rows(pair_base, pair_count, pair_tile, c0);
+        load_b_from_weight(offset, c0);
+        barrier();
+
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a_mat;
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b_mat;
+        coopMatLoad(a_mat, a_tile, a_off, TILE_K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(b_mat, b_tile, b_off, BLOCK_N, gl_CooperativeMatrixLayoutRowMajor);
+        acc = coopMatMulAdd(a_mat, b_mat, acc);
+        barrier();
+    }
+
+    coopMatStore(acc, c_tile, c_off, BLOCK_N, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    const uint lane = gl_LocalInvocationID.x;
+    const uint oc_base = gl_WorkGroupID.x * BLOCK_N;
+    for (uint load = lane; load < BLOCK_M * BLOCK_N; load += gl_WorkGroupSize.x) {
+        uint r = load / BLOCK_N;
+        uint n = load - r * BLOCK_N;
+        uint pair = pair_tile * BLOCK_M + r;
+        uint oc = oc_base + n;
+        if (pair < pair_count && oc < p.out_channels) {
+            uint dst = uint(i1[pair_base + pair]);
+            uint out_idx = dst * p.out_channels + oc;
+            f3[out_idx] = f3[out_idx] + c_tile[load];
+        }
+    }
+}

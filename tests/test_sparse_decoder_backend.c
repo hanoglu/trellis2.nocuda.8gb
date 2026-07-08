@@ -215,6 +215,101 @@ static int check_large_sample(
     return 1;
 }
 
+static int run_direct_sparse_conv_compare(trellis_sparse_backend_kind backend_kind) {
+    const int64_t n = 8;
+    const int in_channels = 3;
+    const int out_channels = 2;
+    const int32_t coords[] = {
+        0, 1, 1, 1,
+        0, 0, 1, 1,
+        0, 2, 1, 1,
+        0, 1, 0, 1,
+        0, 1, 2, 1,
+        0, 1, 1, 0,
+        0, 1, 1, 2,
+        0, 0, 0, 0,
+    };
+    float feats[8 * 3];
+    float conv_w[2 * 27 * 3];
+    float conv_b[2] = {0.125f, -0.075f};
+    for (int64_t r = 0; r < n; ++r) {
+        for (int c = 0; c < in_channels; ++c) {
+            feats[r * in_channels + c] = sinf((float) r * 0.31f + (float) c * 0.17f) + 0.05f * (float) (r - c);
+        }
+    }
+    for (int oc = 0; oc < out_channels; ++oc) {
+        for (int v = 0; v < 27; ++v) {
+            for (int ic = 0; ic < in_channels; ++ic) {
+                conv_w[(oc * 27 + v) * in_channels + ic] =
+                    0.01f * (float) ((oc + 1) * (ic + 2)) + 0.0025f * (float) (v - 13);
+            }
+        }
+    }
+
+    trellis_sparse_backend * cpu = NULL;
+    trellis_sparse_backend * backend = NULL;
+    trellis_sparse_buffer * cpu_x = NULL;
+    trellis_sparse_buffer * cpu_y = NULL;
+    trellis_sparse_buffer * x = NULL;
+    trellis_sparse_buffer * y = NULL;
+    trellis_sparse_rulebook * cpu_rulebook = NULL;
+    trellis_sparse_rulebook * rulebook = NULL;
+    float ref[8 * 2];
+    float got[8 * 2];
+    int ok = 1;
+
+    trellis_status status = trellis_sparse_cpu_backend_create(&cpu);
+    CHECK_TRUE(status == TRELLIS_STATUS_OK);
+    if (backend_kind == TRELLIS_SPARSE_BACKEND_VULKAN) {
+        status = trellis_sparse_vulkan_backend_create(0, &backend);
+    } else {
+        status = trellis_sparse_cpu_backend_create(&backend);
+    }
+    if (status == TRELLIS_STATUS_NOT_IMPLEMENTED || status == TRELLIS_STATUS_CUDA_UNAVAILABLE) {
+        trellis_sparse_backend_destroy(cpu);
+        fprintf(stderr, "sparse backend unavailable: %s\n", trellis_status_string(status));
+        return 77;
+    }
+    CHECK_TRUE(status == TRELLIS_STATUS_OK);
+
+    status = cpu->ops->upload_f32(cpu, feats, (size_t) n * in_channels, &cpu_x);
+    if (status == TRELLIS_STATUS_OK) status = cpu->ops->alloc_f32(cpu, (size_t) n * out_channels, &cpu_y);
+    if (status == TRELLIS_STATUS_OK) status = cpu->ops->build_rulebook(cpu, coords, n, &cpu_rulebook);
+    if (status == TRELLIS_STATUS_OK) status = cpu->ops->sparse_conv3d(cpu, cpu_rulebook, cpu_x, conv_w, conv_b, cpu_y, n, in_channels, out_channels);
+    if (status == TRELLIS_STATUS_OK) status = cpu->ops->download_f32(cpu, cpu_y, ref, (size_t) n * out_channels);
+    CHECK_TRUE(status == TRELLIS_STATUS_OK);
+
+    status = backend->ops->upload_f32(backend, feats, (size_t) n * in_channels, &x);
+    if (status == TRELLIS_STATUS_OK) status = backend->ops->alloc_f32(backend, (size_t) n * out_channels, &y);
+    if (status == TRELLIS_STATUS_OK) status = backend->ops->build_rulebook(backend, coords, n, &rulebook);
+    if (status == TRELLIS_STATUS_OK) status = backend->ops->sparse_conv3d(backend, rulebook, x, conv_w, conv_b, y, n, in_channels, out_channels);
+    if (status == TRELLIS_STATUS_OK) status = backend->ops->download_f32(backend, y, got, (size_t) n * out_channels);
+    CHECK_TRUE(status == TRELLIS_STATUS_OK);
+
+    for (int64_t i = 0; i < n * out_channels; ++i) {
+        if (!check_close(got[i], ref[i], 2e-4f, "direct_sparse_conv", (int) i)) {
+            ok = 0;
+            break;
+        }
+    }
+
+    if (cpu != NULL && cpu->ops != NULL) {
+        cpu->ops->free_rulebook(cpu, cpu_rulebook);
+        cpu->ops->free_buffer(cpu, cpu_y);
+        cpu->ops->free_buffer(cpu, cpu_x);
+    }
+    if (backend != NULL && backend->ops != NULL) {
+        backend->ops->free_rulebook(backend, rulebook);
+        backend->ops->free_buffer(backend, y);
+        backend->ops->free_buffer(backend, x);
+    }
+    trellis_sparse_backend_destroy(cpu);
+    trellis_sparse_backend_destroy(backend);
+    CHECK_TRUE(ok);
+    printf("direct sparse conv compare passed\n");
+    return 1;
+}
+
 static int run_large_vulkan_dispatch_tests(void) {
     enum {
         DIM_X = 102,
@@ -405,6 +500,17 @@ int main(int argc, char ** argv) {
     }
     for (int64_t i = 0; i < ref_guides.levels[0].n_coords * 4; ++i) {
         CHECK_TRUE(got_guides.levels[0].coords_bxyz[i] == ref_guides.levels[0].coords_bxyz[i]);
+    }
+
+    int direct_ok = run_direct_sparse_conv_compare(backend);
+    if (direct_ok != 1) {
+        free(ref_coords);
+        free(ref_feats);
+        free(got_coords);
+        free(got_feats);
+        trellis_sparse_c2s_guides_free(&ref_guides);
+        trellis_sparse_c2s_guides_free(&got_guides);
+        return direct_ok;
     }
 
     if (backend == TRELLIS_SPARSE_BACKEND_VULKAN) {
