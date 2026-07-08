@@ -60,6 +60,11 @@ set(GGML_NATIVE OFF CACHE BOOL "Avoid host-specific codegen in the embedded ggml
 set(GGML_FATAL_WARNINGS OFF CACHE BOOL "" FORCE)
 message(STATUS "TRELLIS2_C_ENABLE_TENSOR_CORES=${TRELLIS2_C_ENABLE_TENSOR_CORES}")
 
+set(TRELLIS2_C_HAS_VKMESH_C_API OFF)
+if (TRELLIS2_C_BUILD_TOOLS AND TRELLIS2_C_BACKEND STREQUAL "vulkan")
+    set(TRELLIS2_C_HAS_VKMESH_C_API ON)
+endif()
+
 set(TRELLIS2_C_HAS_GLTF_VULKAN_BAKE OFF)
 if (TRELLIS2_C_ENABLE_GLTF_VULKAN_BAKE)
     set(TRELLIS2_C_HAS_GLTF_VULKAN_BAKE ON)
@@ -111,6 +116,12 @@ set(TRELLIS2_C_SOURCES
     src/model/sparse/trellis_sparse_cpu.c
     src/io/trellis_weights.c
 )
+
+if (NOT TRELLIS2_C_HAS_VKMESH_C_API)
+    list(APPEND TRELLIS2_C_SOURCES
+        src/mesh/trellis_vkmesh_stubs.c
+    )
+endif()
 
 if (TRELLIS2_C_BACKEND STREQUAL "cuda")
     list(APPEND TRELLIS2_C_SOURCES
@@ -395,11 +406,17 @@ if (TRELLIS2_C_HAS_GLTF_VULKAN_BAKE)
 else()
     set(TRELLIS_HAS_GLTF_VULKAN_BAKE_VALUE 0)
 endif()
+if (TRELLIS2_C_HAS_VKMESH_C_API)
+    set(TRELLIS_HAS_VKMESH_C_API_VALUE 1)
+else()
+    set(TRELLIS_HAS_VKMESH_C_API_VALUE 0)
+endif()
 target_compile_definitions(trellis2_c PUBLIC
     TRELLIS_DEFAULT_BACKEND="${TRELLIS2_C_BACKEND}"
     TRELLIS_DEFAULT_GGML_BACKEND="${TRELLIS2_C_BACKEND}"
     TRELLIS_HAS_CUDA_DECODER=${TRELLIS_HAS_CUDA_DECODER_VALUE}
     TRELLIS_HAS_GLTF_VULKAN_BAKE=${TRELLIS_HAS_GLTF_VULKAN_BAKE_VALUE}
+    TRELLIS_HAS_VKMESH_C_API=${TRELLIS_HAS_VKMESH_C_API_VALUE}
 )
 if (GGML_CUDA)
     target_compile_definitions(trellis2_c PUBLIC GGML_USE_CUDA)
@@ -575,6 +592,19 @@ if (TRELLIS2_C_BUILD_TOOLS)
         add_vkmesh_shader(vkmesh_write_hole_faces ${VKMESH_SHADER_DIR}/vkmesh_write_hole_faces.comp vkmesh_write_hole_faces_spv)
         add_vkmesh_shader(vkmesh_unsigned_distance ${VKMESH_SHADER_DIR}/vkmesh_unsigned_distance.comp vkmesh_unsigned_distance_spv)
         add_custom_target(vkmesh_shader DEPENDS ${VKMESH_SHADER_HEADERS})
+        if (TRELLIS2_C_HAS_VKMESH_C_API)
+            add_library(trellis_vkmesh_api OBJECT tools/vkmesh/vkmesh.c)
+            target_compile_definitions(trellis_vkmesh_api PRIVATE TRELLIS_VKMESH_LIBRARY)
+            target_include_directories(trellis_vkmesh_api PRIVATE
+                "${CMAKE_CURRENT_LIST_DIR}/include"
+                "${CMAKE_CURRENT_BINARY_DIR}/generated"
+                "${CMAKE_CURRENT_LIST_DIR}/3rd/ggml/include"
+                "${CMAKE_CURRENT_LIST_DIR}/3rd/xatlas/source/xatlas")
+            set_target_properties(trellis_vkmesh_api PROPERTIES POSITION_INDEPENDENT_CODE ON)
+            add_dependencies(trellis_vkmesh_api vkmesh_shader)
+            target_sources(trellis2_c PRIVATE $<TARGET_OBJECTS:trellis_vkmesh_api>)
+            add_dependencies(trellis2_c trellis_vkmesh_api)
+        endif()
         add_executable(vkmesh tools/vkmesh/vkmesh.c)
         add_dependencies(vkmesh vkmesh_shader)
         target_include_directories(vkmesh PRIVATE

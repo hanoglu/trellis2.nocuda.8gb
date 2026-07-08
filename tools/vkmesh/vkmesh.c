@@ -6869,6 +6869,147 @@ static int vkmesh_trellis_postprocess(
     return ok;
 }
 
+#ifdef TRELLIS_VKMESH_LIBRARY
+static trellis_status vkmesh_from_trellis_mesh(const trellis_mesh_host * src, vkmesh_mesh * dst) {
+    if (src == NULL || dst == NULL || src->vertices == NULL || src->faces == NULL ||
+        src->n_vertices <= 0 || src->n_faces <= 0 ||
+        src->n_vertices > INT32_MAX ||
+        (uint64_t) src->n_vertices > (uint64_t) SIZE_MAX / (3u * sizeof(float)) ||
+        (uint64_t) src->n_faces > (uint64_t) SIZE_MAX / (3u * sizeof(int32_t))) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+
+    vkmesh_mesh out;
+    memset(&out, 0, sizeof(out));
+    const size_t vertex_count = (size_t) src->n_vertices * 3u;
+    const size_t face_count = (size_t) src->n_faces * 3u;
+    out.vertices = (float *) malloc(vertex_count * sizeof(float));
+    out.faces = (int32_t *) malloc(face_count * sizeof(int32_t));
+    if (out.vertices == NULL || out.faces == NULL) {
+        mesh_free(&out);
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    memcpy(out.vertices, src->vertices, vertex_count * sizeof(float));
+    memcpy(out.faces, src->faces, face_count * sizeof(int32_t));
+    for (size_t i = 0; i < face_count; ++i) {
+        if (out.faces[i] < 0 || out.faces[i] >= src->n_vertices) {
+            mesh_free(&out);
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
+        }
+    }
+    out.n_vertices = src->n_vertices;
+    out.n_faces = src->n_faces;
+    out.vertex_capacity = src->n_vertices;
+    out.face_capacity = src->n_faces;
+    *dst = out;
+    return TRELLIS_STATUS_OK;
+}
+
+static trellis_status vkmesh_move_to_trellis_mesh(vkmesh_mesh * src, trellis_mesh_host * dst) {
+    if (src == NULL || dst == NULL || src->vertices == NULL || src->faces == NULL ||
+        src->n_vertices <= 0 || src->n_faces <= 0) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    memset(dst, 0, sizeof(*dst));
+    dst->vertices = src->vertices;
+    dst->faces = src->faces;
+    dst->n_vertices = src->n_vertices;
+    dst->n_faces = src->n_faces;
+    free(src->uvs);
+    memset(src, 0, sizeof(*src));
+    return TRELLIS_STATUS_OK;
+}
+
+trellis_status trellis_vkmesh_postprocess(
+    const trellis_mesh_host * mesh,
+    trellis_mesh_host * mesh_out,
+    trellis_mesh_host * projection_mesh_out,
+    const trellis_vkmesh_postprocess_options * options) {
+    if (mesh == NULL || mesh_out == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    memset(mesh_out, 0, sizeof(*mesh_out));
+    if (projection_mesh_out != NULL) {
+        memset(projection_mesh_out, 0, sizeof(*projection_mesh_out));
+    }
+
+    vkmesh_mesh work;
+    vkmesh_mesh projection;
+    memset(&work, 0, sizeof(work));
+    memset(&projection, 0, sizeof(projection));
+    trellis_status status = vkmesh_from_trellis_mesh(mesh, &work);
+    if (status != TRELLIS_STATUS_OK) {
+        return status;
+    }
+
+    const int no_simplify = options != NULL && options->no_simplify;
+    int decimation_target = options != NULL ? options->decimation_target : 0;
+    if (no_simplify) {
+        decimation_target = INT_MAX;
+    } else if (decimation_target <= 0) {
+        decimation_target = 1000000;
+    }
+
+    const float max_hole_perimeter =
+        options != NULL && options->max_hole_perimeter > 0.0f ? options->max_hole_perimeter : 3e-2f;
+    const float degenerate_abs =
+        options != NULL && options->degenerate_abs > 0.0f ? options->degenerate_abs : 1e-24f;
+    const float degenerate_rel =
+        options != NULL && options->degenerate_rel > 0.0f ? options->degenerate_rel : 1e-12f;
+    const float min_component_area =
+        options != NULL && options->min_component_area > 0.0f ? options->min_component_area : 1e-5f;
+    const float lambda_edge_length =
+        options != NULL && options->lambda_edge_length > 0.0f ? options->lambda_edge_length : 1e-2f;
+    const float lambda_skinny =
+        options != NULL && options->lambda_skinny > 0.0f ? options->lambda_skinny : 1e-3f;
+    const float simplify_threshold =
+        options != NULL && options->simplify_threshold > 0.0f ? options->simplify_threshold : 1e-8f;
+    const int simplify_steps = options != NULL ? options->simplify_steps : 0;
+    const int run_degenerate_cleanup = options != NULL && options->run_degenerate_cleanup;
+
+    if (!vkmesh_trellis_postprocess(
+            &work,
+            NULL,
+            projection_mesh_out != NULL ? &projection : NULL,
+            decimation_target,
+            max_hole_perimeter,
+            degenerate_abs,
+            degenerate_rel,
+            min_component_area,
+            lambda_edge_length,
+            lambda_skinny,
+            simplify_threshold,
+            simplify_steps,
+            run_degenerate_cleanup)) {
+        status = TRELLIS_STATUS_ERROR;
+        goto cleanup;
+    }
+
+    status = vkmesh_move_to_trellis_mesh(&work, mesh_out);
+    if (status != TRELLIS_STATUS_OK) {
+        goto cleanup;
+    }
+    if (projection_mesh_out != NULL && projection.vertices != NULL) {
+        status = vkmesh_move_to_trellis_mesh(&projection, projection_mesh_out);
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
+    }
+
+cleanup:
+    if (status != TRELLIS_STATUS_OK) {
+        trellis_mesh_free(mesh_out);
+        if (projection_mesh_out != NULL) {
+            trellis_mesh_free(projection_mesh_out);
+        }
+    }
+    mesh_free(&projection);
+    mesh_free(&work);
+    return status;
+}
+#endif
+
+#ifndef TRELLIS_VKMESH_LIBRARY
 static void print_usage(const char * argv0) {
     fprintf(stderr,
         "usage: %s --input in.meshbin --output out.meshbin [options]\n"
@@ -7127,3 +7268,4 @@ int main(int argc, char ** argv) {
     mesh_free(&mesh);
     return 0;
 }
+#endif

@@ -1095,6 +1095,60 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
         mesh->n_vertices <= 0 || mesh->n_faces <= 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
+    if (projection_mesh_out != NULL) {
+        memset(projection_mesh_out, 0, sizeof(*projection_mesh_out));
+    }
+
+#if TRELLIS_HAS_VKMESH_C_API
+    (void) vkmesh_path;
+    trellis_vkmesh_postprocess_options vkmesh_options;
+    memset(&vkmesh_options, 0, sizeof(vkmesh_options));
+    vkmesh_options.decimation_target = decimation_target > 0 ? decimation_target : 1000000;
+    vkmesh_options.no_simplify = no_simplify ? 1 : 0;
+
+    trellis_mesh_host processed;
+    trellis_mesh_host projection;
+    memset(&processed, 0, sizeof(processed));
+    memset(&projection, 0, sizeof(projection));
+
+    TRELLIS_INFO(
+        "mesh postprocess: running vkmesh C API target=%d no_simplify=%d input_faces=%lld",
+        vkmesh_options.decimation_target,
+        no_simplify ? 1 : 0,
+        (long long) mesh->n_faces);
+    trellis_status status = trellis_vkmesh_postprocess(
+        mesh,
+        &processed,
+        projection_mesh_out != NULL ? &projection : NULL,
+        &vkmesh_options);
+    if (status != TRELLIS_STATUS_OK) {
+        trellis_mesh_free(&processed);
+        trellis_mesh_free(&projection);
+        TRELLIS_ERROR("mesh postprocess: vkmesh C API failed: %s", trellis_status_string(status));
+        return status;
+    }
+    if (projection_mesh_out != NULL) {
+        *projection_mesh_out = projection;
+        memset(&projection, 0, sizeof(projection));
+        TRELLIS_INFO(
+            "mesh postprocess: loaded projection source vertices=%lld faces=%lld",
+            (long long) projection_mesh_out->n_vertices,
+            (long long) projection_mesh_out->n_faces);
+    }
+
+    int64_t old_vertices = mesh->n_vertices;
+    int64_t old_faces = mesh->n_faces;
+    trellis_mesh_free(mesh);
+    *mesh = processed;
+    TRELLIS_INFO(
+        "mesh postprocess: done vertices=%lld->%lld faces=%lld->%lld",
+        (long long) old_vertices,
+        (long long) mesh->n_vertices,
+        (long long) old_faces,
+        (long long) mesh->n_faces);
+    trellis_mesh_free(&projection);
+    return TRELLIS_STATUS_OK;
+#else
     char input_mesh[4096];
     char output_mesh[4096];
     char projection_mesh[4096];
@@ -1106,10 +1160,6 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
         n2 < 0 || (size_t) n2 >= sizeof(projection_mesh)) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
-    if (projection_mesh_out != NULL) {
-        memset(projection_mesh_out, 0, sizeof(*projection_mesh_out));
-    }
-
     trellis_status status = trellis_pipeline_write_meshbin(input_mesh, mesh);
     if (status != TRELLIS_STATUS_OK) {
         unlink_if_set(input_mesh);
@@ -1169,6 +1219,7 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
         (long long) old_faces,
         (long long) mesh->n_faces);
     return TRELLIS_STATUS_OK;
+#endif
 }
 
 trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_options * options) {
