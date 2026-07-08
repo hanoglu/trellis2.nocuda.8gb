@@ -18,7 +18,7 @@ static void usage(const char * argv0) {
         "  %s --model TRELLIS.2-4B --validate-shape-decoder\n"
         "  %s --timesteps 12 --rescale-t 3.0\n"
         "  %s --model TRELLIS.2-4B --shape-flow-512 --coords-i32 coords.i32 --input-cond-f32 cond.f32 --noise-seed 18 --out DIR\n"
-        "  %s --model TRELLIS.2-4B --shape-decode --coords-i32 shape_coords.i32 --input-slat-f32 shape_final_latent.f32 --obj mesh.obj --out DIR\n"
+        "  %s --model TRELLIS.2-4B --shape-decode --coords-i32 shape_coords.i32 --input-slat-f32 shape_final_latent.f32 --out DIR\n"
         "\n"
         "Options:\n"
         "  --model DIR             TRELLIS.2 model directory containing ckpts/\n"
@@ -37,7 +37,6 @@ static void usage(const char * argv0) {
         "  --input-noise-f32 FILE  Initial sparse latent feats [N,32]\n"
         "  --noise-seed N          Generate initial sparse latent feats when --input-noise-f32 is omitted\n"
         "  --input-slat-f32 FILE   Denormalized shape SLat feats [N,32] for --shape-decode\n"
-        "  --obj FILE              Write OBJ mesh from --shape-decode output\n"
         "  --out DIR               Output tensor dump directory, default benchmark_outputs/c_shape_flow\n"
         "  --steps N               Euler steps, default 12\n"
         "  --rescale-t X           Timestep rescale factor, default 3.0\n"
@@ -404,34 +403,6 @@ static int write_manifest_line(FILE * f, const char * name, const char * shape, 
         return 0;
     }
     return fprintf(f, "%s\t%s\t%s\n", name, shape, file) > 0;
-}
-
-static int write_obj_file(const char * path, const trellis_mesh_host * mesh) {
-    if (path == NULL || mesh == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
-        mesh->n_vertices <= 0 || mesh->n_faces <= 0) {
-        return 0;
-    }
-    FILE * f = fopen(path, "w");
-    if (f == NULL) {
-        fprintf(stderr, "obj: failed to open %s\n", path);
-        return 0;
-    }
-    fprintf(f, "# trellis2.c mesh\n");
-    for (int64_t i = 0; i < mesh->n_vertices; ++i) {
-        const float * v = mesh->vertices + (size_t) i * 3u;
-        if (fprintf(f, "v %.9g %.9g %.9g\n", v[0], v[1], v[2]) < 0) {
-            fclose(f);
-            return 0;
-        }
-    }
-    for (int64_t i = 0; i < mesh->n_faces; ++i) {
-        const int32_t * face = mesh->faces + (size_t) i * 3u;
-        if (fprintf(f, "f %d %d %d\n", face[0] + 1, face[1] + 1, face[2] + 1) < 0) {
-            fclose(f);
-            return 0;
-        }
-    }
-    return fclose(f) == 0;
 }
 
 static float lcg_uniform(uint32_t * state) {
@@ -973,9 +944,7 @@ static int run_shape_decode(
     const char * out_dir,
     int max_levels,
     int64_t max_input_tokens,
-    const char * dump_dir,
-    int mesh_resolution,
-    const char * obj_path) {
+    const char * dump_dir) {
     if (cuda == NULL || model_dir == NULL || coords_path == NULL || slat_path == NULL || out_dir == NULL) {
         return 1;
     }
@@ -1082,32 +1051,6 @@ static int run_shape_decode(
         (long long) n_out,
         channels_out,
         out_dir);
-    if (obj_path != NULL && obj_path[0] != '\0') {
-        trellis_mesh_host mesh;
-        memset(&mesh, 0, sizeof(mesh));
-        status = trellis_flexible_dual_grid_mesh_from_decoder_logits_host(
-            out_coords,
-            out_feats,
-            n_out,
-            channels_out,
-            mesh_resolution,
-            &mesh);
-        if (status != TRELLIS_STATUS_OK) {
-            fprintf(stderr, "shape decoder: mesh extraction failed: %s\n", trellis_status_string(status));
-            trellis_mesh_free(&mesh);
-            goto cleanup;
-        }
-        if (!write_obj_file(obj_path, &mesh)) {
-            fprintf(stderr, "shape decoder: failed to write OBJ %s\n", obj_path);
-            trellis_mesh_free(&mesh);
-            goto cleanup;
-        }
-        printf("shape decoder: wrote OBJ %s (%lld vertices, %lld faces)\n",
-            obj_path,
-            (long long) mesh.n_vertices,
-            (long long) mesh.n_faces);
-        trellis_mesh_free(&mesh);
-    }
     rc = 0;
 
 cleanup:
@@ -1131,7 +1074,6 @@ int main(int argc, char ** argv) {
     const char * neg_cond_path = NULL;
     const char * noise_path = NULL;
     const char * slat_path = NULL;
-    const char * obj_path = NULL;
     const char * out_dir = "benchmark_outputs/c_shape_flow";
     const char * decode_dump_dir = NULL;
     int validate = 0;
@@ -1204,8 +1146,6 @@ int main(int argc, char ** argv) {
             use_noise_seed = 1;
         } else if (strcmp(argv[i], "--input-slat-f32") == 0) {
             slat_path = arg_value(argc, argv, &i);
-        } else if (strcmp(argv[i], "--obj") == 0) {
-            obj_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--out") == 0) {
             out_dir = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--steps") == 0) {
@@ -1419,9 +1359,7 @@ int main(int argc, char ** argv) {
             out_dir,
             decode_max_levels,
             decode_max_input_tokens,
-            decode_dump_dir,
-            resolution,
-            obj_path);
+            decode_dump_dir);
         trellis_cuda_free(&cuda);
         return rc;
     }

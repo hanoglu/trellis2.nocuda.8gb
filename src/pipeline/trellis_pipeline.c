@@ -560,233 +560,7 @@ cleanup:
     return status;
 }
 
-static float clamp01(float x) {
-    if (x < 0.0f) return 0.0f;
-    if (x > 1.0f) return 1.0f;
-    return x;
-}
-
-static uint64_t pbr_coord_key(int32_t x, int32_t y, int32_t z) {
-    return (((uint64_t) (uint32_t) x) << 42) ^
-        (((uint64_t) (uint32_t) y) << 21) ^
-        ((uint64_t) (uint32_t) z);
-}
-
-static uint64_t hash_u64(uint64_t x) {
-    x ^= x >> 33;
-    x *= 0xff51afd7ed558ccdULL;
-    x ^= x >> 33;
-    x *= 0xc4ceb9fe1a85ec53ULL;
-    x ^= x >> 33;
-    return x;
-}
-
-static int next_pow2_size(size_t n, size_t * out) {
-    size_t v = 1;
-    while (v < n) {
-        if (v > SIZE_MAX / 2u) {
-            return 0;
-        }
-        v *= 2u;
-    }
-    *out = v;
-    return 1;
-}
-
-static int32_t pbr_hash_lookup(
-    const uint64_t * keys,
-    const int32_t * values,
-    size_t table_size,
-    int32_t x,
-    int32_t y,
-    int32_t z) {
-    uint64_t key = pbr_coord_key(x, y, z);
-    if (key == 0) {
-        key = 1;
-    }
-    size_t slot = (size_t) hash_u64(key) & (table_size - 1u);
-    while (values[slot] >= 0) {
-        if (keys[slot] == key) {
-            return values[slot];
-        }
-        slot = (slot + 1u) & (table_size - 1u);
-    }
-    return -1;
-}
-
-static int pbr_sample_color_trilinear(
-    const trellis_pbr_voxels * voxels,
-    const uint64_t * keys,
-    const int32_t * values,
-    size_t table_size,
-    const float vertex[3],
-    float color[3]) {
-    const int resolution = voxels->resolution > 0 ? voxels->resolution : 512;
-    const float qx = (vertex[0] + 0.5f) * (float) resolution;
-    const float qy = (vertex[1] + 0.5f) * (float) resolution;
-    const float qz = (vertex[2] + 0.5f) * (float) resolution;
-    const int32_t bx = (int32_t) floorf(qx - 0.5f);
-    const int32_t by = (int32_t) floorf(qy - 0.5f);
-    const int32_t bz = (int32_t) floorf(qz - 0.5f);
-
-    float acc[3] = {0.0f, 0.0f, 0.0f};
-    float weight_sum = 0.0f;
-    for (int dz = 0; dz < 2; ++dz) {
-        for (int dy = 0; dy < 2; ++dy) {
-            for (int dx = 0; dx < 2; ++dx) {
-                const int32_t x = bx + dx;
-                const int32_t y = by + dy;
-                const int32_t z = bz + dz;
-                if (x < 0 || y < 0 || z < 0 ||
-                    x >= resolution || y >= resolution || z >= resolution) {
-                    continue;
-                }
-                const float wx = 1.0f - fabsf(qx - (float) x - 0.5f);
-                const float wy = 1.0f - fabsf(qy - (float) y - 0.5f);
-                const float wz = 1.0f - fabsf(qz - (float) z - 0.5f);
-                const float w = wx * wy * wz;
-                if (w <= 0.0f) {
-                    continue;
-                }
-                const int32_t idx = pbr_hash_lookup(keys, values, table_size, x, y, z);
-                if (idx < 0) {
-                    continue;
-                }
-                const float * src = voxels->attrs + (size_t) idx * (size_t) voxels->channels;
-                acc[0] += w * clamp01(src[0]);
-                acc[1] += w * clamp01(src[1]);
-                acc[2] += w * clamp01(src[2]);
-                weight_sum += w;
-            }
-        }
-    }
-    if (weight_sum > 1e-8f) {
-        color[0] = acc[0] / weight_sum;
-        color[1] = acc[1] / weight_sum;
-        color[2] = acc[2] / weight_sum;
-        return 1;
-    }
-
-    const int32_t cx = (int32_t) floorf(qx);
-    const int32_t cy = (int32_t) floorf(qy);
-    const int32_t cz = (int32_t) floorf(qz);
-    int32_t best = -1;
-    for (int radius = 0; best < 0 && radius <= 2; ++radius) {
-        for (int dz = -radius; best < 0 && dz <= radius; ++dz) {
-            for (int dy = -radius; best < 0 && dy <= radius; ++dy) {
-                for (int dx = -radius; dx <= radius; ++dx) {
-                    if (radius > 0 &&
-                        abs(dx) != radius && abs(dy) != radius && abs(dz) != radius) {
-                        continue;
-                    }
-                    const int32_t x = cx + dx;
-                    const int32_t y = cy + dy;
-                    const int32_t z = cz + dz;
-                    if (x < 0 || y < 0 || z < 0 ||
-                        x >= resolution || y >= resolution || z >= resolution) {
-                        continue;
-                    }
-                    best = pbr_hash_lookup(keys, values, table_size, x, y, z);
-                }
-            }
-        }
-    }
-    if (best >= 0) {
-        const float * src = voxels->attrs + (size_t) best * (size_t) voxels->channels;
-        color[0] = clamp01(src[0]);
-        color[1] = clamp01(src[1]);
-        color[2] = clamp01(src[2]);
-        return 1;
-    }
-    color[0] = 0.8f;
-    color[1] = 0.8f;
-    color[2] = 0.8f;
-    return 0;
-}
-
-trellis_status trellis_pipeline_apply_pbr_voxels_to_mesh(
-    const trellis_pbr_voxels * voxels,
-    trellis_mesh_host * mesh) {
-    if (voxels == NULL || mesh == NULL || voxels->coords_bxyz == NULL ||
-        voxels->attrs == NULL || voxels->n_coords <= 0 || voxels->channels < 3 ||
-        mesh->vertices == NULL || mesh->n_vertices <= 0) {
-        return TRELLIS_STATUS_INVALID_ARGUMENT;
-    }
-
-    size_t table_size = 0;
-    if (!next_pow2_size((size_t) voxels->n_coords * 4u, &table_size)) {
-        return TRELLIS_STATUS_OUT_OF_MEMORY;
-    }
-    uint64_t * keys = (uint64_t *) calloc(table_size, sizeof(uint64_t));
-    int32_t * values = (int32_t *) malloc(table_size * sizeof(int32_t));
-    if (keys == NULL || values == NULL) {
-        free(keys);
-        free(values);
-        return TRELLIS_STATUS_OUT_OF_MEMORY;
-    }
-    for (size_t i = 0; i < table_size; ++i) {
-        values[i] = -1;
-    }
-    for (int64_t i = 0; i < voxels->n_coords; ++i) {
-        const int32_t * c = voxels->coords_bxyz + (size_t) i * 4u;
-        uint64_t key = pbr_coord_key(c[1], c[2], c[3]);
-        if (key == 0) {
-            key = 1;
-        }
-        size_t slot = (size_t) hash_u64(key) & (table_size - 1u);
-        while (values[slot] >= 0 && keys[slot] != key) {
-            slot = (slot + 1u) & (table_size - 1u);
-        }
-        keys[slot] = key;
-        values[slot] = (int32_t) i;
-    }
-
-    float * colors = (float *) malloc((size_t) mesh->n_vertices * 3u * sizeof(float));
-    if (colors == NULL) {
-        free(keys);
-        free(values);
-        return TRELLIS_STATUS_OUT_OF_MEMORY;
-    }
-
-    const int progress_steps = mesh->n_vertices >= 100000 ? 20 : 0;
-    int progress_step = 1;
-    int64_t chunk_start_us = ggml_time_us();
-    int64_t misses = 0;
-    for (int64_t vi = 0; vi < mesh->n_vertices; ++vi) {
-        const float * v = mesh->vertices + (size_t) vi * 3u;
-        float * dst = colors + (size_t) vi * 3u;
-        if (!pbr_sample_color_trilinear(voxels, keys, values, table_size, v, dst)) {
-            ++misses;
-        }
-        if (progress_steps > 0 &&
-            vi + 1 >= (mesh->n_vertices * (int64_t) progress_step) / progress_steps) {
-            char detail[128];
-            snprintf(
-                detail,
-                sizeof(detail),
-                "vertices=%lld/%lld misses=%lld",
-                (long long) (vi + 1),
-                (long long) mesh->n_vertices,
-                (long long) misses);
-            trellis_progress_steps(
-                "OBJ vertex colors",
-                progress_step,
-                progress_steps,
-                ggml_time_us() - chunk_start_us,
-                detail);
-            chunk_start_us = ggml_time_us();
-            ++progress_step;
-        }
-    }
-
-    free(mesh->vertex_colors);
-    mesh->vertex_colors = colors;
-    free(keys);
-    free(values);
-    return TRELLIS_STATUS_OK;
-}
-
-trellis_status trellis_pipeline_write_obj(const char * path, const trellis_mesh_host * mesh) {
+static trellis_status trellis_pipeline_write_meshbin(const char * path, const trellis_mesh_host * mesh) {
     if (path == NULL || mesh == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
         mesh->n_vertices <= 0 || mesh->n_faces <= 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
@@ -795,32 +569,96 @@ trellis_status trellis_pipeline_write_obj(const char * path, const trellis_mesh_
         TRELLIS_ERROR("pipeline mesh: failed to create output directory for %s", path);
         return TRELLIS_STATUS_IO_ERROR;
     }
-    FILE * f = fopen(path, "w");
+    FILE * f = fopen(path, "wb");
     if (f == NULL) {
         TRELLIS_ERROR("pipeline mesh: failed to open %s", path);
         return TRELLIS_STATUS_IO_ERROR;
     }
-    fprintf(f, "# trellis2.c mesh\n");
-    for (int64_t i = 0; i < mesh->n_vertices; ++i) {
-        const float * v = mesh->vertices + (size_t) i * 3u;
-        const float * c = mesh->vertex_colors != NULL ? mesh->vertex_colors + (size_t) i * 3u : NULL;
-        /* Match TRELLIS.2 GLB export convention: internal (x,y,z) -> viewer (x,z,-y). */
-        int rc = c != NULL ?
-            fprintf(f, "v %.9g %.9g %.9g %.9g %.9g %.9g\n", v[0], v[2], -v[1], c[0], c[1], c[2]) :
-            fprintf(f, "v %.9g %.9g %.9g\n", v[0], v[2], -v[1]);
-        if (rc < 0) {
-            fclose(f);
-            return TRELLIS_STATUS_IO_ERROR;
+    const char magic[8] = { 'T', 'R', 'L', 'M', 'E', 'S', 'H', '1' };
+    const uint64_t n_vertices = (uint64_t) mesh->n_vertices;
+    const uint64_t n_faces = (uint64_t) mesh->n_faces;
+    const uint32_t flags = 0;
+    const uint32_t reserved = 0;
+    const size_t vertex_count = (size_t) mesh->n_vertices * 3u;
+    const size_t face_count = (size_t) mesh->n_faces * 3u;
+    trellis_status status = TRELLIS_STATUS_OK;
+    if (fwrite(magic, 1, sizeof(magic), f) != sizeof(magic) ||
+        fwrite(&n_vertices, sizeof(n_vertices), 1, f) != 1 ||
+        fwrite(&n_faces, sizeof(n_faces), 1, f) != 1 ||
+        fwrite(&flags, sizeof(flags), 1, f) != 1 ||
+        fwrite(&reserved, sizeof(reserved), 1, f) != 1 ||
+        fwrite(mesh->vertices, sizeof(float), vertex_count, f) != vertex_count ||
+        fwrite(mesh->faces, sizeof(int32_t), face_count, f) != face_count) {
+        status = TRELLIS_STATUS_IO_ERROR;
+    }
+    if (fclose(f) != 0 && status == TRELLIS_STATUS_OK) {
+        status = TRELLIS_STATUS_IO_ERROR;
+    }
+    return status;
+}
+
+static trellis_status trellis_pipeline_load_meshbin(const char * path, trellis_mesh_host * mesh_out) {
+    if (path == NULL || mesh_out == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    memset(mesh_out, 0, sizeof(*mesh_out));
+    FILE * f = fopen(path, "rb");
+    if (f == NULL) {
+        TRELLIS_ERROR("pipeline mesh: failed to open meshbin %s", path);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+
+    char magic[8];
+    uint64_t n_vertices = 0;
+    uint64_t n_faces = 0;
+    uint32_t flags = 0;
+    uint32_t reserved = 0;
+    trellis_status status = TRELLIS_STATUS_OK;
+    if (fread(magic, 1, sizeof(magic), f) != sizeof(magic) ||
+        fread(&n_vertices, sizeof(n_vertices), 1, f) != 1 ||
+        fread(&n_faces, sizeof(n_faces), 1, f) != 1 ||
+        fread(&flags, sizeof(flags), 1, f) != 1 ||
+        fread(&reserved, sizeof(reserved), 1, f) != 1 ||
+        memcmp(magic, "TRLMESH1", 8) != 0 ||
+        n_vertices == 0 || n_faces == 0 ||
+        n_vertices > (uint64_t) INT64_MAX ||
+        n_faces > (uint64_t) INT64_MAX ||
+        n_vertices > (uint64_t) SIZE_MAX / (3u * sizeof(float)) ||
+        n_faces > (uint64_t) SIZE_MAX / (3u * sizeof(int32_t))) {
+        status = TRELLIS_STATUS_PARSE_ERROR;
+    }
+
+    trellis_mesh_host mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    if (status == TRELLIS_STATUS_OK) {
+        const size_t vertex_count = (size_t) n_vertices * 3u;
+        const size_t face_count = (size_t) n_faces * 3u;
+        mesh.vertices = (float *) malloc(vertex_count * sizeof(float));
+        mesh.faces = (int32_t *) malloc(face_count * sizeof(int32_t));
+        mesh.n_vertices = (int64_t) n_vertices;
+        mesh.n_faces = (int64_t) n_faces;
+        if (mesh.vertices == NULL || mesh.faces == NULL) {
+            status = TRELLIS_STATUS_OUT_OF_MEMORY;
+        } else if (fread(mesh.vertices, sizeof(float), vertex_count, f) != vertex_count ||
+                   fread(mesh.faces, sizeof(int32_t), face_count, f) != face_count) {
+            status = TRELLIS_STATUS_IO_ERROR;
+        }
+        if (status == TRELLIS_STATUS_OK && (flags & 1u) != 0) {
+            const uint64_t uv_bytes = n_vertices * 2u * (uint64_t) sizeof(float);
+            if (uv_bytes > (uint64_t) LONG_MAX || fseek(f, (long) uv_bytes, SEEK_CUR) != 0) {
+                status = TRELLIS_STATUS_IO_ERROR;
+            }
         }
     }
-    for (int64_t i = 0; i < mesh->n_faces; ++i) {
-        const int32_t * face = mesh->faces + (size_t) i * 3u;
-        if (fprintf(f, "f %d %d %d\n", face[0] + 1, face[1] + 1, face[2] + 1) < 0) {
-            fclose(f);
-            return TRELLIS_STATUS_IO_ERROR;
-        }
+    if (fclose(f) != 0 && status == TRELLIS_STATUS_OK) {
+        status = TRELLIS_STATUS_IO_ERROR;
     }
-    return fclose(f) == 0 ? TRELLIS_STATUS_OK : TRELLIS_STATUS_IO_ERROR;
+    if (status != TRELLIS_STATUS_OK) {
+        trellis_mesh_free(&mesh);
+        return status;
+    }
+    *mesh_out = mesh;
+    return TRELLIS_STATUS_OK;
 }
 
 static trellis_status trellis_pipeline_write_pbr_voxels_debug(
@@ -879,20 +717,20 @@ static trellis_status trellis_pipeline_dump_material_inputs_if_requested(
     }
 
     char path[4096];
-    if (!make_material_dump_path(path, sizeof(path), dump_dir, "processed.obj")) {
+    if (!make_material_dump_path(path, sizeof(path), dump_dir, "processed.meshbin")) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
-    trellis_status status = trellis_pipeline_write_obj(path, mesh);
+    trellis_status status = trellis_pipeline_write_meshbin(path, mesh);
     if (status != TRELLIS_STATUS_OK) {
         return status;
     }
 
     if (sample_mesh != NULL && sample_mesh->vertices != NULL && sample_mesh->faces != NULL &&
         sample_mesh->n_vertices > 0 && sample_mesh->n_faces > 0) {
-        if (!make_material_dump_path(path, sizeof(path), dump_dir, "projection_source.obj")) {
+        if (!make_material_dump_path(path, sizeof(path), dump_dir, "projection_source.meshbin")) {
             return TRELLIS_STATUS_INVALID_ARGUMENT;
         }
-        status = trellis_pipeline_write_obj(path, sample_mesh);
+        status = trellis_pipeline_write_meshbin(path, sample_mesh);
         if (status != TRELLIS_STATUS_OK) {
             return status;
         }
@@ -932,165 +770,11 @@ static trellis_status trellis_pipeline_dump_material_inputs_if_requested(
     return TRELLIS_STATUS_OK;
 }
 
-static int postprocess_mesh_reserve_vertices(trellis_mesh_host * mesh, int64_t need, int64_t * vertex_capacity) {
-    if (need <= *vertex_capacity) {
-        return 1;
-    }
-    int64_t cap = *vertex_capacity > 0 ? *vertex_capacity : 1024;
-    while (cap < need) {
-        if (cap > INT64_MAX / 2) return 0;
-        cap *= 2;
-    }
-    float * vertices = (float *) realloc(mesh->vertices, (size_t) cap * 3u * sizeof(float));
-    if (vertices == NULL) return 0;
-    mesh->vertices = vertices;
-    *vertex_capacity = cap;
-    return 1;
-}
-
-static int postprocess_mesh_reserve_faces(trellis_mesh_host * mesh, int64_t need, int64_t * face_capacity) {
-    if (need <= *face_capacity) {
-        return 1;
-    }
-    int64_t cap = *face_capacity > 0 ? *face_capacity : 1024;
-    while (cap < need) {
-        if (cap > INT64_MAX / 2) return 0;
-        cap *= 2;
-    }
-    int32_t * faces = (int32_t *) realloc(mesh->faces, (size_t) cap * 3u * sizeof(int32_t));
-    if (faces == NULL) return 0;
-    mesh->faces = faces;
-    *face_capacity = cap;
-    return 1;
-}
-
-static int postprocess_mesh_add_vertex(
-    trellis_mesh_host * mesh,
-    int64_t * vertex_capacity,
-    float obj_x,
-    float obj_y,
-    float obj_z) {
-    if (!postprocess_mesh_reserve_vertices(mesh, mesh->n_vertices + 1, vertex_capacity)) {
-        return 0;
-    }
-    float * v = mesh->vertices + (size_t) mesh->n_vertices * 3u;
-    v[0] = obj_x;
-    v[1] = -obj_z;
-    v[2] = obj_y;
-    ++mesh->n_vertices;
-    return 1;
-}
-
-static int postprocess_mesh_add_face(trellis_mesh_host * mesh, int64_t * face_capacity, int32_t a, int32_t b, int32_t c) {
-    if (a < 0 || b < 0 || c < 0 ||
-        a >= mesh->n_vertices || b >= mesh->n_vertices || c >= mesh->n_vertices) {
-        return 0;
-    }
-    if (!postprocess_mesh_reserve_faces(mesh, mesh->n_faces + 1, face_capacity)) {
-        return 0;
-    }
-    int32_t * f = mesh->faces + (size_t) mesh->n_faces * 3u;
-    f[0] = a;
-    f[1] = b;
-    f[2] = c;
-    ++mesh->n_faces;
-    return 1;
-}
-
-static int postprocess_parse_obj_index(const char * token, int64_t n_vertices, int32_t * out) {
-    char * end = NULL;
-    long idx = strtol(token, &end, 10);
-    if (end == token || idx == 0) {
-        return 0;
-    }
-    int64_t resolved = idx > 0 ? (int64_t) idx - 1 : n_vertices + (int64_t) idx;
-    if (resolved < 0 || resolved >= n_vertices || resolved > INT32_MAX) {
-        return 0;
-    }
-    *out = (int32_t) resolved;
-    return 1;
-}
-
-static trellis_status load_postprocessed_obj_mesh(const char * path, trellis_mesh_host * mesh_out) {
-    if (path == NULL || mesh_out == NULL) {
-        return TRELLIS_STATUS_INVALID_ARGUMENT;
-    }
-    memset(mesh_out, 0, sizeof(*mesh_out));
-    FILE * f = fopen(path, "r");
-    if (f == NULL) {
-        TRELLIS_ERROR("mesh postprocess: failed to open processed OBJ %s", path);
-        return TRELLIS_STATUS_IO_ERROR;
-    }
-
-    trellis_mesh_host mesh;
-    memset(&mesh, 0, sizeof(mesh));
-    int64_t vertex_capacity = 0;
-    int64_t face_capacity = 0;
-    char line[8192];
-    int64_t line_no = 0;
-    trellis_status status = TRELLIS_STATUS_OK;
-    while (fgets(line, sizeof(line), f) != NULL) {
-        ++line_no;
-        char * p = line;
-        while (*p == ' ' || *p == '\t') ++p;
-        if (p[0] == 'v' && isspace((unsigned char) p[1])) {
-            float x = 0.0f, y = 0.0f, z = 0.0f;
-            if (sscanf(p + 1, "%f %f %f", &x, &y, &z) != 3 ||
-                !postprocess_mesh_add_vertex(&mesh, &vertex_capacity, x, y, z)) {
-                TRELLIS_ERROR("mesh postprocess: bad vertex at %s:%lld", path, (long long) line_no);
-                status = TRELLIS_STATUS_IO_ERROR;
-                break;
-            }
-        } else if (p[0] == 'f' && isspace((unsigned char) p[1])) {
-            int32_t ids[256];
-            int n = 0;
-            char * q = p + 1;
-            while (*q != '\0') {
-                while (*q != '\0' && isspace((unsigned char) *q)) ++q;
-                if (*q == '\0' || *q == '#') break;
-                if (n >= (int) (sizeof(ids) / sizeof(ids[0])) ||
-                    !postprocess_parse_obj_index(q, mesh.n_vertices, &ids[n])) {
-                    TRELLIS_ERROR("mesh postprocess: bad face index at %s:%lld", path, (long long) line_no);
-                    status = TRELLIS_STATUS_IO_ERROR;
-                    break;
-                }
-                ++n;
-                while (*q != '\0' && !isspace((unsigned char) *q)) ++q;
-            }
-            if (status != TRELLIS_STATUS_OK) break;
-            if (n < 3) {
-                TRELLIS_ERROR("mesh postprocess: face has fewer than 3 vertices at %s:%lld", path, (long long) line_no);
-                status = TRELLIS_STATUS_IO_ERROR;
-                break;
-            }
-            for (int i = 1; i + 1 < n; ++i) {
-                if (!postprocess_mesh_add_face(&mesh, &face_capacity, ids[0], ids[i], ids[i + 1])) {
-                    TRELLIS_ERROR("mesh postprocess: failed to append face at %s:%lld", path, (long long) line_no);
-                    status = TRELLIS_STATUS_IO_ERROR;
-                    break;
-                }
-            }
-            if (status != TRELLIS_STATUS_OK) break;
-        }
-    }
-    fclose(f);
-    if (status == TRELLIS_STATUS_OK && (mesh.n_vertices <= 0 || mesh.n_faces <= 0)) {
-        TRELLIS_ERROR("mesh postprocess: processed OBJ has no usable triangle mesh: %s", path);
-        status = TRELLIS_STATUS_IO_ERROR;
-    }
-    if (status != TRELLIS_STATUS_OK) {
-        trellis_mesh_free(&mesh);
-        return status;
-    }
-    *mesh_out = mesh;
-    return TRELLIS_STATUS_OK;
-}
-
 static int run_vkmesh_postprocess_command(
     const char * vkmesh_path,
-    const char * input_obj,
-    const char * output_obj,
-    const char * projection_obj,
+    const char * input_mesh,
+    const char * output_mesh,
+    const char * projection_mesh,
     int decimation_target,
     int no_simplify) {
     char target[64];
@@ -1127,12 +811,12 @@ static int run_vkmesh_postprocess_command(
         int argc = 0;
         argv[argc++] = (char *) exe;
         argv[argc++] = (char *) "--input";
-        argv[argc++] = (char *) input_obj;
+        argv[argc++] = (char *) input_mesh;
         argv[argc++] = (char *) "--output";
-        argv[argc++] = (char *) output_obj;
-        if (projection_obj != NULL && projection_obj[0] != '\0') {
+        argv[argc++] = (char *) output_mesh;
+        if (projection_mesh != NULL && projection_mesh[0] != '\0') {
             argv[argc++] = (char *) "--projection-mesh-output";
-            argv[argc++] = (char *) projection_obj;
+            argv[argc++] = (char *) projection_mesh;
         }
         argv[argc++] = (char *) "--postprocess";
         argv[argc++] = (char *) "--decimation-target";
@@ -1166,26 +850,26 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
         mesh->n_vertices <= 0 || mesh->n_faces <= 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
-    char input_obj[4096];
-    char output_obj[4096];
-    char projection_obj[4096];
-    int n0 = snprintf(input_obj, sizeof(input_obj), "/tmp/trellis2_vkmesh_in_%ld.obj", (long) getpid());
-    int n1 = snprintf(output_obj, sizeof(output_obj), "/tmp/trellis2_vkmesh_out_%ld.obj", (long) getpid());
-    int n2 = snprintf(projection_obj, sizeof(projection_obj), "/tmp/trellis2_vkmesh_projection_%ld.obj", (long) getpid());
-    if (n0 < 0 || (size_t) n0 >= sizeof(input_obj) ||
-        n1 < 0 || (size_t) n1 >= sizeof(output_obj) ||
-        n2 < 0 || (size_t) n2 >= sizeof(projection_obj)) {
+    char input_mesh[4096];
+    char output_mesh[4096];
+    char projection_mesh[4096];
+    int n0 = snprintf(input_mesh, sizeof(input_mesh), "/tmp/trellis2_vkmesh_in_%ld.meshbin", (long) getpid());
+    int n1 = snprintf(output_mesh, sizeof(output_mesh), "/tmp/trellis2_vkmesh_out_%ld.meshbin", (long) getpid());
+    int n2 = snprintf(projection_mesh, sizeof(projection_mesh), "/tmp/trellis2_vkmesh_projection_%ld.meshbin", (long) getpid());
+    if (n0 < 0 || (size_t) n0 >= sizeof(input_mesh) ||
+        n1 < 0 || (size_t) n1 >= sizeof(output_mesh) ||
+        n2 < 0 || (size_t) n2 >= sizeof(projection_mesh)) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     if (projection_mesh_out != NULL) {
         memset(projection_mesh_out, 0, sizeof(*projection_mesh_out));
     }
 
-    trellis_status status = trellis_pipeline_write_obj(input_obj, mesh);
+    trellis_status status = trellis_pipeline_write_meshbin(input_mesh, mesh);
     if (status != TRELLIS_STATUS_OK) {
-        unlink_if_set(input_obj);
-        unlink_if_set(output_obj);
-        unlink_if_set(projection_obj);
+        unlink_if_set(input_mesh);
+        unlink_if_set(output_mesh);
+        unlink_if_set(projection_mesh);
         return status;
     }
 
@@ -1196,22 +880,22 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
         (long long) mesh->n_faces);
     if (!run_vkmesh_postprocess_command(
             vkmesh_path,
-            input_obj,
-            output_obj,
-            projection_mesh_out != NULL ? projection_obj : NULL,
+            input_mesh,
+            output_mesh,
+            projection_mesh_out != NULL ? projection_mesh : NULL,
             decimation_target,
             no_simplify)) {
         TRELLIS_ERROR("mesh postprocess: vkmesh failed; pass --vkmesh /path/to/vkmesh if it is not in PATH");
-        unlink_if_set(input_obj);
-        unlink_if_set(output_obj);
-        unlink_if_set(projection_obj);
+        unlink_if_set(input_mesh);
+        unlink_if_set(output_mesh);
+        unlink_if_set(projection_mesh);
         return TRELLIS_STATUS_ERROR;
     }
 
     trellis_mesh_host processed;
-    status = load_postprocessed_obj_mesh(output_obj, &processed);
+    status = trellis_pipeline_load_meshbin(output_mesh, &processed);
     if (status == TRELLIS_STATUS_OK && projection_mesh_out != NULL) {
-        status = load_postprocessed_obj_mesh(projection_obj, projection_mesh_out);
+        status = trellis_pipeline_load_meshbin(projection_mesh, projection_mesh_out);
         if (status == TRELLIS_STATUS_OK) {
             TRELLIS_INFO(
                 "mesh postprocess: loaded projection source vertices=%lld faces=%lld",
@@ -1219,9 +903,9 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
                 (long long) projection_mesh_out->n_faces);
         }
     }
-    unlink_if_set(input_obj);
-    unlink_if_set(output_obj);
-    unlink_if_set(projection_obj);
+    unlink_if_set(input_mesh);
+    unlink_if_set(output_mesh);
+    unlink_if_set(projection_mesh);
     if (status != TRELLIS_STATUS_OK) {
         if (projection_mesh_out != NULL) {
             trellis_mesh_free(projection_mesh_out);
@@ -1242,13 +926,15 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     return TRELLIS_STATUS_OK;
 }
 
-trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options * options) {
+trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_options * options) {
     if (options == NULL || options->model_dir == NULL || options->dino_dir == NULL ||
-        options->image_path == NULL ||
-        ((options->obj_path == NULL || options->obj_path[0] == '\0') &&
-         (options->gltf_path == NULL || options->gltf_path[0] == '\0'))) {
+        options->image_path == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
+    const char * output_gltf_path =
+        options->gltf_path != NULL && options->gltf_path[0] != '\0' ?
+            options->gltf_path :
+            "output.glb";
 
     char temp_image[4096];
     char temp_birefnet_image[4096];
@@ -1278,7 +964,7 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
         int n = snprintf(
             temp_image,
             sizeof(temp_image),
-            "/tmp/trellis2_image_to_obj_%ld.png",
+            "/tmp/trellis2_image_to_gltf_%ld.png",
             (long) getpid());
         if (n < 0 || (size_t) n >= sizeof(temp_image)) {
             return TRELLIS_STATUS_INVALID_ARGUMENT;
@@ -1372,8 +1058,6 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     memset(&pbr_voxels, 0, sizeof(pbr_voxels));
     memset(&mesh, 0, sizeof(mesh));
     memset(&gltf_projection_mesh, 0, sizeof(gltf_projection_mesh));
-    const int want_obj = options->obj_path != NULL && options->obj_path[0] != '\0';
-    const int want_gltf = options->gltf_path != NULL && options->gltf_path[0] != '\0';
     const char * material_dump_dir = getenv("TRELLIS_MATERIAL_DUMP_DIR");
 
     TRELLIS_INFO("[1/5] SparseStructureFlowModel image -> sparse structure");
@@ -1470,11 +1154,11 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     }
     if (material_dump_dir != NULL && material_dump_dir[0] != '\0') {
         char raw_mesh_path[4096];
-        if (!make_material_dump_path(raw_mesh_path, sizeof(raw_mesh_path), material_dump_dir, "raw.obj")) {
+        if (!make_material_dump_path(raw_mesh_path, sizeof(raw_mesh_path), material_dump_dir, "raw.meshbin")) {
             status = TRELLIS_STATUS_INVALID_ARGUMENT;
             goto cleanup;
         }
-        status = trellis_pipeline_write_obj(raw_mesh_path, &mesh);
+        status = trellis_pipeline_write_meshbin(raw_mesh_path, &mesh);
         if (status != TRELLIS_STATUS_OK) {
             goto cleanup;
         }
@@ -1483,7 +1167,7 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
     if (options->mesh_postprocess) {
         status = trellis_pipeline_postprocess_mesh_with_vkmesh(
             &mesh,
-            want_gltf ? &gltf_projection_mesh : NULL,
+            &gltf_projection_mesh,
             options->vkmesh_path,
             options->mesh_postprocess_decimation_target > 0 ? options->mesh_postprocess_decimation_target : 1000000,
             options->mesh_postprocess_no_simplify);
@@ -1567,36 +1251,15 @@ trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options 
         }
     }
 
-    if (want_obj) {
-        TRELLIS_INFO(
-            "pipeline: applying PBR voxels to OBJ vertex colors vertices=%lld voxels=%lld",
-            (long long) mesh.n_vertices,
-            (long long) pbr_voxels.n_coords);
-        status = trellis_pipeline_apply_pbr_voxels_to_mesh(&pbr_voxels, &mesh);
-        if (status != TRELLIS_STATUS_OK) {
-            goto cleanup;
-        }
-        status = trellis_pipeline_write_obj(options->obj_path, &mesh);
-        if (status != TRELLIS_STATUS_OK) {
-            goto cleanup;
-        }
-        TRELLIS_INFO(
-            "pipeline: wrote %s (%lld vertices, %lld faces)",
-            options->obj_path,
-            (long long) mesh.n_vertices,
-            (long long) mesh.n_faces);
-    }
-    if (want_gltf) {
-        const int texture_size = options->texture_size > 0 ? options->texture_size : 1024;
-        const trellis_mesh_host * sample_mesh =
-            gltf_projection_mesh.vertices != NULL && gltf_projection_mesh.faces != NULL ?
-                &gltf_projection_mesh :
-                NULL;
-        status = trellis_pipeline_write_gltf(options->gltf_path, &mesh, sample_mesh, &pbr_voxels, texture_size);
-        if (status != TRELLIS_STATUS_OK) {
-            TRELLIS_ERROR("pipeline: glTF export failed: %s", trellis_status_string(status));
-            goto cleanup;
-        }
+    const int texture_size = options->texture_size > 0 ? options->texture_size : 1024;
+    const trellis_mesh_host * sample_mesh =
+        gltf_projection_mesh.vertices != NULL && gltf_projection_mesh.faces != NULL ?
+            &gltf_projection_mesh :
+            NULL;
+    status = trellis_pipeline_write_gltf(output_gltf_path, &mesh, sample_mesh, &pbr_voxels, texture_size);
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR("pipeline: glTF export failed: %s", trellis_status_string(status));
+        goto cleanup;
     }
 
 cleanup:

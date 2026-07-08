@@ -22,19 +22,20 @@ static void print_banner(void) {
 static void usage(FILE * out, const char * argv0) {
     fprintf(out,
         "Usage:\n"
-        "  %s --model DIR --dino DIR --image FILE (--obj FILE | --gltf FILE) [options]\n"
+        "  %s --model DIR --dino DIR --image FILE [--gltf FILE | --glb FILE | --output FILE] [options]\n"
         "\n"
-        "Runs image -> sparse structure -> shape SLat -> mesh/subs -> texture SLat -> OBJ vertex colors and/or glTF textures.\n"
+        "Runs image -> sparse structure -> shape SLat -> mesh/subs -> texture SLat -> GLB/glTF textures.\n"
         "\n"
         "Options:\n"
         "  --model DIR             TRELLIS.2 model directory containing ckpts/\n"
         "  --dino DIR              DINOv3 image encoder directory containing model.safetensors\n"
         "  --birefnet FILE         Optional BiRefNet GGUF background-removal model; uses --backend/--device\n"
         "  --image FILE            Input image. PNG/JPEG load directly; WebP is converted with ffmpeg first.\n"
-        "  --obj FILE              Output OBJ path with vertex colors; no UV texture files\n"
-        "  --gltf FILE             Output glTF 2.0 path; use .glb to embed PBR textures\n"
+        "  --gltf FILE             Output glTF 2.0 path; use .glb to embed PBR textures, default output.glb\n"
+        "  --glb FILE              Alias of --gltf\n"
+        "  --output FILE           Alias of --gltf\n"
         "  --texture-size N        glTF texture size, default 1024\n"
-        "  --mesh-postprocess      Run vkmesh TRELLIS topology cleanup before OBJ/glTF export\n"
+        "  --mesh-postprocess      Run vkmesh TRELLIS topology cleanup before GLB/glTF export\n"
         "  --mesh-postprocess-no-simplify Skip vkmesh simplify, keeping cleanup/orientation only\n"
         "  --mesh-decimation-target N Postprocess final face target, default 1000000\n"
         "  --vkmesh FILE           vkmesh executable path; default searches sibling binary then PATH\n"
@@ -130,7 +131,7 @@ static int parse_float_arg(const char * text, float * out) {
 int main(int argc, char ** argv) {
     print_banner();
 
-    trellis_image_to_obj_options options;
+    trellis_image_to_gltf_options options;
     memset(&options, 0, sizeof(options));
     options.device = 0;
     options.sparse_structure_steps = 12;
@@ -160,9 +161,9 @@ int main(int argc, char ** argv) {
             options.birefnet_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--image") == 0) {
             options.image_path = arg_value(argc, argv, &i);
-        } else if (strcmp(argv[i], "--obj") == 0) {
-            options.obj_path = arg_value(argc, argv, &i);
-        } else if (strcmp(argv[i], "--gltf") == 0) {
+        } else if (strcmp(argv[i], "--gltf") == 0 ||
+                   strcmp(argv[i], "--glb") == 0 ||
+                   strcmp(argv[i], "--output") == 0) {
             options.gltf_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--mesh-postprocess") == 0) {
             options.mesh_postprocess = 1;
@@ -243,9 +244,12 @@ int main(int argc, char ** argv) {
         }
     }
 
+    if (options.gltf_path == NULL || options.gltf_path[0] == '\0') {
+        options.gltf_path = "output.glb";
+    }
+
     if (options.model_dir == NULL || options.dino_dir == NULL ||
         options.image_path == NULL ||
-        (options.obj_path == NULL && options.gltf_path == NULL) ||
         options.sparse_structure_steps <= 0 || options.structured_latent_steps <= 0 ||
         options.latent_size <= 0 || options.cond_resolution <= 0 ||
         options.sparse_resolution <= 0 || options.texture_size <= 0 ||
@@ -254,9 +258,9 @@ int main(int argc, char ** argv) {
         goto bad_args;
     }
 
-    trellis_status status = trellis_pipeline_image_to_obj(&options);
+    trellis_status status = trellis_pipeline_image_to_gltf(&options);
     if (status != TRELLIS_STATUS_OK) {
-        TRELLIS_ERROR("trellis-image-to-obj failed: %s", trellis_status_string(status));
+        TRELLIS_ERROR("trellis-image-to-gltf failed: %s", trellis_status_string(status));
         return 1;
     }
     return 0;

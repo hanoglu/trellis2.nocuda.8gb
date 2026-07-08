@@ -16,25 +16,26 @@ The downloader writes to `../TRELLIS.2/` by default. Use `--output-dir`,
 `--only trellis|dino`, `--revision`, `--include`, or `--full` when you need a
 custom layout or a non-default set of files.
 
-`trellis-image-to-obj` is the default terminal inference app:
+`trellis-image-to-gltf` is the default terminal inference app:
 
 ```sh
-../build/trellis-image-to-obj \
+../build/trellis-image-to-gltf \
   --model ../TRELLIS.2/TRELLIS.2-4B \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
   --image ../assets/example_image/T.png \
-  --obj benchmark_outputs/output.obj
+  --gltf benchmark_outputs/output.glb
 ```
 
 It loads an input image, runs DINO conditioning, sparse-structure flow,
-structured-latent shape flow, shape decode, and writes an OBJ in one command.
-It does not open raylib. Sparse coords and DINO condition data are passed
-directly in memory, so no stage handoff files are written by default.
-WebP inputs are converted to a temporary PNG because the current
+structured-latent shape flow, shape decode, texture decode, and writes a GLB or
+glTF in one command. It does not open raylib. Sparse coords and DINO condition
+data are passed directly in memory, so no stage handoff files are written by
+default. If no output path is passed, it writes `output.glb`. WebP inputs are
+converted to a temporary PNG because the current
 stb_image loader does not decode WebP directly.
 
-`trellis-image-to-obj.c` is intentionally thin: it parses arguments and calls
-`trellis_pipeline_image_to_obj()` from `src/pipeline/trellis_pipeline.c`.
+`trellis_image_to_gltf.c` is intentionally thin: it parses arguments and calls
+`trellis_pipeline_image_to_gltf()` from `src/pipeline/trellis_pipeline.c`.
 
 `vkmesh` runs the Vulkan compute mesh postprocess path. The TRELLIS preset
 mirrors the standard PyTorch/o-voxel export cleanup order: fill small holes,
@@ -45,7 +46,7 @@ The implementation lives under `tools/vkmesh/`; compute shaders, including the
 glTF texture bake/dilate/fill shaders, live under `tools/vkmesh/shaders/`.
 
 ```sh
-../build/trellis-image-to-obj \
+../build/trellis-image-to-gltf \
   --model ../TRELLIS.2/TRELLIS.2-4B \
   --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
   --birefnet ../TRELLIS.2/BiRefNet/model.gguf \
@@ -65,10 +66,10 @@ Use a `.glb` output path to embed geometry and PNG textures in one binary file;
 `.gltf` output paths keep writing external `.bin` and `.png` files.
 BiRefNet follows the same `--backend` and `--device` settings as the rest of the
 image-to-3D pipeline. Use standalone `vkmesh --postprocess --no-uv-unwrap` for
-geometry-only OBJ output, `--cleanup` for a single primitive cleanup pass, or
+geometry-only meshbin output, `--cleanup` for a single primitive cleanup pass, or
 individual flags such as `--fill-holes`, `--repair-non-manifold-edges`, and
 `--remove-small-components` when debugging one stage at a time.
-When `trellis-image-to-obj` is run from a Vulkan build tree it first looks for a
+When `trellis-image-to-gltf` is run from a Vulkan build tree it first looks for a
 sibling `vkmesh` executable, then falls back to `PATH`; pass `--vkmesh FILE`
 only when using a custom binary.
 CuMesh-style UV unwrap is hybrid rather than fully GPU-resident: chart
@@ -105,7 +106,7 @@ Pipeline code lives under `src/`:
 - `src/model/trellis_cuda_kernels.cu`: internal CUDA kernels for sparse shape decoding.
 - `src/pipeline/trellis_sparse_structure_pipeline.c`: image -> sparse coords + DINO condition.
 - `src/pipeline/trellis_structured_latent_pipeline.c`: sparse coords + condition -> shape/texture SLat.
-- `src/pipeline/trellis_pipeline.c`: image -> colored OBJ orchestration.
+- `src/pipeline/trellis_pipeline.c`: image -> textured GLB/glTF orchestration.
 - `tools/debug/trellis_checkpoint_validate.c`: checkpoint contract validation for debug tools/tests.
 - `tools/debug/trellis_sparse_reference.c`: CPU sparse reference ops for tests/debug.
 
@@ -114,7 +115,7 @@ Debug/live helpers:
 - `trellis_tool_cli.h`: terminal logging and diffusion.cpp-style progress output.
 - `trellis_tool_model.h`: shared safetensors-to-CUDA tensor-store loading helper.
 - `trellis_tool_live.h`: in-memory sparse-structure and structured-latent live interfaces.
-- `trellis_image_to_obj.c`: one-shot image-to-OBJ CLI entry point.
+- `trellis_image_to_gltf.c`: one-shot image-to-GLB/glTF CLI entry point.
 - `debug/trellis_infer.c`: legacy/debug sparse-structure image/DINO/flow/voxel decode CLI.
 - `viewers/trellis_structured_latent_mesh_live_viewer.c`: structured-latent shape flow, per-step mesh decode,
   and raylib mesh upload. It also builds as the standalone

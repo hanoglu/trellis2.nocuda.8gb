@@ -688,12 +688,11 @@ trellis_status trellis_flexible_dual_grid_mesh_from_decoder_logits_host(
     int resolution,
     trellis_mesh_host * mesh_out);
 
-typedef struct trellis_image_to_obj_options {
+typedef struct trellis_image_to_gltf_options {
     const char * model_dir;
     const char * dino_dir;
     const char * birefnet_path;
     const char * image_path;
-    const char * obj_path;
     const char * gltf_path;
     const char * flow_override_path;
     const char * decoder_override_path;
@@ -724,9 +723,9 @@ typedef struct trellis_image_to_obj_options {
     int mesh_postprocess_no_simplify;
     int mesh_postprocess_decimation_target;
     const char * vkmesh_path;
-} trellis_image_to_obj_options;
+} trellis_image_to_gltf_options;
 
-trellis_status trellis_pipeline_image_to_obj(const trellis_image_to_obj_options * options);
+trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_options * options);
 
 #include "trellis_ggml_layers.h"
 #include "trellis_flow_sampler.h"

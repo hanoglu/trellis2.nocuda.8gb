@@ -48,6 +48,7 @@
 #include "xatlas_c.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <float.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -336,109 +337,135 @@ static int mesh_add_face(vkmesh_mesh * mesh, int32_t a, int32_t b, int32_t c) {
     return 1;
 }
 
-static int parse_obj_index(const char * token, int64_t n_vertices, int32_t * out) {
-    char * end = NULL;
-    long idx = strtol(token, &end, 10);
-    if (end == token || idx == 0) return 0;
-    int64_t resolved = idx > 0 ? (int64_t) idx - 1 : n_vertices + (int64_t) idx;
-    if (resolved < 0 || resolved >= n_vertices || resolved > INT32_MAX) return 0;
-    *out = (int32_t) resolved;
+static int meshbin_checked_count(uint64_t n, uint64_t channels, size_t * out) {
+    if (out == NULL || channels == 0 || n > (uint64_t) SIZE_MAX / channels) {
+        return 0;
+    }
+    *out = (size_t) n * (size_t) channels;
     return 1;
 }
 
-static int load_obj(const char * path, vkmesh_mesh * mesh) {
-    FILE * f = fopen(path, "r");
+static int load_meshbin(const char * path, vkmesh_mesh * mesh) {
+    FILE * f = fopen(path, "rb");
     if (f == NULL) {
-        fprintf(stderr, "vkmesh: failed to open %s\n", path);
+        fprintf(stderr, "vkmesh: failed to open meshbin %s: %s\n", path, strerror(errno));
         return 0;
     }
-    char line[8192];
+
+    char magic[8];
+    uint64_t n_vertices = 0;
+    uint64_t n_faces = 0;
+    uint32_t flags = 0;
+    uint32_t reserved = 0;
     int ok = 1;
-    int64_t line_no = 0;
-    while (fgets(line, sizeof(line), f) != NULL) {
-        ++line_no;
-        char * p = line;
-        while (*p == ' ' || *p == '\t') ++p;
-        if (p[0] == 'v' && isspace((unsigned char) p[1])) {
-            float x, y, z;
-            if (sscanf(p + 1, "%f %f %f", &x, &y, &z) != 3 || !mesh_add_vertex(mesh, x, y, z)) {
-                fprintf(stderr, "vkmesh: bad vertex at %s:%" PRId64 "\n", path, line_no);
-                ok = 0;
-                break;
-            }
-        } else if (p[0] == 'f' && isspace((unsigned char) p[1])) {
-            int32_t ids[256];
-            int n = 0;
-            char * q = p + 1;
-            while (*q != '\0') {
-                while (*q != '\0' && isspace((unsigned char) *q)) ++q;
-                if (*q == '\0' || *q == '#') break;
-                if (n >= (int) (sizeof(ids) / sizeof(ids[0]))) {
-                    fprintf(stderr, "vkmesh: face has too many vertices at %s:%" PRId64 "\n", path, line_no);
-                    ok = 0;
-                    break;
-                }
-                if (!parse_obj_index(q, mesh->n_vertices, &ids[n++])) {
-                    fprintf(stderr, "vkmesh: bad face index at %s:%" PRId64 "\n", path, line_no);
-                    ok = 0;
-                    break;
-                }
-                while (*q != '\0' && !isspace((unsigned char) *q)) ++q;
-            }
-            if (!ok) break;
-            if (n < 3) {
-                fprintf(stderr, "vkmesh: face has fewer than 3 vertices at %s:%" PRId64 "\n", path, line_no);
-                ok = 0;
-                break;
-            }
-            for (int i = 1; i + 1 < n; ++i) {
-                if (!mesh_add_face(mesh, ids[0], ids[i], ids[i + 1])) {
-                    fprintf(stderr, "vkmesh: failed to append face at %s:%" PRId64 "\n", path, line_no);
-                    ok = 0;
-                    break;
-                }
-            }
-            if (!ok) break;
-        }
-    }
-    fclose(f);
-    if (ok && (mesh->n_vertices <= 0 || mesh->n_faces <= 0)) {
-        fprintf(stderr, "vkmesh: %s did not contain a usable triangle mesh\n", path);
+    size_t vertex_count = 0;
+    size_t face_count = 0;
+    size_t uv_count = 0;
+    vkmesh_mesh out;
+    memset(&out, 0, sizeof(out));
+    if (fread(magic, 1, sizeof(magic), f) != sizeof(magic) ||
+        fread(&n_vertices, sizeof(n_vertices), 1, f) != 1 ||
+        fread(&n_faces, sizeof(n_faces), 1, f) != 1 ||
+        fread(&flags, sizeof(flags), 1, f) != 1 ||
+        fread(&reserved, sizeof(reserved), 1, f) != 1 ||
+        memcmp(magic, "TRLMESH1", 8) != 0 ||
+        n_vertices == 0 || n_faces == 0 ||
+        n_vertices > (uint64_t) INT64_MAX ||
+        n_faces > (uint64_t) INT64_MAX ||
+        !meshbin_checked_count(n_vertices, 3u, &vertex_count) ||
+        !meshbin_checked_count(n_faces, 3u, &face_count) ||
+        vertex_count > SIZE_MAX / sizeof(float) ||
+        face_count > SIZE_MAX / sizeof(int32_t) ||
+        ((flags & 1u) != 0 && (!meshbin_checked_count(n_vertices, 2u, &uv_count) ||
+                               uv_count > SIZE_MAX / sizeof(float)))) {
         ok = 0;
     }
-    return ok;
-}
+    (void) reserved;
 
-static int write_obj(const char * path, const vkmesh_mesh * mesh) {
-    FILE * f = fopen(path, "w");
-    if (f == NULL) {
-        fprintf(stderr, "vkmesh: failed to open %s for writing\n", path);
+    if (ok) {
+        out.vertices = (float *) malloc(vertex_count * sizeof(float));
+        out.faces = (int32_t *) malloc(face_count * sizeof(int32_t));
+        if ((flags & 1u) != 0) {
+            out.uvs = (float *) malloc(uv_count * sizeof(float));
+        }
+        out.n_vertices = (int64_t) n_vertices;
+        out.n_faces = (int64_t) n_faces;
+        out.vertex_capacity = out.n_vertices;
+        out.face_capacity = out.n_faces;
+        out.has_uvs = ((flags & 1u) != 0 && out.uvs != NULL) ? 1 : 0;
+        if (out.vertices == NULL || out.faces == NULL || (((flags & 1u) != 0) && out.uvs == NULL)) {
+            ok = 0;
+        } else if (fread(out.vertices, sizeof(float), vertex_count, f) != vertex_count ||
+                   fread(out.faces, sizeof(int32_t), face_count, f) != face_count ||
+                   (((flags & 1u) != 0) && fread(out.uvs, sizeof(float), uv_count, f) != uv_count)) {
+            ok = 0;
+        }
+    }
+    if (ok) {
+        for (size_t i = 0; i < face_count; ++i) {
+            if (out.faces[i] < 0 || (uint64_t) out.faces[i] >= n_vertices) {
+                ok = 0;
+                break;
+            }
+        }
+    }
+    if (fclose(f) != 0) {
+        ok = 0;
+    }
+    if (!ok) {
+        fprintf(stderr, "vkmesh: failed to read meshbin %s\n", path);
+        mesh_free(&out);
         return 0;
     }
-    fprintf(f, "# vkmesh output\n");
-    for (int64_t i = 0; i < mesh->n_vertices; ++i) {
-        const float * v = mesh->vertices + (size_t) i * 3u;
-        fprintf(f, "v %.9g %.9g %.9g\n", v[0], v[1], v[2]);
+    *mesh = out;
+    return 1;
+}
+
+static int write_meshbin(const char * path, const vkmesh_mesh * mesh) {
+    if (path == NULL || path[0] == '\0' ||
+        mesh == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
+        mesh->n_vertices <= 0 || mesh->n_faces <= 0) {
+        fprintf(stderr, "vkmesh: cannot write empty meshbin %s\n", path != NULL ? path : "(null)");
+        return 0;
     }
-    if (mesh->has_uvs && mesh->uvs != NULL) {
-        for (int64_t i = 0; i < mesh->n_vertices; ++i) {
-            const float * uv = mesh->uvs + (size_t) i * 2u;
-            fprintf(f, "vt %.9g %.9g\n", uv[0], uv[1]);
-        }
+    FILE * f = fopen(path, "wb");
+    if (f == NULL) {
+        fprintf(stderr, "vkmesh: failed to open %s for writing: %s\n", path, strerror(errno));
+        return 0;
     }
-    for (int64_t i = 0; i < mesh->n_faces; ++i) {
-        const int32_t * face = mesh->faces + (size_t) i * 3u;
-        if (mesh->has_uvs && mesh->uvs != NULL) {
-            fprintf(f,
-                "f %d/%d %d/%d %d/%d\n",
-                face[0] + 1, face[0] + 1,
-                face[1] + 1, face[1] + 1,
-                face[2] + 1, face[2] + 1);
-        } else {
-            fprintf(f, "f %d %d %d\n", face[0] + 1, face[1] + 1, face[2] + 1);
-        }
+
+    const char magic[8] = { 'T', 'R', 'L', 'M', 'E', 'S', 'H', '1' };
+    const uint64_t n_vertices = (uint64_t) mesh->n_vertices;
+    const uint64_t n_faces = (uint64_t) mesh->n_faces;
+    const uint32_t flags = (mesh->has_uvs && mesh->uvs != NULL) ? 1u : 0u;
+    const uint32_t reserved = 0;
+    size_t vertex_count = 0;
+    size_t face_count = 0;
+    size_t uv_count = 0;
+    int ok =
+        meshbin_checked_count(n_vertices, 3u, &vertex_count) &&
+        meshbin_checked_count(n_faces, 3u, &face_count) &&
+        vertex_count <= SIZE_MAX / sizeof(float) &&
+        face_count <= SIZE_MAX / sizeof(int32_t) &&
+        (flags == 0u || (meshbin_checked_count(n_vertices, 2u, &uv_count) &&
+                         uv_count <= SIZE_MAX / sizeof(float)));
+    if (ok) {
+        ok = fwrite(magic, 1, sizeof(magic), f) == sizeof(magic) &&
+             fwrite(&n_vertices, sizeof(n_vertices), 1, f) == 1 &&
+             fwrite(&n_faces, sizeof(n_faces), 1, f) == 1 &&
+             fwrite(&flags, sizeof(flags), 1, f) == 1 &&
+             fwrite(&reserved, sizeof(reserved), 1, f) == 1 &&
+             fwrite(mesh->vertices, sizeof(float), vertex_count, f) == vertex_count &&
+             fwrite(mesh->faces, sizeof(int32_t), face_count, f) == face_count &&
+             (flags == 0u || fwrite(mesh->uvs, sizeof(float), uv_count, f) == uv_count);
     }
-    fclose(f);
+    if (fclose(f) != 0) {
+        ok = 0;
+    }
+    if (!ok) {
+        fprintf(stderr, "vkmesh: failed to write meshbin %s\n", path);
+        return 0;
+    }
     return 1;
 }
 
@@ -6450,7 +6477,7 @@ static int vkmesh_trellis_postprocess_device_inner(
             mesh_free(&projection_mesh);
             goto cleanup;
         }
-        int wrote_projection = write_obj(projection_output, &projection_mesh);
+        int wrote_projection = write_meshbin(projection_output, &projection_mesh);
         fprintf(stderr,
             "vkmesh: trellis.pre projection_mesh_output %s vertices=%" PRId64 " faces=%" PRId64 "\n",
             projection_output,
@@ -6635,7 +6662,7 @@ static int vkmesh_trellis_postprocess_inner(
 
     if (!vkmesh_log_fill_holes(mesh, max_hole_perimeter, "trellis.pre")) return 0;
     if (projection_output != NULL && projection_output[0] != '\0') {
-        if (!write_obj(projection_output, mesh)) return 0;
+        if (!write_meshbin(projection_output, mesh)) return 0;
         fprintf(stderr,
             "vkmesh: trellis.pre projection_mesh_output %s vertices=%" PRId64 " faces=%" PRId64 "\n",
             projection_output,
@@ -6787,7 +6814,7 @@ static int vkmesh_trellis_postprocess(
 
 static void print_usage(const char * argv0) {
     fprintf(stderr,
-        "usage: %s --input in.obj --output out.obj [options]\n"
+        "usage: %s --input in.meshbin --output out.meshbin [options]\n"
         "\n"
         "Postprocess stages:\n"
         "  --postprocess                 Run PyTorch/o-voxel TRELLIS postprocess preset\n"
@@ -6802,7 +6829,7 @@ static void print_usage(const char * argv0) {
         "  --unify-face-orientations     Make winding consistent per manifold component\n"
         "  --simplify                    Run CuMesh-style simplify loop\n"
         "  --no-simplify                 Disable simplify even if --target-faces was set\n"
-        "  --uv-unwrap                   Run xatlas unwrap and write OBJ vt records\n"
+        "  --uv-unwrap                   Run xatlas unwrap and store UVs in meshbin\n"
         "  --no-uv-unwrap                Disable UV unwrap after a preset enabled it\n"
         "\n"
         "Parameters:\n"
@@ -6819,7 +6846,7 @@ static void print_usage(const char * argv0) {
         "  --texture-size N              xatlas pack resolution, default 1024\n"
         "  --unsigned-distance pts.txt   Compute UDF for text points: x y z per line\n"
         "  --distance-output out.txt     Required with --unsigned-distance unless --output is enough for mesh only\n"
-        "  --projection-mesh-output OBJ  With --postprocess, write post-fill source mesh for texture projection\n"
+        "  --projection-mesh-output FILE With --postprocess, write post-fill source meshbin for texture projection\n"
         "\n"
         "Note: unsigned_distance is currently a Vulkan compute brute-force kernel;\n"
         "      remesh_narrow_band_dc is the remaining optional stage.\n",
@@ -6939,7 +6966,7 @@ int main(int argc, char ** argv) {
 
     vkmesh_mesh mesh;
     memset(&mesh, 0, sizeof(mesh));
-    if (!load_obj(input, &mesh)) {
+    if (!load_meshbin(input, &mesh)) {
         mesh_free(&mesh);
         return 1;
     }
@@ -7033,7 +7060,7 @@ int main(int argc, char ** argv) {
         free(face_ids);
     }
     if (output != NULL) {
-        if (!write_obj(output, &mesh)) {
+        if (!write_meshbin(output, &mesh)) {
             mesh_free(&mesh);
             return 1;
         }

@@ -1,7 +1,6 @@
 #include "trellis.h"
 #include "../../src/pipeline/trellis_pipeline_internal.h"
 
-#include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
@@ -12,12 +11,12 @@
 static void usage(FILE * out, const char * argv0) {
     fprintf(out,
         "Usage:\n"
-        "  %s --mesh processed.obj --voxels pbr_voxels.bin --gltf out.glb [options]\n"
+        "  %s --mesh processed.meshbin --voxels pbr_voxels.bin --gltf out.glb [options]\n"
         "\n"
         "Re-bakes a GLB from material inputs dumped by TRELLIS_MATERIAL_DUMP_DIR.\n"
         "\n"
         "Options:\n"
-        "  --sample projection_source.obj  Optional source mesh for CuMesh-style texture projection\n"
+        "  --sample projection_source.meshbin Optional source mesh for CuMesh-style texture projection\n"
         "  --texture-size N                Texture size, default 1024\n",
         argv0);
 }
@@ -43,188 +42,93 @@ static int parse_int_arg(const char * text, int * out) {
     return 1;
 }
 
-static int mesh_reserve_vertices(trellis_mesh_host * mesh, int64_t need, int64_t * capacity) {
-    if (need <= *capacity) {
-        return 1;
-    }
-    int64_t cap = *capacity > 0 ? *capacity : 1024;
-    while (cap < need) {
-        if (cap > INT64_MAX / 2) {
-            return 0;
-        }
-        cap *= 2;
-    }
-    float * vertices = (float *) realloc(mesh->vertices, (size_t) cap * 3u * sizeof(float));
-    if (vertices == NULL) {
-        return 0;
-    }
-    mesh->vertices = vertices;
-    *capacity = cap;
-    return 1;
-}
-
-static int mesh_reserve_faces(trellis_mesh_host * mesh, int64_t need, int64_t * capacity) {
-    if (need <= *capacity) {
-        return 1;
-    }
-    int64_t cap = *capacity > 0 ? *capacity : 1024;
-    while (cap < need) {
-        if (cap > INT64_MAX / 2) {
-            return 0;
-        }
-        cap *= 2;
-    }
-    int32_t * faces = (int32_t *) realloc(mesh->faces, (size_t) cap * 3u * sizeof(int32_t));
-    if (faces == NULL) {
-        return 0;
-    }
-    mesh->faces = faces;
-    *capacity = cap;
-    return 1;
-}
-
-static int mesh_add_obj_vertex(
-    trellis_mesh_host * mesh,
-    int64_t * vertex_capacity,
-    float obj_x,
-    float obj_y,
-    float obj_z) {
-    if (!mesh_reserve_vertices(mesh, mesh->n_vertices + 1, vertex_capacity)) {
-        return 0;
-    }
-    float * v = mesh->vertices + (size_t) mesh->n_vertices * 3u;
-    v[0] = obj_x;
-    v[1] = -obj_z;
-    v[2] = obj_y;
-    ++mesh->n_vertices;
-    return 1;
-}
-
-static int mesh_add_face(trellis_mesh_host * mesh, int64_t * face_capacity, int32_t a, int32_t b, int32_t c) {
-    if (a < 0 || b < 0 || c < 0 ||
-        a >= mesh->n_vertices || b >= mesh->n_vertices || c >= mesh->n_vertices) {
-        return 0;
-    }
-    if (!mesh_reserve_faces(mesh, mesh->n_faces + 1, face_capacity)) {
-        return 0;
-    }
-    int32_t * f = mesh->faces + (size_t) mesh->n_faces * 3u;
-    f[0] = a;
-    f[1] = b;
-    f[2] = c;
-    ++mesh->n_faces;
-    return 1;
-}
-
-static int parse_obj_index(const char * token, int64_t vertex_count, int32_t * out) {
-    char * end = NULL;
-    long idx = strtol(token, &end, 10);
-    if (end == token || idx == 0) {
-        return 0;
-    }
-    int64_t resolved = idx > 0 ? (int64_t) idx - 1 : vertex_count + (int64_t) idx;
-    if (resolved < 0 || resolved >= vertex_count || resolved > INT32_MAX) {
-        return 0;
-    }
-    *out = (int32_t) resolved;
-    return 1;
-}
-
-static trellis_status load_obj_mesh(const char * path, trellis_mesh_host * mesh_out) {
-    if (path == NULL || mesh_out == NULL) {
-        return TRELLIS_STATUS_INVALID_ARGUMENT;
-    }
-    memset(mesh_out, 0, sizeof(*mesh_out));
-    FILE * f = fopen(path, "r");
-    if (f == NULL) {
-        fprintf(stderr, "trellis-rebake-gltf: failed to open OBJ %s: %s\n", path, strerror(errno));
-        return TRELLIS_STATUS_IO_ERROR;
-    }
-
-    trellis_mesh_host mesh;
-    memset(&mesh, 0, sizeof(mesh));
-    int64_t vertex_capacity = 0;
-    int64_t face_capacity = 0;
-    char line[8192];
-    int64_t line_no = 0;
-    trellis_status status = TRELLIS_STATUS_OK;
-    while (fgets(line, sizeof(line), f) != NULL) {
-        ++line_no;
-        char * p = line;
-        while (*p == ' ' || *p == '\t') {
-            ++p;
-        }
-        if (p[0] == 'v' && isspace((unsigned char) p[1])) {
-            float x = 0.0f;
-            float y = 0.0f;
-            float z = 0.0f;
-            if (sscanf(p + 1, "%f %f %f", &x, &y, &z) != 3 ||
-                !mesh_add_obj_vertex(&mesh, &vertex_capacity, x, y, z)) {
-                fprintf(stderr, "trellis-rebake-gltf: bad vertex at %s:%lld\n", path, (long long) line_no);
-                status = TRELLIS_STATUS_IO_ERROR;
-                break;
-            }
-        } else if (p[0] == 'f' && isspace((unsigned char) p[1])) {
-            int32_t ids[256];
-            int n = 0;
-            char * q = p + 1;
-            while (*q != '\0') {
-                while (*q != '\0' && isspace((unsigned char) *q)) {
-                    ++q;
-                }
-                if (*q == '\0' || *q == '#') {
-                    break;
-                }
-                if (n >= (int) (sizeof(ids) / sizeof(ids[0])) ||
-                    !parse_obj_index(q, mesh.n_vertices, &ids[n])) {
-                    fprintf(stderr, "trellis-rebake-gltf: bad face index at %s:%lld\n", path, (long long) line_no);
-                    status = TRELLIS_STATUS_IO_ERROR;
-                    break;
-                }
-                ++n;
-                while (*q != '\0' && !isspace((unsigned char) *q)) {
-                    ++q;
-                }
-            }
-            if (status != TRELLIS_STATUS_OK) {
-                break;
-            }
-            if (n < 3) {
-                fprintf(stderr, "trellis-rebake-gltf: face has fewer than 3 vertices at %s:%lld\n", path, (long long) line_no);
-                status = TRELLIS_STATUS_IO_ERROR;
-                break;
-            }
-            for (int i = 1; i + 1 < n; ++i) {
-                if (!mesh_add_face(&mesh, &face_capacity, ids[0], ids[i], ids[i + 1])) {
-                    fprintf(stderr, "trellis-rebake-gltf: failed to append face at %s:%lld\n", path, (long long) line_no);
-                    status = TRELLIS_STATUS_IO_ERROR;
-                    break;
-                }
-            }
-            if (status != TRELLIS_STATUS_OK) {
-                break;
-            }
-        }
-    }
-    fclose(f);
-    if (status == TRELLIS_STATUS_OK && (mesh.n_vertices <= 0 || mesh.n_faces <= 0)) {
-        fprintf(stderr, "trellis-rebake-gltf: OBJ has no usable triangle mesh: %s\n", path);
-        status = TRELLIS_STATUS_IO_ERROR;
-    }
-    if (status != TRELLIS_STATUS_OK) {
-        trellis_mesh_free(&mesh);
-        return status;
-    }
-    *mesh_out = mesh;
-    return TRELLIS_STATUS_OK;
-}
-
 static int checked_mul_size(size_t a, size_t b, size_t * out) {
     if (a != 0 && b > SIZE_MAX / a) {
         return 0;
     }
     *out = a * b;
     return 1;
+}
+
+static trellis_status load_meshbin(const char * path, trellis_mesh_host * mesh_out) {
+    if (path == NULL || mesh_out == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    memset(mesh_out, 0, sizeof(*mesh_out));
+    FILE * f = fopen(path, "rb");
+    if (f == NULL) {
+        fprintf(stderr, "trellis-rebake-gltf: failed to open meshbin %s: %s\n", path, strerror(errno));
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+
+    char magic[8];
+    uint64_t n_vertices = 0;
+    uint64_t n_faces = 0;
+    uint32_t flags = 0;
+    uint32_t reserved = 0;
+    trellis_status status = TRELLIS_STATUS_OK;
+    size_t vertex_count = 0;
+    size_t face_count = 0;
+    if (fread(magic, 1, sizeof(magic), f) != sizeof(magic) ||
+        fread(&n_vertices, sizeof(n_vertices), 1, f) != 1 ||
+        fread(&n_faces, sizeof(n_faces), 1, f) != 1 ||
+        fread(&flags, sizeof(flags), 1, f) != 1 ||
+        fread(&reserved, sizeof(reserved), 1, f) != 1 ||
+        memcmp(magic, "TRLMESH1", 8) != 0 ||
+        n_vertices == 0 || n_faces == 0 ||
+        n_vertices > (uint64_t) INT64_MAX ||
+        n_faces > (uint64_t) INT64_MAX ||
+        n_vertices > (uint64_t) SIZE_MAX ||
+        n_faces > (uint64_t) SIZE_MAX ||
+        !checked_mul_size((size_t) n_vertices, 3u, &vertex_count) ||
+        !checked_mul_size((size_t) n_faces, 3u, &face_count) ||
+        vertex_count > SIZE_MAX / sizeof(float) ||
+        face_count > SIZE_MAX / sizeof(int32_t)) {
+        status = TRELLIS_STATUS_PARSE_ERROR;
+    }
+    (void) reserved;
+
+    trellis_mesh_host mesh;
+    memset(&mesh, 0, sizeof(mesh));
+    if (status == TRELLIS_STATUS_OK) {
+        mesh.vertices = (float *) malloc(vertex_count * sizeof(float));
+        mesh.faces = (int32_t *) malloc(face_count * sizeof(int32_t));
+        mesh.n_vertices = (int64_t) n_vertices;
+        mesh.n_faces = (int64_t) n_faces;
+        if (mesh.vertices == NULL || mesh.faces == NULL) {
+            status = TRELLIS_STATUS_OUT_OF_MEMORY;
+        } else if (fread(mesh.vertices, sizeof(float), vertex_count, f) != vertex_count ||
+                   fread(mesh.faces, sizeof(int32_t), face_count, f) != face_count) {
+            status = TRELLIS_STATUS_IO_ERROR;
+        }
+    }
+    if (status == TRELLIS_STATUS_OK) {
+        for (size_t i = 0; i < face_count; ++i) {
+            if (mesh.faces[i] < 0 || (uint64_t) mesh.faces[i] >= n_vertices) {
+                status = TRELLIS_STATUS_PARSE_ERROR;
+                break;
+            }
+        }
+    }
+    if (status == TRELLIS_STATUS_OK && (flags & 1u) != 0) {
+        size_t uv_count = 0;
+        if (!checked_mul_size((size_t) n_vertices, 2u, &uv_count) ||
+            uv_count > SIZE_MAX / sizeof(float) ||
+            uv_count > (size_t) LONG_MAX / sizeof(float) ||
+            fseek(f, (long) (uv_count * sizeof(float)), SEEK_CUR) != 0) {
+            status = TRELLIS_STATUS_IO_ERROR;
+        }
+    }
+    if (fclose(f) != 0 && status == TRELLIS_STATUS_OK) {
+        status = TRELLIS_STATUS_IO_ERROR;
+    }
+    if (status != TRELLIS_STATUS_OK) {
+        trellis_mesh_free(&mesh);
+        fprintf(stderr, "trellis-rebake-gltf: failed to read meshbin %s: %s\n", path, trellis_status_string(status));
+        return status;
+    }
+    *mesh_out = mesh;
+    return TRELLIS_STATUS_OK;
 }
 
 static trellis_status read_pbr_voxels(const char * path, trellis_pbr_voxels * voxels_out) {
@@ -328,9 +232,9 @@ int main(int argc, char ** argv) {
     memset(&sample_mesh, 0, sizeof(sample_mesh));
     memset(&voxels, 0, sizeof(voxels));
 
-    trellis_status status = load_obj_mesh(mesh_path, &mesh);
+    trellis_status status = load_meshbin(mesh_path, &mesh);
     if (status == TRELLIS_STATUS_OK && sample_path != NULL) {
-        status = load_obj_mesh(sample_path, &sample_mesh);
+        status = load_meshbin(sample_path, &sample_mesh);
     }
     if (status == TRELLIS_STATUS_OK) {
         status = read_pbr_voxels(voxels_path, &voxels);

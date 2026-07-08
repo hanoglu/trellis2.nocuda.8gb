@@ -358,12 +358,12 @@ if (TRELLIS2_C_BUILD_TOOLS)
         target_link_libraries(trellis-infer PRIVATE trellis2_c ggml)
     endif()
 
-    add_executable(trellis-image-to-obj
-        tools/trellis_image_to_obj.c
+    add_executable(trellis-image-to-gltf
+        tools/trellis_image_to_gltf.c
     )
-    target_link_libraries(trellis-image-to-obj PRIVATE trellis2_c ggml)
+    target_link_libraries(trellis-image-to-gltf PRIVATE trellis2_c ggml)
     if (UNIX)
-        target_link_libraries(trellis-image-to-obj PRIVATE m)
+        target_link_libraries(trellis-image-to-gltf PRIVATE m)
     endif()
 
     add_executable(trellis-rebake-gltf
@@ -461,8 +461,8 @@ if (TRELLIS2_C_BUILD_TOOLS)
         if (UNIX)
             target_link_libraries(vkmesh PRIVATE m)
         endif()
-        if (TARGET trellis-image-to-obj)
-            add_dependencies(trellis-image-to-obj vkmesh)
+        if (TARGET trellis-image-to-gltf)
+            add_dependencies(trellis-image-to-gltf vkmesh)
         endif()
     endif()
 

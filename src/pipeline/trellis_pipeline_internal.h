@@ -130,8 +130,6 @@ trellis_status trellis_pipeline_apply_pbr_voxels_to_mesh(
     const trellis_pbr_voxels * voxels,
     trellis_mesh_host * mesh);
 
-trellis_status trellis_pipeline_write_obj(const char * path, const trellis_mesh_host * mesh);
-
 trellis_status trellis_pipeline_write_gltf(
     const char * path,
     const trellis_mesh_host * mesh,
