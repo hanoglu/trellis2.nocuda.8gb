@@ -4,27 +4,27 @@
       "bufferView": 0,
       "componentType": 5125,
       "type": "SCALAR",
-      "count": 14521422
+      "count": 11743296
     },
     {
       "bufferView": 1,
       "componentType": 5126,
       "type": "VEC3",
-      "count": 3939596,
-      "min": [-0.439351082, -0.500001848, -0.446667016],
-      "max": [0.440458119, 0.499981582, 0.446369618]
+      "count": 3501303,
+      "min": [-0.500116527, -0.435111225, -0.206722081],
+      "max": [0.500128865, 0.437362432, 0.207244784]
     },
     {
       "bufferView": 2,
       "componentType": 5126,
       "type": "VEC3",
-      "count": 3939596
+      "count": 3501303
     },
     {
       "bufferView": 3,
       "componentType": 5126,
       "type": "VEC2",
-      "count": 3939596
+      "count": 3501303
     }
   ],
   "asset": {
@@ -34,31 +34,31 @@
   "bufferViews": [
     {
       "buffer": 0,
-      "byteLength": 58085688
+      "byteLength": 46973184
     },
     {
       "buffer": 0,
-      "byteLength": 47275152,
-      "byteOffset": 58085688,
+      "byteLength": 42015636,
+      "byteOffset": 46973184,
       "byteStride": 12
     },
     {
       "buffer": 0,
-      "byteLength": 47275152,
-      "byteOffset": 105360840,
+      "byteLength": 42015636,
+      "byteOffset": 88988820,
       "byteStride": 12
     },
     {
       "buffer": 0,
-      "byteLength": 31516768,
-      "byteOffset": 152635992,
+      "byteLength": 28010424,
+      "byteOffset": 131004456,
       "byteStride": 8
     }
   ],
   "buffers": [
     {
       "uri": "trellis_viewer_output.bin",
-      "byteLength": 184152760
+      "byteLength": 159014880
     }
   ],
   "images": [

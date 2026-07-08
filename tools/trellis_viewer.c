@@ -5,6 +5,7 @@
 #include "trellis_sparse_backend.h"
 #include "raylib.h"
 #include "raymath.h"
+#include "rlgl.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -97,6 +98,7 @@ typedef struct viewer_snapshot {
 
     float * mesh_vertices;
     float * mesh_normals;
+    unsigned char * mesh_colors;
     int mesh_vertex_count;
     int mesh_triangle_count;
     int64_t source_vertices;
@@ -152,6 +154,7 @@ typedef struct viewer_worker_args {
 typedef struct display_mesh {
     float * vertices;
     float * normals;
+    unsigned char * colors;
     int vertex_count;
     int triangle_count;
     int version;
@@ -161,6 +164,12 @@ typedef struct display_mesh {
     int64_t source_vertices;
     int64_t source_faces;
 } display_mesh;
+
+typedef struct viewer_env_override {
+    const char * name;
+    char old_value[256];
+    int had_old;
+} viewer_env_override;
 
 typedef struct display_voxels {
     int32_t * xyz;
@@ -373,6 +382,8 @@ static const char * arg_value(int argc, char ** argv, int * i) {
     return argv[*i];
 }
 
+static int command_available(const char * name);
+
 static void viewer_options_defaults(viewer_options * options) {
     memset(options, 0, sizeof(*options));
     copy_text(options->model_dir, sizeof(options->model_dir), "TRELLIS.2-4B");
@@ -549,6 +560,7 @@ static void viewer_snapshot_free(viewer_snapshot * snapshot) {
     free(snapshot->voxel_xyz);
     free(snapshot->mesh_vertices);
     free(snapshot->mesh_normals);
+    free(snapshot->mesh_colors);
     int version = snapshot->version;
     memset(snapshot, 0, sizeof(*snapshot));
     snapshot->version = version;
@@ -594,6 +606,31 @@ static void shared_clear_error(viewer_shared * shared) {
     pthread_mutex_lock(&shared->mutex);
     shared->error[0] = '\0';
     pthread_mutex_unlock(&shared->mutex);
+}
+
+static void viewer_env_override_begin(viewer_env_override * env, const char * name, const char * value) {
+    if (env == NULL || name == NULL || value == NULL) {
+        return;
+    }
+    memset(env, 0, sizeof(*env));
+    env->name = name;
+    const char * old_value = getenv(name);
+    env->had_old = old_value != NULL;
+    if (old_value != NULL) {
+        copy_text(env->old_value, sizeof(env->old_value), old_value);
+    }
+    setenv(name, value, 1);
+}
+
+static void viewer_env_override_end(const viewer_env_override * env) {
+    if (env == NULL || env->name == NULL) {
+        return;
+    }
+    if (env->had_old) {
+        setenv(env->name, env->old_value, 1);
+    } else {
+        unsetenv(env->name);
+    }
 }
 
 static int sampled_index_i64(int64_t i, int64_t count, int max_count) {
@@ -646,9 +683,165 @@ static Vector3 vec3_from_floats(const float * v) {
     return (Vector3) { v[0], v[1], v[2] };
 }
 
+static unsigned char clamp_u8(float v);
+
+static uint32_t viewer_hash_coord(int x, int y, int z) {
+    uint32_t h = (uint32_t) x * 73856093u ^ (uint32_t) y * 19349663u ^ (uint32_t) z * 83492791u;
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    h *= 0x846ca68bu;
+    h ^= h >> 16;
+    return h;
+}
+
+static size_t viewer_next_pow2_size(size_t v) {
+    size_t p = 1u;
+    while (p < v && p <= SIZE_MAX / 2u) {
+        p <<= 1u;
+    }
+    return p >= v ? p : 0u;
+}
+
+static int32_t * viewer_build_pbr_hash(const trellis_pbr_voxels * voxels, uint32_t * hash_size_out) {
+    if (hash_size_out != NULL) *hash_size_out = 0;
+    if (voxels == NULL || voxels->coords_bxyz == NULL || voxels->attrs == NULL || voxels->n_coords <= 0) {
+        return NULL;
+    }
+    size_t table_size = viewer_next_pow2_size((size_t) voxels->n_coords * 4u);
+    if (table_size == 0 || table_size > UINT32_MAX) {
+        return NULL;
+    }
+    int32_t * entries = (int32_t *) malloc(table_size * 4u * sizeof(int32_t));
+    if (entries == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < table_size; ++i) {
+        entries[i * 4u + 0u] = 0;
+        entries[i * 4u + 1u] = 0;
+        entries[i * 4u + 2u] = 0;
+        entries[i * 4u + 3u] = -1;
+    }
+    for (int64_t i = 0; i < voxels->n_coords; ++i) {
+        const int32_t * c = voxels->coords_bxyz + (size_t) i * 4u;
+        uint32_t slot = viewer_hash_coord(c[1], c[2], c[3]) & ((uint32_t) table_size - 1u);
+        while (entries[(size_t) slot * 4u + 3u] >= 0 &&
+               (entries[(size_t) slot * 4u + 0u] != c[1] ||
+                entries[(size_t) slot * 4u + 1u] != c[2] ||
+                entries[(size_t) slot * 4u + 2u] != c[3])) {
+            slot = (slot + 1u) & ((uint32_t) table_size - 1u);
+        }
+        entries[(size_t) slot * 4u + 0u] = c[1];
+        entries[(size_t) slot * 4u + 1u] = c[2];
+        entries[(size_t) slot * 4u + 2u] = c[3];
+        entries[(size_t) slot * 4u + 3u] = (int32_t) i;
+    }
+    if (hash_size_out != NULL) {
+        *hash_size_out = (uint32_t) table_size;
+    }
+    return entries;
+}
+
+static int viewer_lookup_pbr_hash(const int32_t * entries, uint32_t hash_size, int x, int y, int z) {
+    if (entries == NULL || hash_size == 0) {
+        return -1;
+    }
+    uint32_t slot = viewer_hash_coord(x, y, z) & (hash_size - 1u);
+    for (uint32_t probe = 0; probe < hash_size; ++probe) {
+        const int32_t * e = entries + (size_t) slot * 4u;
+        if (e[3] < 0) {
+            return -1;
+        }
+        if (e[0] == x && e[1] == y && e[2] == z) {
+            return e[3];
+        }
+        slot = (slot + 1u) & (hash_size - 1u);
+    }
+    return -1;
+}
+
+static void viewer_sample_pbr_color(
+    const trellis_pbr_voxels * voxels,
+    const int32_t * hash_entries,
+    uint32_t hash_size,
+    const float p[3],
+    unsigned char out[4]) {
+    out[0] = 176;
+    out[1] = 190;
+    out[2] = 206;
+    out[3] = 255;
+    if (voxels == NULL || voxels->attrs == NULL || voxels->channels < 3 ||
+        hash_entries == NULL || hash_size == 0 || voxels->resolution <= 0) {
+        return;
+    }
+    const int res = voxels->resolution;
+    float q[3] = {
+        (p[0] + 0.5f) * (float) res,
+        (p[1] + 0.5f) * (float) res,
+        (p[2] + 0.5f) * (float) res,
+    };
+    int base[3] = {
+        (int) floorf(q[0] - 0.5f),
+        (int) floorf(q[1] - 0.5f),
+        (int) floorf(q[2] - 0.5f),
+    };
+    float rgb[3] = {0.0f, 0.0f, 0.0f};
+    float sum_w = 0.0f;
+    for (int dz = 0; dz < 2; ++dz) {
+        for (int dy = 0; dy < 2; ++dy) {
+            for (int dx = 0; dx < 2; ++dx) {
+                int c[3] = {base[0] + dx, base[1] + dy, base[2] + dz};
+                if (c[0] < 0 || c[1] < 0 || c[2] < 0 || c[0] >= res || c[1] >= res || c[2] >= res) {
+                    continue;
+                }
+                float wx = 1.0f - fabsf(q[0] - (float) c[0] - 0.5f);
+                float wy = 1.0f - fabsf(q[1] - (float) c[1] - 0.5f);
+                float wz = 1.0f - fabsf(q[2] - (float) c[2] - 0.5f);
+                float w = wx * wy * wz;
+                if (w <= 0.0f) continue;
+                int id = viewer_lookup_pbr_hash(hash_entries, hash_size, c[0], c[1], c[2]);
+                if (id < 0) continue;
+                const float * attr = voxels->attrs + (size_t) id * (size_t) voxels->channels;
+                rgb[0] += attr[0] * w;
+                rgb[1] += attr[1] * w;
+                rgb[2] += attr[2] * w;
+                sum_w += w;
+            }
+        }
+    }
+    if (sum_w <= 1e-6f) {
+        int best = -1;
+        for (int radius = 0; radius <= 2 && best < 0; ++radius) {
+            for (int dz = -radius; dz <= radius && best < 0; ++dz) {
+                for (int dy = -radius; dy <= radius && best < 0; ++dy) {
+                    for (int dx = -radius; dx <= radius; ++dx) {
+                        if (radius > 0 && abs(dx) != radius && abs(dy) != radius && abs(dz) != radius) continue;
+                        int c[3] = {base[0] + dx, base[1] + dy, base[2] + dz};
+                        if (c[0] < 0 || c[1] < 0 || c[2] < 0 || c[0] >= res || c[1] >= res || c[2] >= res) continue;
+                        best = viewer_lookup_pbr_hash(hash_entries, hash_size, c[0], c[1], c[2]);
+                        if (best >= 0) break;
+                    }
+                }
+            }
+        }
+        if (best < 0) {
+            return;
+        }
+        const float * attr = voxels->attrs + (size_t) best * (size_t) voxels->channels;
+        rgb[0] = attr[0];
+        rgb[1] = attr[1];
+        rgb[2] = attr[2];
+        sum_w = 1.0f;
+    }
+    out[0] = clamp_u8((rgb[0] / sum_w) * 255.0f);
+    out[1] = clamp_u8((rgb[1] / sum_w) * 255.0f);
+    out[2] = clamp_u8((rgb[2] / sum_w) * 255.0f);
+}
+
 static void publish_mesh_snapshot(
     viewer_shared * shared,
     const trellis_mesh_host * mesh,
+    const trellis_pbr_voxels * pbr_voxels,
     const char * label) {
     if (mesh == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
         mesh->n_vertices <= 0 || mesh->n_faces <= 0) {
@@ -680,21 +873,31 @@ static void publish_mesh_snapshot(
     int vertex_count = triangle_count * 3;
     float * vertices = (float *) malloc((size_t) vertex_count * 3u * sizeof(float));
     float * normals = (float *) malloc((size_t) vertex_count * 3u * sizeof(float));
-    if (vertices == NULL || normals == NULL) {
+    unsigned char * colors = (unsigned char *) malloc((size_t) vertex_count * 4u);
+    if (vertices == NULL || normals == NULL || colors == NULL) {
         free(vertices);
         free(normals);
+        free(colors);
         return;
     }
+    uint32_t pbr_hash_size = 0;
+    int32_t * pbr_hash = viewer_build_pbr_hash(pbr_voxels, &pbr_hash_size);
 
     for (int i = 0; i < triangle_count; ++i) {
         const int32_t * f = mesh->faces + (size_t) i * 3u;
         Vector3 tri[3];
+        unsigned char tri_color[3][4];
         for (int k = 0; k < 3; ++k) {
             int32_t vi = f[k];
             if (vi < 0 || vi >= mesh->n_vertices) {
                 tri[k] = (Vector3) {0.0f, 0.0f, 0.0f};
+                tri_color[k][0] = 176;
+                tri_color[k][1] = 190;
+                tri_color[k][2] = 206;
+                tri_color[k][3] = 255;
             } else {
                 const float * src = mesh->vertices + (size_t) vi * 3u;
+                viewer_sample_pbr_color(pbr_voxels, pbr_hash, pbr_hash_size, src, tri_color[k]);
                 tri[k] = (Vector3) {
                     (src[0] - center[0]) * scale,
                     (src[2] - center[2]) * scale,
@@ -714,8 +917,14 @@ static void publish_mesh_snapshot(
             ndst[0] = n.x;
             ndst[1] = n.y;
             ndst[2] = n.z;
+            unsigned char * cdst = colors + ((size_t) i * 3u + (size_t) k) * 4u;
+            cdst[0] = tri_color[k][0];
+            cdst[1] = tri_color[k][1];
+            cdst[2] = tri_color[k][2];
+            cdst[3] = tri_color[k][3];
         }
     }
+    free(pbr_hash);
 
     pthread_mutex_lock(&shared->mutex);
     viewer_snapshot_free(&shared->snapshot);
@@ -724,6 +933,7 @@ static void publish_mesh_snapshot(
     copy_text(shared->snapshot.label, sizeof(shared->snapshot.label), label);
     shared->snapshot.mesh_vertices = vertices;
     shared->snapshot.mesh_normals = normals;
+    shared->snapshot.mesh_colors = colors;
     shared->snapshot.mesh_vertex_count = vertex_count;
     shared->snapshot.mesh_triangle_count = triangle_count;
     shared->snapshot.source_vertices = mesh->n_vertices;
@@ -945,12 +1155,53 @@ static trellis_status read_meshbin(const char * path, trellis_mesh_host * mesh_o
     return TRELLIS_STATUS_OK;
 }
 
+static int find_vkmesh_executable(char * out, size_t out_size) {
+    char candidate[VIEWER_MAX_PATH];
+    ssize_t self_len = readlink("/proc/self/exe", candidate, sizeof(candidate) - 1u);
+    if (self_len > 0) {
+        candidate[self_len] = '\0';
+        char * slash = strrchr(candidate, '/');
+        if (slash != NULL) {
+            slash[1] = '\0';
+            size_t len = strlen(candidate);
+            if (len + strlen("vkmesh") + 1u < sizeof(candidate)) {
+                memcpy(candidate + len, "vkmesh", sizeof("vkmesh"));
+                if (access(candidate, X_OK) == 0) {
+                    copy_text(out, out_size, candidate);
+                    return 1;
+                }
+            }
+        }
+    }
+    const char * local_candidates[] = {
+        "build-vulkan/vkmesh",
+        "build-cuda/vkmesh",
+        "vkmesh",
+        NULL,
+    };
+    for (int i = 0; local_candidates[i] != NULL; ++i) {
+        if (access(local_candidates[i], X_OK) == 0) {
+            copy_text(out, out_size, local_candidates[i]);
+            return 1;
+        }
+    }
+    if (command_available("vkmesh")) {
+        copy_text(out, out_size, "vkmesh");
+        return 1;
+    }
+    return 0;
+}
+
 static int run_vkmesh_external(
     const trellis_mesh_host * mesh,
     trellis_mesh_host * processed_out,
     trellis_mesh_host * projection_out,
     int target,
     int no_simplify) {
+    char exe[VIEWER_MAX_PATH];
+    if (!find_vkmesh_executable(exe, sizeof(exe))) {
+        return -1;
+    }
     char input_mesh[VIEWER_MAX_PATH];
     char output_mesh[VIEWER_MAX_PATH];
     char projection_mesh[VIEWER_MAX_PATH];
@@ -964,7 +1215,7 @@ static int run_vkmesh_external(
     snprintf(target_text, sizeof(target_text), "%d", target > 0 ? target : 1000000);
     char * argv[16];
     int argc = 0;
-    argv[argc++] = (char *) "vkmesh";
+    argv[argc++] = exe;
     argv[argc++] = (char *) "--input";
     argv[argc++] = input_mesh;
     argv[argc++] = (char *) "--output";
@@ -992,7 +1243,7 @@ static int run_vkmesh_external(
     unlink(input_mesh);
     unlink(output_mesh);
     unlink(projection_mesh);
-    return ok;
+    return ok ? 1 : 0;
 }
 
 static trellis_status run_mesh_postprocess(
@@ -1018,12 +1269,16 @@ static trellis_status run_mesh_postprocess(
         return status;
     }
 #else
-    if (!run_vkmesh_external(
+    int external_status = run_vkmesh_external(
             mesh,
             &processed,
             &projection,
             options->mesh_postprocess_decimation_target,
-            options->mesh_postprocess_no_simplify)) {
+            options->mesh_postprocess_no_simplify);
+    if (external_status < 0) {
+        return TRELLIS_STATUS_NOT_FOUND;
+    }
+    if (external_status == 0) {
         return TRELLIS_STATUS_ERROR;
     }
 #endif
@@ -1217,13 +1472,27 @@ static trellis_status run_mesh_job(viewer_worker_args * args) {
     mesh_options.sparse_device = options->device;
     mesh_options.sparse_backend = sparse_backend;
     mesh_options.cache = cache_initialized ? &cache : NULL;
+
+    viewer_env_override c2s_guides_env;
+    memset(&c2s_guides_env, 0, sizeof(c2s_guides_env));
+    if (sparse_kind == TRELLIS_SPARSE_BACKEND_VULKAN) {
+        /*
+         * The viewer persists shape_subs after this worker destroys its Vulkan
+         * sparse backend. Keep those subdivision guides host-owned so the later
+         * texture worker does not reuse dangling device maps.
+         */
+        viewer_env_override_begin(&c2s_guides_env, "TRELLIS_VK_DEVICE_C2S_GUIDES", "0");
+    }
     status = trellis_pipeline_decode_shape_latent_mesh(&mesh_options, &next.shape_subs, &next.mesh);
+    if (sparse_kind == TRELLIS_SPARSE_BACKEND_VULKAN) {
+        viewer_env_override_end(&c2s_guides_env);
+    }
     if (status != TRELLIS_STATUS_OK) {
         goto done;
     }
     next.has_mesh = 1;
     trellis_pipeline_model_cache_unpin_all(cache_initialized ? &cache : NULL);
-    publish_mesh_snapshot(shared, &next.mesh, "Raw mesh intermediate");
+    publish_mesh_snapshot(shared, &next.mesh, NULL, "Raw mesh intermediate");
 
     pthread_mutex_lock(&shared->mutex);
     viewer_artifacts_free(&shared->artifacts);
@@ -1353,7 +1622,7 @@ static trellis_status run_texture_job(viewer_worker_args * args) {
         goto done;
     }
     make_base_color_path(gltf_path, base_color_path, sizeof(base_color_path));
-    publish_mesh_snapshot(shared, &artifacts->mesh, "Final mesh");
+    publish_mesh_snapshot(shared, &artifacts->mesh, &pbr_voxels, "Textured mesh preview");
     pthread_mutex_lock(&shared->mutex);
     shared->texture_ready = 1;
     copy_text(shared->gltf_output_path, sizeof(shared->gltf_output_path), gltf_path);
@@ -1387,7 +1656,7 @@ static trellis_status run_postprocess_job(viewer_worker_args * args) {
     trellis_status status = run_mesh_postprocess(options, &shared->artifacts.mesh, &shared->artifacts.projection_mesh);
     if (status == TRELLIS_STATUS_OK) {
         shared->artifacts.has_postprocess = 1;
-        publish_mesh_snapshot(shared, &shared->artifacts.mesh, "Postprocessed mesh");
+        publish_mesh_snapshot(shared, &shared->artifacts.mesh, NULL, "Postprocessed mesh");
         pthread_mutex_lock(&shared->mutex);
         shared->postprocess_ready = 1;
         shared->texture_ready = 0;
@@ -1598,6 +1867,7 @@ static void display_mesh_free(display_mesh * mesh) {
     free(mesh->models);
     free(mesh->vertices);
     free(mesh->normals);
+    free(mesh->colors);
     memset(mesh, 0, sizeof(*mesh));
 }
 
@@ -1653,7 +1923,7 @@ static void display_mesh_upload(display_mesh * display, int lighting) {
     free(display->models);
     display->models = NULL;
     display->model_count = 0;
-    if (display->vertices == NULL || display->normals == NULL || display->vertex_count <= 0) {
+    if (display->vertices == NULL || display->normals == NULL || display->colors == NULL || display->vertex_count <= 0) {
         return;
     }
 
@@ -1689,9 +1959,10 @@ static void display_mesh_upload(display_mesh * display, int lighting) {
         for (int i = 0; i < vertices; ++i) {
             Vector3 n = vec3_from_floats(mesh.normals + (size_t) i * 3u);
             float shade = lighting ? (0.34f + 0.66f * fmaxf(0.0f, Vector3DotProduct(n, light))) : 0.82f;
-            mesh.colors[(size_t) i * 4u + 0u] = clamp_u8(166.0f * shade);
-            mesh.colors[(size_t) i * 4u + 1u] = clamp_u8(185.0f * shade);
-            mesh.colors[(size_t) i * 4u + 2u] = clamp_u8(206.0f * shade);
+            const unsigned char * src_color = display->colors + (first_vertex + (size_t) i) * 4u;
+            mesh.colors[(size_t) i * 4u + 0u] = clamp_u8((float) src_color[0] * shade);
+            mesh.colors[(size_t) i * 4u + 1u] = clamp_u8((float) src_color[1] * shade);
+            mesh.colors[(size_t) i * 4u + 2u] = clamp_u8((float) src_color[2] * shade);
             mesh.colors[(size_t) i * 4u + 3u] = 255;
         }
         UploadMesh(&mesh, false);
@@ -1740,9 +2011,11 @@ static void copy_snapshot_to_display(viewer_shared * shared, display_mesh * mesh
     if (shared->snapshot.mesh_vertices != NULL && local.mesh_vertex_count > 0) {
         local.mesh_vertices = (float *) malloc((size_t) local.mesh_vertex_count * 3u * sizeof(float));
         local.mesh_normals = (float *) malloc((size_t) local.mesh_vertex_count * 3u * sizeof(float));
-        if (local.mesh_vertices != NULL && local.mesh_normals != NULL) {
+        local.mesh_colors = (unsigned char *) malloc((size_t) local.mesh_vertex_count * 4u);
+        if (local.mesh_vertices != NULL && local.mesh_normals != NULL && local.mesh_colors != NULL) {
             memcpy(local.mesh_vertices, shared->snapshot.mesh_vertices, (size_t) local.mesh_vertex_count * 3u * sizeof(float));
             memcpy(local.mesh_normals, shared->snapshot.mesh_normals, (size_t) local.mesh_vertex_count * 3u * sizeof(float));
+            memcpy(local.mesh_colors, shared->snapshot.mesh_colors, (size_t) local.mesh_vertex_count * 4u);
         }
     }
     pthread_mutex_unlock(&shared->mutex);
@@ -1760,6 +2033,7 @@ static void copy_snapshot_to_display(viewer_shared * shared, display_mesh * mesh
         display_mesh_free(mesh);
         mesh->vertices = local.mesh_vertices;
         mesh->normals = local.mesh_normals;
+        mesh->colors = local.mesh_colors;
         mesh->vertex_count = local.mesh_vertex_count;
         mesh->triangle_count = local.mesh_triangle_count;
         mesh->source_vertices = local.source_vertices;
@@ -1767,6 +2041,7 @@ static void copy_snapshot_to_display(viewer_shared * shared, display_mesh * mesh
         mesh->version = local.version;
         local.mesh_vertices = NULL;
         local.mesh_normals = NULL;
+        local.mesh_colors = NULL;
         display_mesh_upload(mesh, lighting);
     } else if (local.kind == VIEWER_SNAPSHOT_NONE) {
         display_mesh_free(mesh);
@@ -2212,11 +2487,15 @@ int main(int argc, char ** argv) {
         if (voxel_display.xyz != NULL) {
             draw_voxels(&voxel_display);
         }
-        for (int i = 0; i < mesh_display.model_count; ++i) {
-            DrawModel(mesh_display.models[i], (Vector3) {0, 0, 0}, 1.0f, WHITE);
-            if (ui.wireframe) {
-                DrawModelWires(mesh_display.models[i], (Vector3) {0, 0, 0}, 1.002f, (Color) {16, 22, 28, 210});
+        if (mesh_display.model_count > 0) {
+            rlDisableBackfaceCulling();
+            for (int i = 0; i < mesh_display.model_count; ++i) {
+                DrawModel(mesh_display.models[i], (Vector3) {0, 0, 0}, 1.0f, WHITE);
+                if (ui.wireframe) {
+                    DrawModelWires(mesh_display.models[i], (Vector3) {0, 0, 0}, 1.002f, (Color) {16, 22, 28, 210});
+                }
             }
+            rlEnableBackfaceCulling();
         }
         EndMode3D();
         EndScissorMode();
