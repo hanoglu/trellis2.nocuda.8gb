@@ -1,0 +1,133 @@
+{
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5125,
+      "type": "SCALAR",
+      "count": 14521422
+    },
+    {
+      "bufferView": 1,
+      "componentType": 5126,
+      "type": "VEC3",
+      "count": 3939596,
+      "min": [-0.439351082, -0.500001848, -0.446667016],
+      "max": [0.440458119, 0.499981582, 0.446369618]
+    },
+    {
+      "bufferView": 2,
+      "componentType": 5126,
+      "type": "VEC3",
+      "count": 3939596
+    },
+    {
+      "bufferView": 3,
+      "componentType": 5126,
+      "type": "VEC2",
+      "count": 3939596
+    }
+  ],
+  "asset": {
+    "generator": "trellis2.c",
+    "version": "2.0"
+  },
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteLength": 58085688
+    },
+    {
+      "buffer": 0,
+      "byteLength": 47275152,
+      "byteOffset": 58085688,
+      "byteStride": 12
+    },
+    {
+      "buffer": 0,
+      "byteLength": 47275152,
+      "byteOffset": 105360840,
+      "byteStride": 12
+    },
+    {
+      "buffer": 0,
+      "byteLength": 31516768,
+      "byteOffset": 152635992,
+      "byteStride": 8
+    }
+  ],
+  "buffers": [
+    {
+      "uri": "trellis_viewer_output.bin",
+      "byteLength": 184152760
+    }
+  ],
+  "images": [
+    {
+      "uri": "trellis_viewer_output_baseColor.png"
+    },
+    {
+      "uri": "trellis_viewer_output_metallicRoughness.png"
+    }
+  ],
+  "meshes": [
+    {
+      "name": "trellis_mesh",
+      "primitives": [
+        {
+          "indices": 0,
+          "material": 0,
+          "attributes": {
+            "POSITION": 1,
+            "NORMAL": 2,
+            "TEXCOORD_0": 3
+          }
+        }
+      ]
+    }
+  ],
+  "materials": [
+    {
+      "name": "trellis_pbr",
+      "doubleSided": true,
+      "pbrMetallicRoughness": {
+        "baseColorTexture": {
+          "index": 0
+        },
+        "metallicRoughnessTexture": {
+          "index": 1
+        }
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "mesh": 0,
+      "name": "trellis"
+    }
+  ],
+  "samplers": [
+    {
+      "magFilter": 9729,
+      "minFilter": 9729,
+      "wrapS": 33071,
+      "wrapT": 33071
+    }
+  ],
+  "scene": 0,
+  "scenes": [
+    {
+      "name": "Scene",
+      "nodes": [ 0 ]
+    }
+  ],
+  "textures": [
+    {
+      "source": 0,
+      "sampler": 0
+    },
+    {
+      "source": 1,
+      "sampler": 0
+    }
+  ]
+}

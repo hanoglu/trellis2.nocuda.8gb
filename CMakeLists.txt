@@ -634,6 +634,15 @@ if (TRELLIS2_C_BUILD_TOOLS)
             target_link_libraries(trellis-live PRIVATE m)
         endif()
 
+        add_executable(trellis-viewer tools/trellis_viewer.c)
+        target_include_directories(trellis-viewer PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/src/pipeline"
+            "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse")
+        target_link_libraries(trellis-viewer PRIVATE trellis2_c ggml raylib)
+        if (UNIX)
+            target_link_libraries(trellis-viewer PRIVATE m pthread)
+        endif()
+
         add_executable(trellis-voxel-viewer tools/viewers/trellis_voxel_viewer.c)
         target_link_libraries(trellis-voxel-viewer PRIVATE raylib)
         if (UNIX)
