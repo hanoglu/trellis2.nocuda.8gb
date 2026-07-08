@@ -1,4 +1,5 @@
 #include "trellis.h"
+#include "trellis_ggml_layers.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -227,6 +228,126 @@ static int test_pixel_shuffle_3d(trellis_backend_context * backend) {
     return 1;
 }
 
+static float attention_input_value(int index, float phase, float scale) {
+    return scale * (sinf((float) index * phase) + 0.5f * cosf((float) (index + 17) * (phase * 0.37f)));
+}
+
+static int check_attention_close(const float * got, const float * exp, int64_t n, float tol, const char * name) {
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    int64_t max_abs_idx = 0;
+    int64_t bad_count = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        if (!isfinite(got[i]) || !isfinite(exp[i])) {
+            fprintf(stderr, "%s[%lld] non-finite: got=%g expected=%g\n", name, (long long) i, got[i], exp[i]);
+            return 0;
+        }
+        const float diff = fabsf(got[i] - exp[i]);
+        const float scale = fmaxf(1.0f, fabsf(exp[i]));
+        const float rel = diff / scale;
+        if (diff > max_abs) {
+            max_abs = diff;
+            max_abs_idx = i;
+        }
+        if (rel > max_rel) {
+            max_rel = rel;
+        }
+        if (diff > tol * scale) {
+            if (bad_count < 8) {
+                fprintf(
+                    stderr,
+                    "%s[%lld] mismatch: got=%g expected=%g diff=%g tol=%g\n",
+                    name,
+                    (long long) i,
+                    got[i],
+                    exp[i],
+                    diff,
+                    tol * scale);
+            }
+            ++bad_count;
+        }
+    }
+    if (bad_count != 0) {
+        fprintf(
+            stderr,
+            "%s mismatches=%lld/%lld max_abs=%g max_rel=%g max_abs_idx=%lld\n",
+            name,
+            (long long) bad_count,
+            (long long) n,
+            max_abs,
+            max_rel,
+            (long long) max_abs_idx);
+        return 0;
+    }
+    printf("%s max_abs=%g max_rel=%g\n", name, max_abs, max_rel);
+    return 1;
+}
+
+static int test_sdpa_flash_attention(trellis_backend_context * backend, int tokens, int batches) {
+    enum { HEAD_DIM = 128, HEADS = 12 };
+    const int64_t nels = (int64_t) HEAD_DIM * tokens * HEADS * batches;
+    const size_t bytes = (size_t) nels * sizeof(float);
+    float * q_data = (float *) malloc(bytes);
+    float * k_data = (float *) malloc(bytes);
+    float * v_data = (float *) malloc(bytes);
+    float * explicit_out = (float *) malloc(bytes);
+    float * flash_out = (float *) malloc(bytes);
+    CHECK_TRUE(q_data != NULL && k_data != NULL && v_data != NULL && explicit_out != NULL && flash_out != NULL);
+
+    for (int64_t i = 0; i < nels; ++i) {
+        q_data[i] = attention_input_value((int) i, 0.0137f, 0.125f);
+        k_data[i] = attention_input_value((int) i, 0.0171f, 0.125f);
+        v_data[i] = attention_input_value((int) i, 0.0193f, 0.25f);
+    }
+
+    struct ggml_context * ctx = make_graph_ctx();
+    CHECK_TRUE(ctx != NULL);
+    struct ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HEAD_DIM, tokens, HEADS, batches);
+    struct ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HEAD_DIM, tokens, HEADS, batches);
+    struct ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, HEAD_DIM, tokens, HEADS, batches);
+    CHECK_TRUE(q != NULL && k != NULL && v != NULL);
+    ggml_set_name(q, "q");
+    ggml_set_name(k, "k");
+    ggml_set_name(v, "v");
+
+    const float scale = 1.0f / sqrtf((float) HEAD_DIM);
+    trellis_ggml_set_flash_attn_enabled(0);
+    struct ggml_tensor * explicit_y = trellis_ggml_sdpa(ctx, q, k, v, scale);
+    ggml_set_name(explicit_y, "sdpa_explicit");
+    trellis_ggml_set_flash_attn_enabled(1);
+    struct ggml_tensor * flash_y = trellis_ggml_sdpa(ctx, q, k, v, scale);
+    ggml_set_name(flash_y, "sdpa_flash");
+    trellis_ggml_set_flash_attn_enabled(0);
+    CHECK_TRUE(explicit_y != NULL && flash_y != NULL);
+    CHECK_TRUE(ggml_nelements(explicit_y) == ggml_nelements(flash_y));
+
+    struct ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, explicit_y);
+    ggml_build_forward_expand(graph, flash_y);
+    ggml_gallocr_t alloc = trellis_backend_new_graph_allocator(backend);
+    CHECK_TRUE(alloc != NULL);
+    CHECK_TRUE(ggml_gallocr_alloc_graph(alloc, graph));
+    ggml_backend_tensor_set(q, q_data, 0, ggml_nbytes(q));
+    ggml_backend_tensor_set(k, k_data, 0, ggml_nbytes(k));
+    ggml_backend_tensor_set(v, v_data, 0, ggml_nbytes(v));
+    CHECK_TRUE(trellis_backend_compute_graph(backend, graph) == TRELLIS_STATUS_OK);
+    ggml_backend_tensor_get(explicit_y, explicit_out, 0, ggml_nbytes(explicit_y));
+    ggml_backend_tensor_get(flash_y, flash_out, 0, ggml_nbytes(flash_y));
+
+    char name[128];
+    snprintf(name, sizeof(name), "sdpa_flash_%s_%dtok_b%d", trellis_backend_kind_name(backend->kind), tokens, batches);
+    const int ok = check_attention_close(flash_out, explicit_out, ggml_nelements(explicit_y), 2e-2f, name);
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    free(q_data);
+    free(k_data);
+    free(v_data);
+    free(explicit_out);
+    free(flash_out);
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     const char * backend_name = argc > 1 ? argv[1] : TRELLIS_DEFAULT_GGML_BACKEND;
     trellis_backend_kind kind;
@@ -245,6 +366,9 @@ int main(int argc, char ** argv) {
 
     int ok = test_conv3d(&backend);
     ok = ok && test_pixel_shuffle_3d(&backend);
+    ok = ok && test_sdpa_flash_attention(&backend, 512, 1);
+    ok = ok && test_sdpa_flash_attention(&backend, 1024, 1);
+    ok = ok && test_sdpa_flash_attention(&backend, 512, 2);
     trellis_backend_free(&backend);
     if (!ok) {
         return 1;

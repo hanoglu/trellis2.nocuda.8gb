@@ -2,6 +2,7 @@
 
 #include "trellis.h"
 #include "trellis_dit_flow_executor.h"
+#include "trellis_ggml_layers.h"
 #include "trellis_pipeline_internal.h"
 
 #include <ctype.h>

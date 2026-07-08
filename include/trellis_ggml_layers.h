@@ -36,6 +36,7 @@ struct ggml_tensor * trellis_ggml_bf16_roundtrip(
 
 /* Selects flash-attention or explicit attention for trellis_ggml_sdpa. */
 void trellis_ggml_set_flash_attn_enabled(int enabled);
+int trellis_ggml_flash_attn_enabled(void);
 
 /* Per-head RMS normalization for attention query/key tensors. */
 struct ggml_tensor * trellis_ggml_multihead_rms_norm(

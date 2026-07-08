@@ -111,6 +111,7 @@ typedef struct trellis_sparse_structure_options {
     int flow_blocks_override;
     int flow_block_parts_override;
     int flow_no_rope;
+    int use_ggml_flash_attn;
     float voxel_threshold;
     const trellis_backend_context * backend;
     const trellis_cuda_context * cuda;

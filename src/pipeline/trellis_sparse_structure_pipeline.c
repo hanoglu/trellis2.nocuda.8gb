@@ -1,5 +1,6 @@
 #include "trellis.h"
 #include "trellis_dit_flow_executor.h"
+#include "trellis_ggml_layers.h"
 #include "trellis_pipeline_internal.h"
 
 #include <math.h>
@@ -571,6 +572,7 @@ static int run_sparse_structure_image(
     int flow_blocks_override,
     int flow_block_parts_override,
     int flow_no_rope,
+    int use_ggml_flash_attn,
     float threshold,
     trellis_pipeline_model_cache * cache,
     trellis_sparse_structure_result * result) {
@@ -687,6 +689,7 @@ static int run_sparse_structure_image(
         fprintf(stderr, "sparse structure: unexpected flow cond channels %d\n", flow.cond_channels);
         goto cleanup;
     }
+    trellis_ggml_set_flash_attn_enabled(use_ggml_flash_attn);
 
     const int tokens = latent_size * latent_size * latent_size;
     const size_t latent_count = (size_t) flow.in_channels * (size_t) tokens;
@@ -909,6 +912,7 @@ static int run_sparse_structure_image(
     rc = 0;
 
 cleanup:
+    trellis_ggml_set_flash_attn_enabled(0);
     if (rc != 0 && result != NULL) {
         trellis_sparse_structure_result_free(result);
     }
@@ -959,6 +963,7 @@ trellis_status trellis_pipeline_run_sparse_structure(
         options->flow_blocks_override,
         options->flow_block_parts_override,
         options->flow_no_rope,
+        options->use_ggml_flash_attn,
         options->voxel_threshold,
         options->cache,
         result);

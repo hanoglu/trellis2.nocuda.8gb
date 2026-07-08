@@ -717,6 +717,7 @@ typedef struct trellis_image_to_gltf_options {
     int flow_no_rope;
     int emulate_bf16_blocks;
     int use_ggml_flash_attn;
+    int no_ggml_flash_attn;
     int decode_max_levels;
     int64_t decode_max_input_tokens;
     int max_num_tokens;

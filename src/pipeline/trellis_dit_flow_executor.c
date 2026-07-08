@@ -1,4 +1,5 @@
 #include "trellis_dit_flow_executor.h"
+#include "trellis_ggml_layers.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -75,6 +76,9 @@ static int cfg_batch_attention_is_reasonable(
     }
     const int debug_parts = weights->debug_block_parts < 0 ? 3 : weights->debug_block_parts;
     if (weights->n_blocks <= 0 || debug_parts <= 0) {
+        return 1;
+    }
+    if (trellis_ggml_flash_attn_enabled()) {
         return 1;
     }
     size_t estimate = 0;

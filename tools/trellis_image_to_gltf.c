@@ -65,7 +65,8 @@ static void usage(FILE * out, const char * argv0) {
         "  --flow-block-parts N    Debug: per-block parts 1=self, 2=self+cross, 3=full\n"
         "  --flow-no-rope          Debug: disable sparse RoPE\n"
         "  --emulate-bf16-blocks   Debug: round structured-latent block activations like reference bf16 flow\n"
-        "  --use-ggml-flash-attn   Debug: use ggml flash attention in structured-latent flow\n"
+        "  --use-ggml-flash-attn   Use ggml flash attention in DiT flows, default on\n"
+        "  --no-ggml-flash-attn    Debug: disable ggml flash attention and use explicit SDPA\n"
         "  --decode-max-levels N   Debug: run only first N shape decoder levels, default full\n"
         "  --decode-max-input-tokens N Debug: truncate shape decoder input tokens\n"
         "  --max-num-tokens N      Cascade token budget hint, default 49152\n"
@@ -161,6 +162,7 @@ int main(int argc, char ** argv) {
     options.max_num_tokens = 49152;
     options.model_cache = 1;
     options.model_cache_budget_mib = 0;
+    options.use_ggml_flash_attn = 1;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--model") == 0) {
@@ -250,6 +252,10 @@ int main(int argc, char ** argv) {
             options.emulate_bf16_blocks = 1;
         } else if (strcmp(argv[i], "--use-ggml-flash-attn") == 0) {
             options.use_ggml_flash_attn = 1;
+            options.no_ggml_flash_attn = 0;
+        } else if (strcmp(argv[i], "--no-ggml-flash-attn") == 0) {
+            options.use_ggml_flash_attn = 0;
+            options.no_ggml_flash_attn = 1;
         } else if (strcmp(argv[i], "--decode-max-levels") == 0) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.decode_max_levels)) goto bad_args;
         } else if (strcmp(argv[i], "--decode-max-input-tokens") == 0) {

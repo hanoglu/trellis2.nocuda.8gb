@@ -73,7 +73,7 @@ static const trellis_component_status g_status[] = {
         TRELLIS_COMPONENT_SHAPE_SLAT_FLOW,
         "SLatFlowModel",
         true,
-        "sparse coordinate host semantics and dense transformer operators are implemented; varlen FlashAttention CUDA packing is pending",
+        "sparse coordinate host semantics, dense transformer operators, and ggml FlashAttention SDPA are implemented",
     },
     {
         TRELLIS_COMPONENT_TEX_SLAT_FLOW,
@@ -1312,6 +1312,11 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     int64_t cascade_decoder_n = 0;
     int32_t * cascade_coords = NULL;
     int64_t cascade_n = 0;
+    int use_ggml_flash_attn = options->no_ggml_flash_attn ? 0 : 1;
+    if (options->use_ggml_flash_attn) {
+        use_ggml_flash_attn = 1;
+    }
+    TRELLIS_INFO("ggml flash attention: %s", use_ggml_flash_attn ? "enabled" : "disabled");
 
     const char * pipeline_type =
         options->pipeline_type != NULL && options->pipeline_type[0] != '\0' ?
@@ -1376,6 +1381,7 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     sparse_structure.flow_blocks_override = options->flow_blocks_override;
     sparse_structure.flow_block_parts_override = options->flow_block_parts_override;
     sparse_structure.flow_no_rope = options->flow_no_rope;
+    sparse_structure.use_ggml_flash_attn = use_ggml_flash_attn;
     sparse_structure.voxel_threshold = 0.0f;
     sparse_structure.backend = &graph_backend;
     sparse_structure.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
@@ -1433,7 +1439,7 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     structured_latent.flow_block_parts_override = options->flow_block_parts_override;
     structured_latent.flow_no_rope = options->flow_no_rope;
     structured_latent.emulate_bf16_blocks = options->emulate_bf16_blocks;
-    structured_latent.use_ggml_flash_attn = options->use_ggml_flash_attn;
+    structured_latent.use_ggml_flash_attn = use_ggml_flash_attn;
     structured_latent.backend = &graph_backend;
     structured_latent.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
     structured_latent.cache = model_cache_ptr;
@@ -1613,7 +1619,7 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     texture_options.flow_block_parts_override = options->flow_block_parts_override;
     texture_options.flow_no_rope = options->flow_no_rope;
     texture_options.emulate_bf16_blocks = options->emulate_bf16_blocks;
-    texture_options.use_ggml_flash_attn = options->use_ggml_flash_attn;
+    texture_options.use_ggml_flash_attn = use_ggml_flash_attn;
     texture_options.backend = &graph_backend;
     texture_options.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
     texture_options.cache = model_cache_ptr;

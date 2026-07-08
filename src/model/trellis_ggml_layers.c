@@ -10,6 +10,10 @@ void trellis_ggml_set_flash_attn_enabled(int enabled) {
     g_trellis_ggml_use_flash_attn = enabled ? 1 : 0;
 }
 
+int trellis_ggml_flash_attn_enabled(void) {
+    return g_trellis_ggml_use_flash_attn;
+}
+
 static struct ggml_tensor * trellis_ggml_cast_param_like(
     struct ggml_context * ctx,
     struct ggml_tensor * param,
@@ -142,16 +146,18 @@ struct ggml_tensor * trellis_ggml_sdpa(
     struct ggml_tensor * v,
     float scale) {
     if (g_trellis_ggml_use_flash_attn) {
+        if (k->type == GGML_TYPE_F32) {
+            k = ggml_cast(ctx, k, GGML_TYPE_F16);
+        }
+        if (v->type == GGML_TYPE_F32) {
+            v = ggml_cast(ctx, v, GGML_TYPE_F16);
+        }
         struct ggml_tensor * h = ggml_flash_attn_ext(ctx, q, k, v, NULL, scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(h, GGML_PREC_F32);
         h = ggml_permute(ctx, h, 0, 2, 1, 3);
         return ggml_cont_4d(ctx, h, v->ne[0], q->ne[1], q->ne[2], q->ne[3]);
     }
 
-    /* ggml's CUDA flash-attention path produces NaNs for the sparse-structure flow at
-     * 512+ latent tokens in this build. Use explicit scaled dot-product
-     * attention; it is heavier but keeps the pure C/ggml/CUDA path numerically
-     * stable while larger-token kernels are tuned.
-     */
     struct ggml_tensor * scores = ggml_mul_mat(ctx, k, q);
     scores = ggml_scale(ctx, scores, scale);
     scores = ggml_soft_max(ctx, scores);
