@@ -107,6 +107,7 @@ static int pthread_detach(pthread_t thread) {
 #endif
 
 extern unsigned char * stbi_load(char const * filename, int * x, int * y, int * comp, int req_comp);
+extern unsigned char * stbi_load_from_memory(unsigned char const * buffer, int len, int * x, int * y, int * comp, int req_comp);
 extern void stbi_image_free(void * retval_from_stbi_load);
 extern int stbi_write_png(char const * filename, int w, int h, int comp, const void * data, int stride_in_bytes);
 
@@ -3546,20 +3547,30 @@ static Texture2D viewer_load_texture_from_path(const char * path, char * error, 
         return texture;
     }
 
-    Image image = LoadImageFromMemory(ext, data, data_size);
+    int width = 0;
+    int height = 0;
+    int comp = 0;
+    unsigned char * rgba = stbi_load_from_memory(data, data_size, &width, &height, &comp, 4);
     free(data);
     if (delete_temp) {
         trellis_unlink(load_path);
     }
-    if (image.data == NULL || image.width <= 0 || image.height <= 0) {
+    if (rgba == NULL || width <= 0 || height <= 0) {
+        stbi_image_free(rgba);
         if (error != NULL && error_size > 0) {
             snprintf(error, error_size, "could not decode image preview");
         }
         return texture;
     }
 
+    Image image = {0};
+    image.data = rgba;
+    image.width = width;
+    image.height = height;
+    image.mipmaps = 1;
+    image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
     texture = LoadTextureFromImage(image);
-    UnloadImage(image);
+    stbi_image_free(rgba);
     if (texture.id == 0) {
         if (error != NULL && error_size > 0) {
             snprintf(error, error_size, "could not upload image preview");
