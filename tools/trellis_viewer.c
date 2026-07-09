@@ -114,6 +114,7 @@ extern int stbi_write_png(char const * filename, int w, int h, int comp, const v
 #define VIEWER_MESH_CHUNK_FACES 120000
 #define VIEWER_MAX_PREVIEW_VOXELS 18000
 #define VIEWER_PREVIEW_AABB_SIZE 2.15f
+#define VIEWER_APP_TITLE "trellis2 local"
 
 typedef enum viewer_job_type {
     VIEWER_JOB_NONE = 0,
@@ -1315,6 +1316,10 @@ static Vector3 vec3_from_floats(const float * v) {
     return (Vector3) { v[0], v[1], v[2] };
 }
 
+static float vec3_len_sq(Vector3 v) {
+    return v.x * v.x + v.y * v.y + v.z * v.z;
+}
+
 static unsigned char clamp_u8(float v);
 
 static uint32_t viewer_hash_coord(int x, int y, int z) {
@@ -1506,14 +1511,50 @@ static void publish_mesh_snapshot(
     float * vertices = (float *) malloc((size_t) vertex_count * 3u * sizeof(float));
     float * normals = (float *) malloc((size_t) vertex_count * 3u * sizeof(float));
     unsigned char * colors = (unsigned char *) malloc((size_t) vertex_count * 4u);
-    if (vertices == NULL || normals == NULL || colors == NULL) {
+    float * smooth_normals = (float *) calloc((size_t) mesh->n_vertices * 3u, sizeof(float));
+    if (vertices == NULL || normals == NULL || colors == NULL || smooth_normals == NULL) {
         free(vertices);
         free(normals);
         free(colors);
+        free(smooth_normals);
         return;
     }
     uint32_t pbr_hash_size = 0;
     int32_t * pbr_hash = viewer_build_pbr_hash(pbr_voxels, &pbr_hash_size);
+
+    for (int i = 0; i < triangle_count; ++i) {
+        const int32_t * f = mesh->faces + (size_t) i * 3u;
+        Vector3 tri[3];
+        int valid = 1;
+        for (int k = 0; k < 3; ++k) {
+            int32_t vi = f[k];
+            if (vi < 0 || vi >= mesh->n_vertices) {
+                valid = 0;
+                break;
+            }
+            const float * src = mesh->vertices + (size_t) vi * 3u;
+            tri[k] = (Vector3) {
+                (src[0] - center[0]) * scale,
+                (src[2] - center[2]) * scale,
+                (src[1] - center[1]) * scale,
+            };
+        }
+        if (!valid) {
+            continue;
+        }
+        Vector3 e0 = Vector3Subtract(tri[1], tri[0]);
+        Vector3 e1 = Vector3Subtract(tri[2], tri[0]);
+        Vector3 area_n = Vector3CrossProduct(e0, e1);
+        if (vec3_len_sq(area_n) <= 1e-14f) {
+            continue;
+        }
+        for (int k = 0; k < 3; ++k) {
+            float * acc = smooth_normals + (size_t) f[k] * 3u;
+            acc[0] += area_n.x;
+            acc[1] += area_n.y;
+            acc[2] += area_n.z;
+        }
+    }
 
     for (int i = 0; i < triangle_count; ++i) {
         const int32_t * f = mesh->faces + (size_t) i * 3u;
@@ -1539,13 +1580,22 @@ static void publish_mesh_snapshot(
         }
         Vector3 e0 = Vector3Subtract(tri[1], tri[0]);
         Vector3 e1 = Vector3Subtract(tri[2], tri[0]);
-        Vector3 n = Vector3Normalize(Vector3CrossProduct(e0, e1));
+        Vector3 face_n = Vector3CrossProduct(e0, e1);
+        face_n = vec3_len_sq(face_n) > 1e-14f ? Vector3Normalize(face_n) : (Vector3) {0.0f, 1.0f, 0.0f};
         for (int k = 0; k < 3; ++k) {
             float * dst = vertices + ((size_t) i * 3u + (size_t) k) * 3u;
             float * ndst = normals + ((size_t) i * 3u + (size_t) k) * 3u;
             dst[0] = tri[k].x;
             dst[1] = tri[k].y;
             dst[2] = tri[k].z;
+            Vector3 n = face_n;
+            int32_t vi = f[k];
+            if (vi >= 0 && vi < mesh->n_vertices) {
+                Vector3 smooth_n = vec3_from_floats(smooth_normals + (size_t) vi * 3u);
+                if (vec3_len_sq(smooth_n) > 1e-14f) {
+                    n = Vector3Normalize(smooth_n);
+                }
+            }
             ndst[0] = n.x;
             ndst[1] = n.y;
             ndst[2] = n.z;
@@ -1557,6 +1607,7 @@ static void publish_mesh_snapshot(
         }
     }
     free(pbr_hash);
+    free(smooth_normals);
 
     pthread_mutex_lock(&shared->mutex);
     viewer_snapshot_free(&shared->snapshot);
@@ -2607,6 +2658,39 @@ static unsigned char clamp_u8(float v) {
     return (unsigned char) lrintf(v);
 }
 
+static float viewer_smooth_shade(Vector3 n, int lighting) {
+    if (!lighting) {
+        return 0.86f;
+    }
+    if (vec3_len_sq(n) <= 1e-12f) {
+        n = (Vector3) {0.0f, 1.0f, 0.0f};
+    } else {
+        n = Vector3Normalize(n);
+    }
+    Vector3 key = Vector3Normalize((Vector3) {-0.42f, 0.78f, 0.46f});
+    Vector3 fill = Vector3Normalize((Vector3) {0.68f, 0.36f, -0.58f});
+    Vector3 rim = Vector3Normalize((Vector3) {0.18f, 0.48f, -0.86f});
+    float key_term = fmaxf(0.0f, Vector3DotProduct(n, key));
+    float fill_term = fmaxf(0.0f, Vector3DotProduct(n, fill));
+    float rim_term = fmaxf(0.0f, Vector3DotProduct(n, rim));
+    float sky = fmaxf(0.0f, n.y);
+    float ground = fmaxf(0.0f, -n.y);
+    float half_lambert = 0.5f + 0.5f * Vector3DotProduct(n, key);
+    half_lambert = half_lambert * half_lambert;
+    float shade =
+        0.36f +
+        0.22f * sky +
+        0.08f * ground +
+        0.34f * half_lambert +
+        0.18f * key_term +
+        0.10f * fill_term +
+        0.08f * rim_term * rim_term;
+    if (shade > 1.18f) {
+        shade = 1.18f;
+    }
+    return shade;
+}
+
 static void display_mesh_upload(display_mesh * display, int lighting) {
     for (int i = 0; i < display->model_count; ++i) {
         UnloadModel(display->models[i]);
@@ -2624,7 +2708,6 @@ static void display_mesh_upload(display_mesh * display, int lighting) {
         return;
     }
 
-    Vector3 light = Vector3Normalize((Vector3) {-0.45f, 0.75f, 0.48f});
     int uploaded = 0;
     for (int chunk = 0; chunk < chunk_count; ++chunk) {
         int first_face = chunk * VIEWER_MESH_CHUNK_FACES;
@@ -2649,7 +2732,7 @@ static void display_mesh_upload(display_mesh * display, int lighting) {
         memcpy(mesh.normals, display->normals + first_vertex * 3u, (size_t) vertices * 3u * sizeof(float));
         for (int i = 0; i < vertices; ++i) {
             Vector3 n = vec3_from_floats(mesh.normals + (size_t) i * 3u);
-            float shade = lighting ? (0.34f + 0.66f * fmaxf(0.0f, Vector3DotProduct(n, light))) : 0.82f;
+            float shade = viewer_smooth_shade(n, lighting);
             const unsigned char * src_color = display->colors + (first_vertex + (size_t) i) * 4u;
             mesh.colors[(size_t) i * 4u + 0u] = clamp_u8((float) src_color[0] * shade);
             mesh.colors[(size_t) i * 4u + 1u] = clamp_u8((float) src_color[1] * shade);
@@ -3086,7 +3169,7 @@ static void draw_left_panel(
     int * thread_active) {
     DrawRectangleRec(panel, (Color) {17, 20, 25, 255});
     DrawRectangle((int) (panel.x + panel.width - 1.0f), 0, 1, GetScreenHeight(), (Color) {44, 51, 60, 255});
-    DrawText("TRELLIS Local", (int) panel.x + 18, 18, 24, RAYWHITE);
+    DrawText(VIEWER_APP_TITLE, (int) panel.x + 18, 18, 24, RAYWHITE);
     DrawText("image-to-3D workspace", (int) panel.x + 20, 48, 13, (Color) {144, 154, 164, 255});
 
     if (CheckCollisionPointRec(GetMousePosition(), panel)) {
@@ -3277,7 +3360,7 @@ int main(int argc, char ** argv) {
     }
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
-    InitWindow(options.width, options.height, "TRELLIS Local");
+    InitWindow(options.width, options.height, VIEWER_APP_TITLE);
     SetTargetFPS(60);
 
     viewer_ui_state ui;
