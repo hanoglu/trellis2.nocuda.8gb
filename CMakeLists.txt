@@ -632,12 +632,17 @@ if (TRELLIS2_C_BUILD_TOOLS)
         if (WIN32)
             set_source_files_properties(tools/trellis_viewer.c PROPERTIES COMPILE_DEFINITIONS "NOGDI;NOUSER")
         endif()
-        add_executable(trellis-gui tools/trellis_viewer.c)
+        set(TRELLIS_GUI_SOURCES tools/trellis_viewer.c)
+        if (WIN32)
+            list(APPEND TRELLIS_GUI_SOURCES tools/trellis_win_file_dialog.c)
+        endif()
+        add_executable(trellis-gui ${TRELLIS_GUI_SOURCES})
         target_include_directories(trellis-gui PRIVATE
             "${CMAKE_CURRENT_LIST_DIR}/src/pipeline"
             "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse")
         target_link_libraries(trellis-gui PRIVATE trellis2_c ggml raylib)
         if (WIN32)
+            target_link_libraries(trellis-gui PRIVATE comdlg32)
             set_target_properties(trellis-gui PROPERTIES WIN32_EXECUTABLE TRUE)
             target_link_options(trellis-gui PRIVATE /ENTRY:mainCRTStartup)
             add_custom_command(TARGET trellis-gui POST_BUILD

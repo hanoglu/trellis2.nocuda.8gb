@@ -110,6 +110,10 @@ extern unsigned char * stbi_load(char const * filename, int * x, int * y, int * 
 extern void stbi_image_free(void * retval_from_stbi_load);
 extern int stbi_write_png(char const * filename, int w, int h, int comp, const void * data, int stride_in_bytes);
 
+#ifdef _WIN32
+int trellis_win_open_image_file_dialog(char * out, size_t out_size);
+#endif
+
 #define VIEWER_MAX_PATH 4096
 #define VIEWER_MESH_CHUNK_FACES 120000
 #define VIEWER_MAX_PREVIEW_VOXELS 18000
@@ -309,9 +313,31 @@ static int text_is_empty(const char * text) {
     return text == NULL || text[0] == '\0';
 }
 
+#ifdef _WIN32
+static int viewer_utf8_to_wide(const char * text, WCHAR * out, size_t out_count) {
+    if (text_is_empty(text) || out == NULL || out_count == 0 || out_count > INT_MAX) {
+        return 0;
+    }
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, out, (int) out_count);
+    if (n > 0) {
+        return 1;
+    }
+    n = MultiByteToWideChar(CP_ACP, 0, text, -1, out, (int) out_count);
+    return n > 0;
+}
+
+static DWORD viewer_get_file_attrs(const char * path) {
+    WCHAR wide[VIEWER_MAX_PATH];
+    if (!viewer_utf8_to_wide(path, wide, sizeof(wide) / sizeof(wide[0]))) {
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    return GetFileAttributesW(wide);
+}
+#endif
+
 static int viewer_path_exists(const char * path) {
 #ifdef _WIN32
-    DWORD attrs = text_is_empty(path) ? INVALID_FILE_ATTRIBUTES : GetFileAttributesA(path);
+    DWORD attrs = viewer_get_file_attrs(path);
     return attrs != INVALID_FILE_ATTRIBUTES;
 #else
     struct stat st;
@@ -321,7 +347,7 @@ static int viewer_path_exists(const char * path) {
 
 static int viewer_dir_exists(const char * path) {
 #ifdef _WIN32
-    DWORD attrs = text_is_empty(path) ? INVALID_FILE_ATTRIBUTES : GetFileAttributesA(path);
+    DWORD attrs = viewer_get_file_attrs(path);
     return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
 #else
     struct stat st;
@@ -331,7 +357,7 @@ static int viewer_dir_exists(const char * path) {
 
 static int viewer_file_exists(const char * path) {
 #ifdef _WIN32
-    DWORD attrs = text_is_empty(path) ? INVALID_FILE_ATTRIBUTES : GetFileAttributesA(path);
+    DWORD attrs = viewer_get_file_attrs(path);
     return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
 #else
     struct stat st;
@@ -413,6 +439,79 @@ static int viewer_path_basename_equals(const char * path, const char * name) {
 }
 
 static int path_has_ext_ci(const char * path, const char * ext);
+
+static int viewer_read_file_bytes(const char * path, unsigned char ** data_out, int * size_out) {
+    if (data_out != NULL) *data_out = NULL;
+    if (size_out != NULL) *size_out = 0;
+    if (text_is_empty(path) || data_out == NULL || size_out == NULL) {
+        return 0;
+    }
+#ifdef _WIN32
+    WCHAR wide[VIEWER_MAX_PATH];
+    if (!viewer_utf8_to_wide(path, wide, sizeof(wide) / sizeof(wide[0]))) {
+        return 0;
+    }
+    HANDLE file = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    LARGE_INTEGER size_li;
+    if (!GetFileSizeEx(file, &size_li) || size_li.QuadPart <= 0 || size_li.QuadPart > INT_MAX) {
+        CloseHandle(file);
+        return 0;
+    }
+    int size = (int) size_li.QuadPart;
+    unsigned char * data = (unsigned char *) malloc((size_t) size);
+    if (data == NULL) {
+        CloseHandle(file);
+        return 0;
+    }
+    int offset = 0;
+    while (offset < size) {
+        DWORD chunk = (DWORD) (size - offset);
+        DWORD got = 0;
+        if (!ReadFile(file, data + offset, chunk, &got, NULL) || got == 0) {
+            free(data);
+            CloseHandle(file);
+            return 0;
+        }
+        offset += (int) got;
+    }
+    CloseHandle(file);
+    *data_out = data;
+    *size_out = size;
+    return 1;
+#else
+    FILE * f = fopen(path, "rb");
+    if (f == NULL) {
+        return 0;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return 0;
+    }
+    long size_long = ftell(f);
+    if (size_long <= 0 || size_long > INT_MAX || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return 0;
+    }
+    int size = (int) size_long;
+    unsigned char * data = (unsigned char *) malloc((size_t) size);
+    if (data == NULL) {
+        fclose(f);
+        return 0;
+    }
+    size_t got = fread(data, 1, (size_t) size, f);
+    fclose(f);
+    if (got != (size_t) size) {
+        free(data);
+        return 0;
+    }
+    *data_out = data;
+    *size_out = size;
+    return 1;
+#endif
+}
 
 static int viewer_file_contains_text(const char * path, const char * needle) {
     if (text_is_empty(path) || text_is_empty(needle)) {
@@ -776,6 +875,10 @@ static void viewer_autodetect_image_path(viewer_options * options) {
         return;
     }
     const char * relative_candidates[] = {
+        "example_image/T.png",
+        "../example_image/T.png",
+        "../../example_image/T.png",
+        "../../../example_image/T.png",
         "assets/example_image/T.png",
         "../assets/example_image/T.png",
         "../../assets/example_image/T.png",
@@ -963,7 +1066,7 @@ static int command_available(const char * name);
 
 static void viewer_options_defaults(viewer_options * options) {
     memset(options, 0, sizeof(*options));
-    copy_text(options->image_path, sizeof(options->image_path), "assets/example_image/T.png");
+    copy_text(options->image_path, sizeof(options->image_path), "example_image/T.png");
     copy_text(options->out_dir, sizeof(options->out_dir), "viewer_outputs");
     copy_text(options->backend, sizeof(options->backend), TRELLIS_DEFAULT_BACKEND);
     copy_text(options->pipeline_type, sizeof(options->pipeline_type), "512");
@@ -1646,13 +1749,80 @@ static trellis_status sparse_kind_from_backend(trellis_backend_kind graph_kind, 
     return TRELLIS_STATUS_INVALID_ARGUMENT;
 }
 
+#ifdef _WIN32
+static int append_process_arg(char * cmd, size_t cmd_size, const char * arg) {
+    if (cmd == NULL || cmd_size == 0 || arg == NULL) {
+        return 0;
+    }
+    size_t pos = strlen(cmd);
+    if (pos + 3u >= cmd_size) {
+        return 0;
+    }
+    if (pos > 0) {
+        cmd[pos++] = ' ';
+    }
+    cmd[pos++] = '"';
+    for (const char * p = arg; *p != '\0'; ++p) {
+        if (*p == '"') {
+            if (pos + 2u >= cmd_size) {
+                return 0;
+            }
+            cmd[pos++] = '\\';
+            cmd[pos++] = *p;
+        } else {
+            if (pos + 1u >= cmd_size) {
+                return 0;
+            }
+            cmd[pos++] = *p;
+        }
+    }
+    if (pos + 2u >= cmd_size) {
+        return 0;
+    }
+    cmd[pos++] = '"';
+    cmd[pos] = '\0';
+    return 1;
+}
+#endif
+
 static int run_process(char * const argv[]) {
     if (argv == NULL || argv[0] == NULL) {
         return 0;
     }
+#ifdef _WIN32
+    char cmd[VIEWER_MAX_PATH * 2u];
+    cmd[0] = '\0';
+    for (int i = 0; argv[i] != NULL; ++i) {
+        if (!append_process_arg(cmd, sizeof(cmd), argv[i])) {
+            return 0;
+        }
+    }
+    WCHAR wide_cmd[VIEWER_MAX_PATH * 2u];
+    if (!viewer_utf8_to_wide(cmd, wide_cmd, sizeof(wide_cmd) / sizeof(wide_cmd[0]))) {
+        return 0;
+    }
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = 0;
+    if (!CreateProcessW(NULL, wide_cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        return 0;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    return code == 0;
+#else
     return trellis_path_has_sep(argv[0]) ?
         trellis_run_process_exact(argv) :
         trellis_run_process_search_path(argv);
+#endif
 }
 
 static int convert_webp_to_png(const char * input, const char * output) {
@@ -2499,17 +2669,10 @@ static int open_image_file_dialog(char * out, size_t out_size, int * dialog_avai
         *dialog_available = 0;
     }
 #ifdef _WIN32
-    if (command_available("powershell")) {
-        if (dialog_available != NULL) {
-            *dialog_available = 1;
-        }
-        if (read_first_line_from_command(
-                "powershell -NoProfile -ExecutionPolicy Bypass -STA -Command \"Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.OpenFileDialog; $d.Title = 'Select input image'; $d.Filter = 'Images|*.png;*.jpg;*.jpeg;*.webp;*.bmp'; if ($d.ShowDialog() -eq 'OK') { [Console]::WriteLine($d.FileName) }\"",
-                out,
-                out_size)) {
-            return 1;
-        }
+    if (dialog_available != NULL) {
+        *dialog_available = 1;
     }
+    return trellis_win_open_image_file_dialog(out, out_size);
 #else
     if (command_available("zenity")) {
         if (dialog_available != NULL) {
@@ -2550,7 +2713,7 @@ static void * file_picker_main(void * user_data) {
     int selected = open_image_file_dialog(path, sizeof(path), &dialog_available);
     int unsupported = 0;
     if (selected) {
-        unsupported = !FileExists(path) || !is_supported_image_path(path);
+        unsupported = !viewer_file_exists(path) || !is_supported_image_path(path);
     }
 
     pthread_mutex_lock(&shared->mutex);
@@ -2624,7 +2787,7 @@ static void set_candidate_image(
     const char * path,
     display_mesh * mesh_display,
     display_voxels * voxel_display) {
-    if (text_is_empty(path) || !FileExists(path) || !is_supported_image_path(path)) {
+    if (text_is_empty(path) || !viewer_file_exists(path) || !is_supported_image_path(path)) {
         pthread_mutex_lock(&shared->mutex);
         copy_text(shared->stage, sizeof(shared->stage), "Unsupported image");
         copy_text(shared->detail, sizeof(shared->detail), "use png, jpg, jpeg, webp, or bmp");
@@ -3309,7 +3472,113 @@ static void draw_left_panel(
     DrawText(status, (int) panel.x + 18, GetScreenHeight() - 28, 13, (Color) {139, 149, 158, 255});
 }
 
-static Texture2D reload_texture_if_changed(Texture2D current, char * loaded_path, const char * desired_path) {
+static int viewer_image_extension(const char * path, char * ext, size_t ext_size) {
+    if (text_is_empty(path) || ext == NULL || ext_size < 5u) {
+        return 0;
+    }
+    const char * base = trellis_path_last_sep_const(path);
+    base = base != NULL ? base + 1 : path;
+    const char * dot = strrchr(base, '.');
+    if (dot == NULL || dot[1] == '\0') {
+        return 0;
+    }
+    size_t n = strlen(dot);
+    if (n >= ext_size) {
+        return 0;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        char c = dot[i];
+        if (c >= 'A' && c <= 'Z') {
+            c = (char) (c - 'A' + 'a');
+        }
+        ext[i] = c;
+    }
+    ext[n] = '\0';
+    return 1;
+}
+
+static Texture2D viewer_load_texture_from_path(const char * path, char * error, size_t error_size) {
+    Texture2D texture = {0};
+    if (error != NULL && error_size > 0) {
+        error[0] = '\0';
+    }
+    if (text_is_empty(path) || !viewer_file_exists(path)) {
+        if (error != NULL && error_size > 0) {
+            snprintf(error, error_size, "image file does not exist");
+        }
+        return texture;
+    }
+
+    char load_path[VIEWER_MAX_PATH];
+    char ext[16];
+    copy_text(load_path, sizeof(load_path), path);
+    if (!viewer_image_extension(load_path, ext, sizeof(ext))) {
+        if (error != NULL && error_size > 0) {
+            snprintf(error, error_size, "image extension is not supported");
+        }
+        return texture;
+    }
+
+    int delete_temp = 0;
+    char temp_path[VIEWER_MAX_PATH];
+    if (strcmp(ext, ".webp") == 0) {
+        if (!trellis_make_temp_path(temp_path, sizeof(temp_path), "trellis_viewer_preview", ".png") ||
+            !convert_webp_to_png(path, temp_path)) {
+            if (error != NULL && error_size > 0) {
+                snprintf(error, error_size, "webp preview conversion failed");
+            }
+            return texture;
+        }
+        copy_text(load_path, sizeof(load_path), temp_path);
+        copy_text(ext, sizeof(ext), ".png");
+        delete_temp = 1;
+    }
+
+    unsigned char * data = NULL;
+    int data_size = 0;
+    if (!viewer_read_file_bytes(load_path, &data, &data_size)) {
+        if (delete_temp) {
+            trellis_unlink(load_path);
+        }
+        if (error != NULL && error_size > 0) {
+            snprintf(error, error_size, "could not read image file");
+        }
+        return texture;
+    }
+
+    Image image = LoadImageFromMemory(ext, data, data_size);
+    free(data);
+    if (delete_temp) {
+        trellis_unlink(load_path);
+    }
+    if (image.data == NULL || image.width <= 0 || image.height <= 0) {
+        if (error != NULL && error_size > 0) {
+            snprintf(error, error_size, "could not decode image preview");
+        }
+        return texture;
+    }
+
+    texture = LoadTextureFromImage(image);
+    UnloadImage(image);
+    if (texture.id == 0) {
+        if (error != NULL && error_size > 0) {
+            snprintf(error, error_size, "could not upload image preview");
+        }
+        return texture;
+    }
+    SetTextureFilter(texture, TEXTURE_FILTER_BILINEAR);
+    return texture;
+}
+
+static Texture2D reload_texture_if_changed(
+    Texture2D current,
+    char * loaded_path,
+    const char * desired_path,
+    char * error,
+    size_t error_size) {
+    if (error != NULL && error_size > 0) {
+        error[0] = '\0';
+    }
     if (desired_path == NULL || strcmp(loaded_path, desired_path) == 0) {
         return current;
     }
@@ -3318,20 +3587,10 @@ static Texture2D reload_texture_if_changed(Texture2D current, char * loaded_path
         current.id = 0;
     }
     loaded_path[0] = '\0';
-    if (!text_is_empty(desired_path) && FileExists(desired_path)) {
-        char preview_path[VIEWER_MAX_PATH];
-        copy_text(preview_path, sizeof(preview_path), desired_path);
-        if (path_has_ext_ci(desired_path, ".webp")) {
-            char tmp[VIEWER_MAX_PATH];
-            if (trellis_make_temp_path(tmp, sizeof(tmp), "trellis_viewer_preview", ".png") &&
-                convert_webp_to_png(desired_path, tmp)) {
-                copy_text(preview_path, sizeof(preview_path), tmp);
-            }
-        }
-        Texture2D next = LoadTexture(preview_path);
+    if (!text_is_empty(desired_path)) {
+        Texture2D next = viewer_load_texture_from_path(desired_path, error, error_size);
+        copy_text(loaded_path, VIEWER_MAX_PATH, desired_path);
         if (next.id != 0) {
-            SetTextureFilter(next, TEXTURE_FILTER_BILINEAR);
-            copy_text(loaded_path, VIEWER_MAX_PATH, desired_path);
             return next;
         }
     }
@@ -3441,8 +3700,21 @@ int main(int argc, char ** argv) {
             UnloadDroppedFiles(dropped);
         }
 
-        image_tex = reload_texture_if_changed(image_tex, loaded_image_path, desired_image);
-        uv_tex = reload_texture_if_changed(uv_tex, loaded_uv_path, desired_uv);
+        char image_load_error[192];
+        char uv_load_error[192];
+        image_tex = reload_texture_if_changed(image_tex, loaded_image_path, desired_image, image_load_error, sizeof(image_load_error));
+        uv_tex = reload_texture_if_changed(uv_tex, loaded_uv_path, desired_uv, uv_load_error, sizeof(uv_load_error));
+        if (!text_is_empty(image_load_error)) {
+            pthread_mutex_lock(&shared.mutex);
+            copy_text(shared.stage, sizeof(shared.stage), "Image preview failed");
+            copy_text(shared.detail, sizeof(shared.detail), image_load_error);
+            pthread_mutex_unlock(&shared.mutex);
+        } else if (!text_is_empty(uv_load_error)) {
+            pthread_mutex_lock(&shared.mutex);
+            copy_text(shared.stage, sizeof(shared.stage), "Texture preview failed");
+            copy_text(shared.detail, sizeof(shared.detail), uv_load_error);
+            pthread_mutex_unlock(&shared.mutex);
+        }
         copy_snapshot_to_display(&shared, &mesh_display, &voxel_display, ui.lighting);
         update_arcball(&ui, viewport);
 
