@@ -18,7 +18,14 @@ Native TRELLIS.2 image-to-3D inference tool with CUDA and Vulkan support. The ma
 
 ## Build
 
-Clone submodules first:
+Clone with submodules:
+
+```sh
+git clone --recursive git@github.com:Wimacs/trellis2.c.git
+cd trellis2.c
+```
+
+If the repository was cloned without `--recursive`, run:
 
 ```sh
 git submodule update --init --recursive

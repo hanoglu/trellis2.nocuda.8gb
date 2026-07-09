@@ -18,7 +18,14 @@
 
 ## 编译
 
-先拉取子模块：
+带子模块克隆：
+
+```sh
+git clone --recursive git@github.com:Wimacs/trellis2.c.git
+cd trellis2.c
+```
+
+如果克隆时没有加 `--recursive`，再执行：
 
 ```sh
 git submodule update --init --recursive
