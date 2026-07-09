@@ -1,4 +1,14 @@
-# trellis2.c
+```text
+  _______ ____  _____ _     _     ___ ____  ____    ____
+ |__   __|  _ \| ____| |   | |   |_ _/ ___||___ \  / ___|
+    | |  | |_) |  _| | |   | |    | |\___ \  __) || |
+    | |  |  _ <| |___| |___| |___ | | ___) |/ __/ | |___
+    |_|  |_| \_\_____|_____|_____|___|____/|_____(_)____|
+
+                 trellis2.c image-to-3D pipeline
+```
+
+![trellis2.c local workspace](img.png)
 
 Native TRELLIS.2 image-to-3D inference tool with CUDA and Vulkan support. The main command is `trellis-image-to-gltf`.
 
