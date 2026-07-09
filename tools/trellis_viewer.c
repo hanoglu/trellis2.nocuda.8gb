@@ -350,14 +350,70 @@ static int viewer_join_path2(const char * base, const char * mid, const char * c
     return viewer_join_path(base, mid, tmp, sizeof(tmp)) && viewer_join_path(tmp, child, dst, dst_size);
 }
 
+static int viewer_parent_path(const char * path, char * dst, size_t dst_size) {
+    if (text_is_empty(path) || dst == NULL || dst_size == 0) {
+        return 0;
+    }
+    char tmp[VIEWER_MAX_PATH];
+    copy_text(tmp, sizeof(tmp), path);
+    size_t len = strlen(tmp);
+    while (len > 1 && trellis_path_is_sep(tmp[len - 1u])) {
+        tmp[--len] = '\0';
+    }
+    char * slash = trellis_path_last_sep(tmp);
+    if (slash == NULL) {
+        return 0;
+    }
+#ifdef _WIN32
+    if (slash == tmp + 2 && tmp[1] == ':') {
+        slash[1] = '\0';
+    } else
+#endif
+    if (slash == tmp) {
+        slash[1] = '\0';
+    } else {
+        *slash = '\0';
+    }
+    copy_text(dst, dst_size, tmp);
+    return dst[0] != '\0';
+}
+
+static int viewer_weights_root_looks_valid(const char * dir);
+
+static int viewer_find_weights_root(const char * selected, char * root, size_t root_size) {
+    if (text_is_empty(selected) || root == NULL || root_size == 0) {
+        return 0;
+    }
+
+    char current[VIEWER_MAX_PATH];
+    copy_text(current, sizeof(current), selected);
+    for (int depth = 0; depth < 6 && !text_is_empty(current); ++depth) {
+        if (viewer_weights_root_looks_valid(current)) {
+            copy_text(root, root_size, current);
+            return 1;
+        }
+        char parent[VIEWER_MAX_PATH];
+        if (!viewer_parent_path(current, parent, sizeof(parent)) || strcmp(parent, current) == 0) {
+            break;
+        }
+        copy_text(current, sizeof(current), parent);
+    }
+    return 0;
+}
+
 static void viewer_apply_weights_dir(viewer_options * options, const char * dir) {
     if (options == NULL || text_is_empty(dir)) {
         return;
     }
-    copy_text(options->weights_dir, sizeof(options->weights_dir), dir);
-    viewer_join_path(dir, "TRELLIS.2-4B", options->model_dir, sizeof(options->model_dir));
-    viewer_join_path(dir, "dinov3-vitl16-pretrain-lvd1689m", options->dino_dir, sizeof(options->dino_dir));
-    viewer_join_path2(dir, "BiRefNet", "BiRefNet-F16.gguf", options->birefnet_path, sizeof(options->birefnet_path));
+    char root[VIEWER_MAX_PATH];
+    const char * weights_root = dir;
+    if (viewer_find_weights_root(dir, root, sizeof(root))) {
+        weights_root = root;
+    }
+    copy_text(options->weights_dir, sizeof(options->weights_dir), weights_root);
+    viewer_join_path(weights_root, "TRELLIS.2-4B", options->model_dir, sizeof(options->model_dir));
+    viewer_join_path(weights_root, "dinov3-vitl16-pretrain-lvd1689m", options->dino_dir, sizeof(options->dino_dir));
+    viewer_join_path2(weights_root, "BiRefNet", "BiRefNet-F16.gguf", options->birefnet_path, sizeof(options->birefnet_path));
 }
 
 static int viewer_weights_root_looks_valid(const char * dir) {
@@ -2349,7 +2405,7 @@ static void set_weights_dir(
     viewer_snapshot_free(&shared->snapshot);
     shared->snapshot.version += 1;
     copy_text(shared->stage, sizeof(shared->stage), ready ? "Weights ready" : "Weights incomplete");
-    copy_text(shared->detail, sizeof(shared->detail), ready ? path : issue);
+    copy_text(shared->detail, sizeof(shared->detail), ready ? options->weights_dir : issue);
     shared->error[0] = '\0';
     pthread_mutex_unlock(&shared->mutex);
     display_mesh_free(mesh_display);
