@@ -16,6 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT.parent / "TRELLIS.2"
 
 DEFAULT_TRELLIS_REPO = "microsoft/TRELLIS.2-4B"
+DEFAULT_SPARSE_DECODER_REPO = "microsoft/TRELLIS-image-large"
 DEFAULT_DINO_REPO = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 DEFAULT_BIREFNET_REPO = "Acly/BiRefNet-GGUF"
 
@@ -40,6 +41,11 @@ BIREFNET_MINIMAL_PATTERNS = [
     "README*",
     "LICENSE*",
     "BiRefNet-F16.gguf",
+]
+
+SPARSE_DECODER_PATTERNS = [
+    "ckpts/ss_dec_conv3d_16l8_fp16.json",
+    "ckpts/ss_dec_conv3d_16l8_fp16.safetensors",
 ]
 
 
@@ -190,6 +196,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="TRELLIS.2 repo id on the selected source",
     )
     parser.add_argument(
+        "--sparse-decoder-repo",
+        default=DEFAULT_SPARSE_DECODER_REPO,
+        help="repo id for the stage1 sparse-structure decoder required by trellis2.c",
+    )
+    parser.add_argument(
+        "--sparse-decoder-source",
+        type=normalize_source,
+        default="huggingface",
+        help="download source for the stage1 sparse-structure decoder",
+    )
+    parser.add_argument(
+        "--skip-sparse-decoder",
+        action="store_true",
+        help="do not download the legacy sparse-structure decoder into TRELLIS.2-4B/ckpts",
+    )
+    parser.add_argument(
         "--dino-repo",
         default=DEFAULT_DINO_REPO,
         help="DINOv3 repo id on the selected source",
@@ -280,6 +302,12 @@ def selected_specs(args: argparse.Namespace) -> list[RepoSpec]:
     return specs
 
 
+def needs_sparse_decoder(args: argparse.Namespace, specs: list[RepoSpec]) -> bool:
+    if args.skip_sparse_decoder:
+        return False
+    return any(spec.local_name == "TRELLIS.2-4B" for spec in specs)
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
@@ -320,6 +348,36 @@ def main() -> int:
             max_workers=args.max_workers,
         )
         print(f"  done: {downloaded_path}")
+
+    if needs_sparse_decoder(args, specs):
+        local_dir = output_dir / "TRELLIS.2-4B"
+        spec = RepoSpec(
+            label="TRELLIS sparse-structure decoder",
+            repo_id=args.sparse_decoder_repo,
+            local_name="TRELLIS.2-4B",
+            minimal_patterns=SPARSE_DECODER_PATTERNS,
+        )
+        source = args.sparse_decoder_source
+        downloader = download_from_huggingface if source == "huggingface" else download_from_modelscope
+
+        print(f"[{source}] {spec.label}: {spec.repo_id}")
+        print(f"  -> {local_dir}")
+        print(f"  include: {', '.join(SPARSE_DECODER_PATTERNS)}")
+
+        if not args.dry_run:
+            local_dir.mkdir(parents=True, exist_ok=True)
+            downloaded_path = downloader(
+                spec=spec,
+                local_dir=local_dir,
+                revision=None,
+                allow_patterns=SPARSE_DECODER_PATTERNS,
+                ignore_patterns=ignore_patterns,
+                token=args.token,
+                endpoint=args.endpoint,
+                local_files_only=args.local_files_only,
+                max_workers=args.max_workers,
+            )
+            print(f"  done: {downloaded_path}")
 
     print("Dry run complete." if args.dry_run else "Weights are ready.")
     downloaded_names = {spec.local_name for spec in specs}

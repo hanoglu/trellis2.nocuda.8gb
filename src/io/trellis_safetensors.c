@@ -1,5 +1,7 @@
 #include "trellis.h"
 
+#include "trellis_file_seek.h"
+
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -508,7 +510,7 @@ trellis_status trellis_safetensors_read_f32(
     if (f == NULL) {
         return TRELLIS_STATUS_IO_ERROR;
     }
-    if (fseek(f, (long) (st->data_base_offset + meta->data_begin), SEEK_SET) != 0) {
+    if (trellis_file_seek_set_sum_u64(f, st->data_base_offset, meta->data_begin) != 0) {
         fclose(f);
         return TRELLIS_STATUS_IO_ERROR;
     }

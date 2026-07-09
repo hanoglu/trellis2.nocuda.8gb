@@ -1,5 +1,7 @@
 #include "trellis.h"
 
+#include "trellis_file_seek.h"
+
 #include "gguf.h"
 
 #include <stdio.h>
@@ -202,7 +204,7 @@ static trellis_status set_tensor_raw_data_from_meta(
         free(tmp);
         return TRELLIS_STATUS_IO_ERROR;
     }
-    if (fseek(f, (long) (st->data_base_offset + meta->data_begin), SEEK_SET) != 0) {
+    if (trellis_file_seek_set_sum_u64(f, st->data_base_offset, meta->data_begin) != 0) {
         fclose(f);
         free(tmp);
         return TRELLIS_STATUS_IO_ERROR;
@@ -515,7 +517,7 @@ trellis_status trellis_tensor_store_load_gguf(
             status = TRELLIS_STATUS_OUT_OF_MEMORY;
             break;
         }
-        if (fseek(f, (long) (data_offset + tensor_offset), SEEK_SET) != 0 ||
+        if (trellis_file_seek_set_sum_u64(f, (uint64_t) data_offset, (uint64_t) tensor_offset) != 0 ||
             (bytes != 0 && fread(tmp, 1, bytes, f) != bytes)) {
             free(tmp);
             status = TRELLIS_STATUS_IO_ERROR;
