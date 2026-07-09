@@ -586,6 +586,31 @@ static int viewer_scan_weights_pool(const char * selected, viewer_weight_scan * 
     return 0;
 }
 
+static int viewer_apply_standard_weights_layout(viewer_options * options, const char * dir) {
+    if (options == NULL || text_is_empty(dir)) {
+        return 0;
+    }
+    char model_dir[VIEWER_MAX_PATH];
+    char dino_dir[VIEWER_MAX_PATH];
+    char birefnet_path[VIEWER_MAX_PATH];
+    if (!viewer_join_path(dir, "TRELLIS.2-4B", model_dir, sizeof(model_dir)) ||
+        !viewer_join_path(dir, "dinov3-vitl16-pretrain-lvd1689m", dino_dir, sizeof(dino_dir)) ||
+        !viewer_trellis_model_dir_valid(model_dir) ||
+        !viewer_dino_dir_valid(dino_dir)) {
+        return 0;
+    }
+    copy_text(options->weights_dir, sizeof(options->weights_dir), dir);
+    copy_text(options->model_dir, sizeof(options->model_dir), model_dir);
+    copy_text(options->dino_dir, sizeof(options->dino_dir), dino_dir);
+    if (viewer_join_path2(dir, "BiRefNet", "BiRefNet-F16.gguf", birefnet_path, sizeof(birefnet_path)) &&
+        viewer_file_exists(birefnet_path)) {
+        copy_text(options->birefnet_path, sizeof(options->birefnet_path), birefnet_path);
+    } else {
+        options->birefnet_path[0] = '\0';
+    }
+    return 1;
+}
+
 static int viewer_find_weights_root(const char * selected, char * root, size_t root_size) {
     if (text_is_empty(selected) || root == NULL || root_size == 0) {
         return 0;
@@ -600,6 +625,9 @@ static int viewer_find_weights_root(const char * selected, char * root, size_t r
 
 static void viewer_apply_weights_dir(viewer_options * options, const char * dir) {
     if (options == NULL || text_is_empty(dir)) {
+        return;
+    }
+    if (viewer_apply_standard_weights_layout(options, dir)) {
         return;
     }
     viewer_weight_scan scan;
@@ -618,6 +646,11 @@ static void viewer_apply_weights_dir(viewer_options * options, const char * dir)
 }
 
 static int viewer_weights_root_looks_valid(const char * dir) {
+    viewer_options options;
+    memset(&options, 0, sizeof(options));
+    if (viewer_apply_standard_weights_layout(&options, dir)) {
+        return 1;
+    }
     viewer_weight_scan scan;
     return viewer_scan_weights_pool(dir, &scan);
 }
