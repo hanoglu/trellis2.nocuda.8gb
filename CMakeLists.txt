@@ -607,6 +607,7 @@ if (TRELLIS2_C_BUILD_TOOLS)
                 "${CMAKE_CURRENT_BINARY_DIR}/generated"
                 "${CMAKE_CURRENT_LIST_DIR}/3rd/ggml/include"
                 "${CMAKE_CURRENT_LIST_DIR}/3rd/xatlas/source/xatlas")
+            target_link_libraries(trellis_vkmesh_api PRIVATE Vulkan::Vulkan xatlas)
             set_target_properties(trellis_vkmesh_api PROPERTIES POSITION_INDEPENDENT_CODE ON)
             add_dependencies(trellis_vkmesh_api vkmesh_shader)
             target_sources(trellis2_c PRIVATE $<TARGET_OBJECTS:trellis_vkmesh_api>)
