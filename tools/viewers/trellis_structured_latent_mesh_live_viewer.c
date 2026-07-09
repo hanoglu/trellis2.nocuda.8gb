@@ -8,6 +8,10 @@
 #include "rlgl.h"
 #include "external/glad.h"
 
+#ifdef glDrawElements
+#undef glDrawElements
+#endif
+
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -773,6 +777,18 @@ static void unload_mesh_shader(mesh_shader * shader) {
     }
 }
 
+typedef void (GLAD_API_PTR * trellis_gl_draw_elements_fn)(GLenum mode, GLsizei count, GLenum type, const void * indices);
+
+static void trellis_gl_draw_elements_u32(int count) {
+    static trellis_gl_draw_elements_fn draw_elements = NULL;
+    if (draw_elements == NULL) {
+        draw_elements = (trellis_gl_draw_elements_fn) rlGetProcAddress("glDrawElements");
+    }
+    if (draw_elements != NULL) {
+        draw_elements(GL_TRIANGLES, count, GL_UNSIGNED_INT, NULL);
+    }
+}
+
 static void set_mesh_shader_common(const mesh_shader * shader, int wire_mode) {
     float base_color[4] = {MESH_BASE_COLOR[0], MESH_BASE_COLOR[1], MESH_BASE_COLOR[2], 1.0f};
     float wire_color[4] = {74.0f / 255.0f, 210.0f / 255.0f, 178.0f / 255.0f, 1.0f};
@@ -1137,12 +1153,12 @@ static void draw_loaded_meshes(
         rlEnableVertexArray(loaded->vao_id);
         if (strcmp(style, "wire") != 0) {
             set_mesh_shader_common(shader, 0);
-            glDrawElements(GL_TRIANGLES, loaded->gpu_index_count, GL_UNSIGNED_INT, 0);
+            trellis_gl_draw_elements_u32(loaded->gpu_index_count);
         }
         if (strcmp(style, "solid") != 0) {
             set_mesh_shader_common(shader, 1);
             rlEnableWireMode();
-            glDrawElements(GL_TRIANGLES, loaded->gpu_index_count, GL_UNSIGNED_INT, 0);
+            trellis_gl_draw_elements_u32(loaded->gpu_index_count);
             rlDisableWireMode();
         }
         rlDisableVertexArray();

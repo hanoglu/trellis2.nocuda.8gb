@@ -3,7 +3,10 @@
 /build-obj/
 /build-cuda/
 /build-vulkan/
+/build-win/
+/build-win-vulkan/
 cmake-build-*/
+/.vs/
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
@@ -17,7 +20,12 @@ Testing/
 .ninja_log
 *.ninja
 *.o
+*.obj
 *.a
+*.lib
+*.exp
+*.pdb
+*.ilk
 *.so
 *.so.*
 *.d

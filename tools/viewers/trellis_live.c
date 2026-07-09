@@ -291,7 +291,11 @@ static int stage1_frame_callback(const trellis_tool_stage1_frame * frame, void *
 }
 
 int main(int argc, char ** argv) {
+#ifdef _WIN32
+    setvbuf(stdout, NULL, _IONBF, 0);
+#else
     setvbuf(stdout, NULL, _IOLBF, 0);
+#endif
     setvbuf(stderr, NULL, _IONBF, 0);
 
     const char * image_path = "assets/example_image/T.png";

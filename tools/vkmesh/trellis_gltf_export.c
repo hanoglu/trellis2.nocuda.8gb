@@ -342,22 +342,26 @@ typedef struct trellis_gltf_vk_shader {
     const char * name;
 } trellis_gltf_vk_shader;
 
+#define TRELLIS_GLTF_SHADER_DESC(data_, name_) { data_, (unsigned int) sizeof(data_), name_ }
+
 static const trellis_gltf_vk_shader g_gltf_bake_vert_shader = {
     trellis_gltf_bake_vert_spv,
-    trellis_gltf_bake_vert_spv_len,
+    (unsigned int) sizeof(trellis_gltf_bake_vert_spv),
     "gltf_bake_vert",
 };
 
 static const trellis_gltf_vk_shader g_gltf_bake_frag_shader = {
     trellis_gltf_bake_frag_spv,
-    trellis_gltf_bake_frag_spv_len,
+    (unsigned int) sizeof(trellis_gltf_bake_frag_spv),
     "gltf_bake_frag",
 };
 
 static const trellis_gltf_vk_shader g_gltf_compute_shaders[TRELLIS_GLTF_COMPUTE_COUNT] = {
-    { trellis_gltf_dilate_spv, trellis_gltf_dilate_spv_len, "gltf_dilate" },
-    { trellis_gltf_fill_empty_spv, trellis_gltf_fill_empty_spv_len, "gltf_fill_empty" },
+    TRELLIS_GLTF_SHADER_DESC(trellis_gltf_dilate_spv, "gltf_dilate"),
+    TRELLIS_GLTF_SHADER_DESC(trellis_gltf_fill_empty_spv, "gltf_fill_empty"),
 };
+
+#undef TRELLIS_GLTF_SHADER_DESC
 
 typedef struct trellis_gltf_vk_push {
     uint32_t texture_size;

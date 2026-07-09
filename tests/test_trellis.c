@@ -989,10 +989,10 @@ static void test_custom_cuda_kernels(void) {
             SD = 1, SH = 2, SW = 1,
             PD = 1, PH = 0, PW = 1,
             DD = 1, DH = 1, DW = 1,
+            OD = (ID + 2 * PD - DD * (KD - 1) - 1) / SD + 1,
+            OH = (IH + 2 * PH - DH * (KH - 1) - 1) / SH + 1,
+            OW = (IW + 2 * PW - DW * (KW - 1) - 1) / SW + 1,
         };
-        const int OD = conv_out_size_ref(ID, KD, SD, PD, DD);
-        const int OH = conv_out_size_ref(IH, KH, SH, PH, DH);
-        const int OW = conv_out_size_ref(IW, KW, SW, PW, DW);
         float x[B * IC * ID * IH * IW];
         float w[OC * IC * KD * KH * KW];
         float bias[OC];
