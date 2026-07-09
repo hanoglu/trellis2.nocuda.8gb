@@ -28,6 +28,10 @@
 #endif
 
 #ifdef _WIN32
+int trellis_win32_select_folder(char * out, size_t out_size, const wchar_t * title);
+#endif
+
+#ifdef _WIN32
 typedef CRITICAL_SECTION pthread_mutex_t;
 typedef HANDLE pthread_t;
 
@@ -2156,16 +2160,11 @@ static int open_weights_folder_dialog(char * out, size_t out_size, int * dialog_
         *dialog_available = 0;
     }
 #ifdef _WIN32
-    if (command_available("powershell")) {
-        if (dialog_available != NULL) {
-            *dialog_available = 1;
-        }
-        if (read_first_line_from_command(
-                "powershell -NoProfile -ExecutionPolicy Bypass -STA -Command \"Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Select TRELLIS.2 weights folder'; $d.ShowNewFolderButton = $false; if ($d.ShowDialog() -eq 'OK') { [Console]::WriteLine($d.SelectedPath) }\"",
-                out,
-                out_size)) {
-            return 1;
-        }
+    if (dialog_available != NULL) {
+        *dialog_available = 1;
+    }
+    if (trellis_win32_select_folder(out, out_size, L"Select TRELLIS.2 weights folder")) {
+        return 1;
     }
 #else
     if (command_available("zenity")) {
