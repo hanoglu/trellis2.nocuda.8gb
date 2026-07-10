@@ -708,6 +708,8 @@ typedef struct trellis_vkmesh_postprocess_options {
     int no_simplify;             /* skip simplify passes, matching vkmesh --no-simplify */
     int run_degenerate_cleanup;  /* default 0, matching current TRELLIS pipeline */
     int simplify_steps;          /* 0 means vkmesh default/unbounded */
+    int remesh;                  /* run CuMesh-style narrow-band dual-contouring remesh */
+    int remesh_resolution;       /* default 1024 when remesh is enabled */
     float max_hole_perimeter;    /* default 0.03 */
     float degenerate_abs;        /* default 1e-24 */
     float degenerate_rel;        /* default 1e-12 */
@@ -715,6 +717,8 @@ typedef struct trellis_vkmesh_postprocess_options {
     float lambda_edge_length;    /* default 1e-2 */
     float lambda_skinny;         /* default 1e-3 */
     float simplify_threshold;    /* default 1e-8 */
+    float remesh_band;           /* default 1.0 */
+    float remesh_project;        /* default 0.0 for TRELLIS.2 examples */
 } trellis_vkmesh_postprocess_options;
 
 trellis_status trellis_vkmesh_postprocess(
@@ -769,6 +773,10 @@ typedef struct trellis_image_to_gltf_options {
     int mesh_postprocess;
     int mesh_postprocess_no_simplify;
     int mesh_postprocess_decimation_target;
+    int mesh_remesh;
+    int mesh_remesh_resolution;
+    float mesh_remesh_band;
+    float mesh_remesh_project;
     int model_cache;
     int model_cache_budget_mib;
     const char * vkmesh_path;

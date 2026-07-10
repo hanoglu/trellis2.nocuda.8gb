@@ -127,6 +127,18 @@ typedef struct vkmesh_bvh_node {
     uint32_t meta;
 } vkmesh_bvh_node;
 
+typedef struct vkmesh_remesh_coord {
+    int32_t x;
+    int32_t y;
+    int32_t z;
+} vkmesh_remesh_coord;
+
+typedef struct vkmesh_u64_u32_hash {
+    uint64_t * keys;
+    uint32_t * vals;
+    size_t capacity;
+} vkmesh_u64_u32_hash;
+
 typedef struct vkmesh_vk_buffer {
     VkBuffer buffer;
     VkDeviceMemory memory;
@@ -5007,26 +5019,26 @@ static float float_from_u32(uint32_t bits) {
     return v.f;
 }
 
-static int vkmesh_unsigned_distance_vulkan(
+static int vkmesh_unsigned_distance_vulkan_with_bvh(
     const vkmesh_mesh * mesh,
+    const vkmesh_bvh_node * nodes,
+    uint32_t node_count,
+    const uint32_t * tri_indices,
     const float * points,
     int64_t point_count,
     float ** distances_out,
     uint32_t ** face_ids_out) {
+    if (distances_out == NULL) return 0;
     *distances_out = NULL;
-    *face_ids_out = NULL;
-    if (mesh->n_faces <= 0 || mesh->n_faces > UINT32_MAX || point_count <= 0 || point_count > UINT32_MAX) return 0;
+    if (face_ids_out != NULL) *face_ids_out = NULL;
+    if (mesh->n_faces <= 0 || mesh->n_faces > UINT32_MAX || point_count <= 0 || point_count > UINT32_MAX ||
+        nodes == NULL || node_count == 0 || tri_indices == NULL || points == NULL) {
+        return 0;
+    }
 
-    vkmesh_bvh_node * nodes = NULL;
-    uint32_t node_count = 0;
-    uint32_t * tri_indices = NULL;
     uint32_t * aux_words = NULL;
     size_t aux_word_count = 0;
-    if (!vkmesh_build_bvh(mesh, &nodes, &node_count, &tri_indices) ||
-        !pack_bvh_aux_buffer(points, point_count, nodes, node_count, tri_indices, mesh->n_faces, &aux_words, &aux_word_count)) {
-        free(nodes);
-        free(tri_indices);
-        free(aux_words);
+    if (!pack_bvh_aux_buffer(points, point_count, nodes, node_count, tri_indices, mesh->n_faces, &aux_words, &aux_word_count)) {
         return 0;
     }
 
@@ -5034,8 +5046,6 @@ static int vkmesh_unsigned_distance_vulkan(
     vkmesh_vk * vk = NULL;
     int owns_vk = 0;
     if (!vkmesh_acquire_vk(&vk, &local_vk, &owns_vk)) {
-        free(nodes);
-        free(tri_indices);
         free(aux_words);
         return 0;
     }
@@ -5065,26 +5075,58 @@ static int vkmesh_unsigned_distance_vulkan(
     if (!vkmesh_dispatch(vk, VKMESH_PIPE_UNSIGNED_DISTANCE, buffers, &push, groups)) goto cleanup;
 
     float * distances = (float *) malloc((size_t) point_count * sizeof(float));
-    uint32_t * face_ids = (uint32_t *) malloc((size_t) point_count * sizeof(uint32_t));
-    if (distances == NULL || face_ids == NULL) {
-        free(distances); free(face_ids);
+    uint32_t * face_ids = face_ids_out != NULL ? (uint32_t *) malloc((size_t) point_count * sizeof(uint32_t)) : NULL;
+    if (distances == NULL || (face_ids_out != NULL && face_ids == NULL)) {
+        free(distances);
+        free(face_ids);
         goto cleanup;
     }
     const uint32_t * raw = (const uint32_t *) buffers[2].mapped;
     for (int64_t i = 0; i < point_count; ++i) {
         distances[i] = float_from_u32(raw[(size_t) i * 2u + 0u]);
-        face_ids[i] = raw[(size_t) i * 2u + 1u];
+        if (face_ids != NULL) face_ids[i] = raw[(size_t) i * 2u + 1u];
     }
     *distances_out = distances;
-    *face_ids_out = face_ids;
+    if (face_ids_out != NULL) *face_ids_out = face_ids;
     ok = 1;
 
 cleanup:
     for (uint32_t i = 0; i < 4; ++i) vk_buffer_destroy(vk, &buffers[i]);
     if (owns_vk) vkmesh_vk_destroy(vk);
+    free(aux_words);
+    return ok;
+}
+
+static int vkmesh_unsigned_distance_vulkan(
+    const vkmesh_mesh * mesh,
+    const float * points,
+    int64_t point_count,
+    float ** distances_out,
+    uint32_t ** face_ids_out) {
+    if (distances_out != NULL) *distances_out = NULL;
+    if (face_ids_out != NULL) *face_ids_out = NULL;
+    if (mesh == NULL || mesh->n_faces <= 0 || mesh->n_faces > UINT32_MAX ||
+        point_count <= 0 || point_count > UINT32_MAX || points == NULL) {
+        return 0;
+    }
+
+    vkmesh_bvh_node * nodes = NULL;
+    uint32_t node_count = 0;
+    uint32_t * tri_indices = NULL;
+    int ok = 0;
+    if (vkmesh_build_bvh(mesh, &nodes, &node_count, &tri_indices)) {
+        ok = vkmesh_unsigned_distance_vulkan_with_bvh(
+            mesh,
+            nodes,
+            node_count,
+            tri_indices,
+            points,
+            point_count,
+            distances_out,
+            face_ids_out);
+    }
     free(nodes);
     free(tri_indices);
-    free(aux_words);
     return ok;
 }
 
@@ -5101,6 +5143,836 @@ static int write_distances(const char * path, const float * points, int64_t poin
     }
     fclose(f);
     return 1;
+}
+
+static uint64_t vkmesh_hash_u64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdULL;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ULL;
+    x ^= x >> 33;
+    return x;
+}
+
+static int vkmesh_next_pow2_size(size_t need, size_t * out) {
+    if (out == NULL) return 0;
+    size_t cap = 16u;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2u) return 0;
+        cap *= 2u;
+    }
+    *out = cap;
+    return 1;
+}
+
+static int vkmesh_hash_init(vkmesh_u64_u32_hash * map, size_t expected_entries) {
+    if (map == NULL) return 0;
+    memset(map, 0, sizeof(*map));
+    size_t cap = 0;
+    if (expected_entries > SIZE_MAX / 2u) return 0;
+    if (!vkmesh_next_pow2_size(expected_entries * 2u + 16u, &cap)) return 0;
+    map->keys = (uint64_t *) malloc(cap * sizeof(uint64_t));
+    map->vals = (uint32_t *) malloc(cap * sizeof(uint32_t));
+    if (map->keys == NULL || map->vals == NULL) {
+        free(map->keys);
+        free(map->vals);
+        memset(map, 0, sizeof(*map));
+        return 0;
+    }
+    for (size_t i = 0; i < cap; ++i) map->keys[i] = UINT64_MAX;
+    map->capacity = cap;
+    return 1;
+}
+
+static void vkmesh_hash_destroy(vkmesh_u64_u32_hash * map) {
+    if (map == NULL) return;
+    free(map->keys);
+    free(map->vals);
+    memset(map, 0, sizeof(*map));
+}
+
+static int vkmesh_hash_insert(vkmesh_u64_u32_hash * map, uint64_t key, uint32_t value) {
+    if (map == NULL || map->keys == NULL || map->capacity == 0 || key == UINT64_MAX) return 0;
+    size_t mask = map->capacity - 1u;
+    size_t slot = (size_t) vkmesh_hash_u64(key) & mask;
+    for (size_t i = 0; i < map->capacity; ++i) {
+        uint64_t prev = map->keys[slot];
+        if (prev == UINT64_MAX || prev == key) {
+            map->keys[slot] = key;
+            map->vals[slot] = value;
+            return 1;
+        }
+        slot = (slot + 1u) & mask;
+    }
+    return 0;
+}
+
+static uint32_t vkmesh_hash_lookup(const vkmesh_u64_u32_hash * map, uint64_t key) {
+    if (map == NULL || map->keys == NULL || map->capacity == 0 || key == UINT64_MAX) return UINT32_MAX;
+    size_t mask = map->capacity - 1u;
+    size_t slot = (size_t) vkmesh_hash_u64(key) & mask;
+    for (size_t i = 0; i < map->capacity; ++i) {
+        uint64_t prev = map->keys[slot];
+        if (prev == UINT64_MAX) return UINT32_MAX;
+        if (prev == key) return map->vals[slot];
+        slot = (slot + 1u) & mask;
+    }
+    return UINT32_MAX;
+}
+
+static uint64_t vkmesh_remesh_coord_key(int32_t x, int32_t y, int32_t z, int dim) {
+    if (dim <= 0 || x < 0 || y < 0 || z < 0 || x >= dim || y >= dim || z >= dim) return UINT64_MAX;
+    uint64_t d = (uint64_t) dim;
+    return ((uint64_t) x * d + (uint64_t) y) * d + (uint64_t) z;
+}
+
+static int vkmesh_remesh_coords_reserve(vkmesh_remesh_coord ** coords, int64_t * capacity, int64_t need) {
+    if (coords == NULL || capacity == NULL || need < 0) return 0;
+    if (need <= *capacity) return 1;
+    int64_t cap = *capacity > 0 ? *capacity : 1024;
+    while (cap < need) {
+        if (cap > INT64_MAX / 2) return 0;
+        cap *= 2;
+    }
+    if ((uint64_t) cap > (uint64_t) SIZE_MAX / sizeof(vkmesh_remesh_coord)) return 0;
+    vkmesh_remesh_coord * next = (vkmesh_remesh_coord *) realloc(*coords, (size_t) cap * sizeof(vkmesh_remesh_coord));
+    if (next == NULL) return 0;
+    *coords = next;
+    *capacity = cap;
+    return 1;
+}
+
+static int vkmesh_remesh_coords_append(
+    vkmesh_remesh_coord ** coords,
+    int64_t * count,
+    int64_t * capacity,
+    int32_t x,
+    int32_t y,
+    int32_t z) {
+    if (!vkmesh_remesh_coords_reserve(coords, capacity, *count + 1)) return 0;
+    (*coords)[*count].x = x;
+    (*coords)[*count].y = y;
+    (*coords)[*count].z = z;
+    *count += 1;
+    return 1;
+}
+
+static int vkmesh_mesh_bounds(const vkmesh_mesh * mesh, float bmin[3], float bmax[3]) {
+    if (mesh == NULL || mesh->vertices == NULL || mesh->n_vertices <= 0 || bmin == NULL || bmax == NULL) return 0;
+    bmin[0] = bmax[0] = mesh->vertices[0];
+    bmin[1] = bmax[1] = mesh->vertices[1];
+    bmin[2] = bmax[2] = mesh->vertices[2];
+    for (int64_t i = 1; i < mesh->n_vertices; ++i) {
+        const float * v = mesh->vertices + (size_t) i * 3u;
+        for (int k = 0; k < 3; ++k) {
+            if (v[k] < bmin[k]) bmin[k] = v[k];
+            if (v[k] > bmax[k]) bmax[k] = v[k];
+        }
+    }
+    return 1;
+}
+
+static int vkmesh_remesh_build_points(
+    const vkmesh_remesh_coord * coords,
+    int64_t count,
+    int grid_resolution,
+    const float center[3],
+    float scale,
+    int centers,
+    float ** points_out) {
+    *points_out = NULL;
+    if (coords == NULL || count <= 0 || count > UINT32_MAX || grid_resolution <= 0) return 0;
+    if ((uint64_t) count > (uint64_t) SIZE_MAX / (3u * sizeof(float))) return 0;
+    float * points = (float *) malloc((size_t) count * 3u * sizeof(float));
+    if (points == NULL) return 0;
+    const float inv_res = 1.0f / (float) grid_resolution;
+    const float offset = centers ? 0.5f : 0.0f;
+    for (int64_t i = 0; i < count; ++i) {
+        points[(size_t) i * 3u + 0u] = (((float) coords[i].x + offset) * inv_res - 0.5f) * scale + center[0];
+        points[(size_t) i * 3u + 1u] = (((float) coords[i].y + offset) * inv_res - 0.5f) * scale + center[1];
+        points[(size_t) i * 3u + 2u] = (((float) coords[i].z + offset) * inv_res - 0.5f) * scale + center[2];
+    }
+    *points_out = points;
+    return 1;
+}
+
+static int vkmesh_remesh_refine_sparse_grid(
+    const vkmesh_mesh * mesh,
+    const vkmesh_bvh_node * nodes,
+    uint32_t node_count,
+    const uint32_t * tri_indices,
+    int resolution,
+    const float center[3],
+    float scale,
+    float band,
+    vkmesh_remesh_coord ** coords_out,
+    int64_t * count_out) {
+    *coords_out = NULL;
+    *count_out = 0;
+    if (resolution <= 0 || band <= 0.0f) return 0;
+    int base_resolution = resolution;
+    while (base_resolution > 32) {
+        if ((base_resolution & 1) != 0) return 0;
+        base_resolution /= 2;
+    }
+    if (base_resolution <= 0) return 0;
+
+    vkmesh_remesh_coord * coords = NULL;
+    int64_t coord_count = 0;
+    int64_t coord_capacity = 0;
+    int64_t base_total = (int64_t) base_resolution * (int64_t) base_resolution * (int64_t) base_resolution;
+    if (!vkmesh_remesh_coords_reserve(&coords, &coord_capacity, base_total)) return 0;
+    for (int32_t x = 0; x < base_resolution; ++x) {
+        for (int32_t y = 0; y < base_resolution; ++y) {
+            for (int32_t z = 0; z < base_resolution; ++z) {
+                coords[coord_count++] = (vkmesh_remesh_coord) { x, y, z };
+            }
+        }
+    }
+
+    const vkmesh_remesh_coord child_offsets[8] = {
+        { 0, 0, 0 }, { 1, 0, 0 }, { 0, 1, 0 }, { 1, 1, 0 },
+        { 0, 0, 1 }, { 1, 0, 1 }, { 0, 1, 1 }, { 1, 1, 1 },
+    };
+    const float eps = band * scale / (float) resolution;
+    int ok = 0;
+    int level = 0;
+    while (1) {
+        float * points = NULL;
+        float * distances = NULL;
+        if (!vkmesh_remesh_build_points(coords, coord_count, base_resolution, center, scale, 1, &points) ||
+            !vkmesh_unsigned_distance_vulkan_with_bvh(mesh, nodes, node_count, tri_indices, points, coord_count, &distances, NULL)) {
+            free(points);
+            free(distances);
+            goto cleanup;
+        }
+        const float cell_size = scale / (float) base_resolution;
+        int64_t keep_count = 0;
+        for (int64_t i = 0; i < coord_count; ++i) {
+            float d = fabsf(distances[i] - eps);
+            if (d < 0.87f * cell_size) {
+                coords[keep_count++] = coords[i];
+            }
+        }
+        fprintf(stderr,
+            "vkmesh: remesh sparse_grid level=%d resolution=%d candidates=%" PRId64 " kept=%" PRId64 "\n",
+            level,
+            base_resolution,
+            coord_count,
+            keep_count);
+        free(points);
+        free(distances);
+        coord_count = keep_count;
+        if (coord_count <= 0) goto cleanup;
+        if (base_resolution >= resolution) break;
+
+        if (coord_count > INT64_MAX / 8) goto cleanup;
+        int64_t next_count = coord_count * 8;
+        vkmesh_remesh_coord * next = NULL;
+        int64_t next_capacity = 0;
+        if (!vkmesh_remesh_coords_reserve(&next, &next_capacity, next_count)) {
+            free(next);
+            goto cleanup;
+        }
+        int64_t dst = 0;
+        for (int64_t i = 0; i < coord_count; ++i) {
+            int32_t bx = coords[i].x * 2;
+            int32_t by = coords[i].y * 2;
+            int32_t bz = coords[i].z * 2;
+            for (int k = 0; k < 8; ++k) {
+                next[dst++] = (vkmesh_remesh_coord) {
+                    bx + child_offsets[k].x,
+                    by + child_offsets[k].y,
+                    bz + child_offsets[k].z,
+                };
+            }
+        }
+        free(coords);
+        coords = next;
+        coord_capacity = next_capacity;
+        coord_count = next_count;
+        base_resolution *= 2;
+        ++level;
+    }
+
+    *coords_out = coords;
+    *count_out = coord_count;
+    coords = NULL;
+    ok = 1;
+
+cleanup:
+    free(coords);
+    return ok;
+}
+
+static int vkmesh_remesh_build_active_hash(
+    const vkmesh_remesh_coord * coords,
+    int64_t coord_count,
+    int resolution,
+    vkmesh_u64_u32_hash * hash_out) {
+    if (coord_count <= 0 || coord_count > UINT32_MAX) return 0;
+    if (!vkmesh_hash_init(hash_out, (size_t) coord_count)) return 0;
+    for (int64_t i = 0; i < coord_count; ++i) {
+        uint64_t key = vkmesh_remesh_coord_key(coords[i].x, coords[i].y, coords[i].z, resolution);
+        if (!vkmesh_hash_insert(hash_out, key, (uint32_t) i)) return 0;
+    }
+    return 1;
+}
+
+static int vkmesh_remesh_collect_grid_vertices(
+    const vkmesh_remesh_coord * coords,
+    int64_t coord_count,
+    int resolution,
+    vkmesh_remesh_coord ** grid_out,
+    int64_t * grid_count_out,
+    vkmesh_u64_u32_hash * vert_hash_out) {
+    *grid_out = NULL;
+    *grid_count_out = 0;
+    if (coord_count <= 0 || coord_count > UINT32_MAX) return 0;
+    if (coord_count > (int64_t) (SIZE_MAX / 8u)) return 0;
+    if (!vkmesh_hash_init(vert_hash_out, (size_t) coord_count * 4u)) return 0;
+
+    vkmesh_remesh_coord * grid = NULL;
+    int64_t grid_count = 0;
+    int64_t grid_capacity = 0;
+    int ok = 0;
+    for (int64_t i = 0; i < coord_count; ++i) {
+        for (int dx = 0; dx <= 1; ++dx) {
+            for (int dy = 0; dy <= 1; ++dy) {
+                for (int dz = 0; dz <= 1; ++dz) {
+                    int32_t x = coords[i].x + dx;
+                    int32_t y = coords[i].y + dy;
+                    int32_t z = coords[i].z + dz;
+                    uint64_t key = vkmesh_remesh_coord_key(x, y, z, resolution + 1);
+                    if (vkmesh_hash_lookup(vert_hash_out, key) != UINT32_MAX) continue;
+                    if (grid_count >= UINT32_MAX) goto cleanup;
+                    if (!vkmesh_remesh_coords_append(&grid, &grid_count, &grid_capacity, x, y, z) ||
+                        !vkmesh_hash_insert(vert_hash_out, key, (uint32_t) (grid_count - 1))) {
+                        goto cleanup;
+                    }
+                }
+            }
+        }
+    }
+    *grid_out = grid;
+    *grid_count_out = grid_count;
+    grid = NULL;
+    ok = 1;
+
+cleanup:
+    free(grid);
+    if (!ok) vkmesh_hash_destroy(vert_hash_out);
+    return ok;
+}
+
+static float vkmesh_remesh_grid_value(
+    const vkmesh_u64_u32_hash * vert_hash,
+    const float * values,
+    int resolution,
+    int32_t x,
+    int32_t y,
+    int32_t z,
+    int * ok) {
+    uint32_t idx = vkmesh_hash_lookup(vert_hash, vkmesh_remesh_coord_key(x, y, z, resolution + 1));
+    if (idx == UINT32_MAX) {
+        *ok = 0;
+        return 0.0f;
+    }
+    return values[idx];
+}
+
+static int vkmesh_remesh_simple_dual_contour(
+    const vkmesh_remesh_coord * coords,
+    int64_t coord_count,
+    const vkmesh_u64_u32_hash * vert_hash,
+    const float * grid_values,
+    int resolution,
+    float ** dual_out,
+    int32_t ** intersected_out) {
+    *dual_out = NULL;
+    *intersected_out = NULL;
+    if (coord_count <= 0 || coord_count > UINT32_MAX) return 0;
+    float * dual = (float *) malloc((size_t) coord_count * 3u * sizeof(float));
+    int32_t * intersected = (int32_t *) calloc((size_t) coord_count * 3u, sizeof(int32_t));
+    if (dual == NULL || intersected == NULL) {
+        free(dual);
+        free(intersected);
+        return 0;
+    }
+
+    int ok = 1;
+    for (int64_t i = 0; i < coord_count; ++i) {
+        int32_t vx = coords[i].x;
+        int32_t vy = coords[i].y;
+        int32_t vz = coords[i].z;
+        float sum[3] = { 0.0f, 0.0f, 0.0f };
+        int count = 0;
+
+        for (int u = 0; u <= 1; ++u) {
+            for (int v = 0; v <= 1; ++v) {
+                float val1 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx, vy + u, vz + v, &ok);
+                float val2 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx + 1, vy + u, vz + v, &ok);
+                if (!ok) goto fail;
+                if ((val1 < 0.0f && val2 >= 0.0f) || (val1 >= 0.0f && val2 < 0.0f)) {
+                    float t = -val1 / (val2 - val1);
+                    sum[0] += (float) vx + t;
+                    sum[1] += (float) (vy + u);
+                    sum[2] += (float) (vz + v);
+                    ++count;
+                }
+                if (u == 1 && v == 1) {
+                    intersected[(size_t) i * 3u + 0u] =
+                        (val1 < 0.0f && val2 >= 0.0f) ? 1 : ((val1 >= 0.0f && val2 < 0.0f) ? -1 : 0);
+                }
+            }
+        }
+
+        for (int u = 0; u <= 1; ++u) {
+            for (int v = 0; v <= 1; ++v) {
+                float val1 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx + u, vy, vz + v, &ok);
+                float val2 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx + u, vy + 1, vz + v, &ok);
+                if (!ok) goto fail;
+                if ((val1 < 0.0f && val2 >= 0.0f) || (val1 >= 0.0f && val2 < 0.0f)) {
+                    float t = -val1 / (val2 - val1);
+                    sum[0] += (float) (vx + u);
+                    sum[1] += (float) vy + t;
+                    sum[2] += (float) (vz + v);
+                    ++count;
+                }
+                if (u == 1 && v == 1) {
+                    intersected[(size_t) i * 3u + 1u] =
+                        (val1 < 0.0f && val2 >= 0.0f) ? 1 : ((val1 >= 0.0f && val2 < 0.0f) ? -1 : 0);
+                }
+            }
+        }
+
+        for (int u = 0; u <= 1; ++u) {
+            for (int v = 0; v <= 1; ++v) {
+                float val1 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx + u, vy + v, vz, &ok);
+                float val2 = vkmesh_remesh_grid_value(vert_hash, grid_values, resolution, vx + u, vy + v, vz + 1, &ok);
+                if (!ok) goto fail;
+                if ((val1 < 0.0f && val2 >= 0.0f) || (val1 >= 0.0f && val2 < 0.0f)) {
+                    float t = -val1 / (val2 - val1);
+                    sum[0] += (float) (vx + u);
+                    sum[1] += (float) (vy + v);
+                    sum[2] += (float) vz + t;
+                    ++count;
+                }
+                if (u == 1 && v == 1) {
+                    intersected[(size_t) i * 3u + 2u] =
+                        (val1 < 0.0f && val2 >= 0.0f) ? 1 : ((val1 >= 0.0f && val2 < 0.0f) ? -1 : 0);
+                }
+            }
+        }
+
+        if (count > 0) {
+            dual[(size_t) i * 3u + 0u] = sum[0] / (float) count;
+            dual[(size_t) i * 3u + 1u] = sum[1] / (float) count;
+            dual[(size_t) i * 3u + 2u] = sum[2] / (float) count;
+        } else {
+            dual[(size_t) i * 3u + 0u] = (float) vx + 0.5f;
+            dual[(size_t) i * 3u + 1u] = (float) vy + 0.5f;
+            dual[(size_t) i * 3u + 2u] = (float) vz + 0.5f;
+        }
+    }
+
+    *dual_out = dual;
+    *intersected_out = intersected;
+    return 1;
+
+fail:
+    free(dual);
+    free(intersected);
+    return 0;
+}
+
+static void vkmesh_cross3(const float a[3], const float b[3], float out[3]) {
+    out[0] = a[1] * b[2] - a[2] * b[1];
+    out[1] = a[2] * b[0] - a[0] * b[2];
+    out[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+static float vkmesh_dot3(const float a[3], const float b[3]) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+static float vkmesh_remesh_split_align(const float * vertices, const int32_t q[4], const int split[6]) {
+    const float * v0 = vertices + (size_t) q[split[0]] * 3u;
+    const float * v1 = vertices + (size_t) q[split[1]] * 3u;
+    const float * v2 = vertices + (size_t) q[split[2]] * 3u;
+    const float * v3 = vertices + (size_t) q[split[3]] * 3u;
+    float a[3] = { v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2] };
+    float b[3] = { v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2] };
+    float c[3] = { v2[0] - v1[0], v2[1] - v1[1], v2[2] - v1[2] };
+    float d[3] = { v3[0] - v1[0], v3[1] - v1[1], v3[2] - v1[2] };
+    float n0[3];
+    float n1[3];
+    vkmesh_cross3(a, b, n0);
+    vkmesh_cross3(c, d, n1);
+    return fabsf(vkmesh_dot3(n0, n1));
+}
+
+static int vkmesh_remesh_append_quad(
+    int32_t ** quads,
+    int32_t ** dirs,
+    int64_t * count,
+    int64_t * capacity,
+    const int32_t q[4],
+    int32_t dir) {
+    if (*count >= *capacity) {
+        int64_t cap = *capacity > 0 ? *capacity : 1024;
+        while (cap <= *count) {
+            if (cap > INT64_MAX / 2) return 0;
+            cap *= 2;
+        }
+        if ((uint64_t) cap > (uint64_t) SIZE_MAX / (4u * sizeof(int32_t))) return 0;
+        int32_t * next_quads = (int32_t *) realloc(*quads, (size_t) cap * 4u * sizeof(int32_t));
+        if (next_quads == NULL) return 0;
+        *quads = next_quads;
+        int32_t * next_dirs = (int32_t *) realloc(*dirs, (size_t) cap * sizeof(int32_t));
+        if (next_dirs == NULL) return 0;
+        *dirs = next_dirs;
+        *capacity = cap;
+    }
+    memcpy(*quads + (size_t) *count * 4u, q, 4u * sizeof(int32_t));
+    (*dirs)[*count] = dir;
+    *count += 1;
+    return 1;
+}
+
+static int vkmesh_remesh_build_mesh_from_dc(
+    const vkmesh_remesh_coord * coords,
+    int64_t coord_count,
+    const vkmesh_u64_u32_hash * active_hash,
+    const float * dual,
+    const int32_t * intersected,
+    int resolution,
+    const float center[3],
+    float scale,
+    vkmesh_mesh * out) {
+    memset(out, 0, sizeof(*out));
+    if (coord_count <= 0 || coord_count > UINT32_MAX) return 0;
+    static const int32_t neighbor_offsets[3][4][3] = {
+        { { 0, 0, 0 }, { 0, 0, 1 }, { 0, 1, 1 }, { 0, 1, 0 } },
+        { { 0, 0, 0 }, { 1, 0, 0 }, { 1, 0, 1 }, { 0, 0, 1 } },
+        { { 0, 0, 0 }, { 0, 1, 0 }, { 1, 1, 0 }, { 1, 0, 0 } },
+    };
+    static const int split_1_n[6] = { 0, 1, 2, 0, 2, 3 };
+    static const int split_1_p[6] = { 0, 2, 1, 0, 3, 2 };
+    static const int split_2_n[6] = { 0, 1, 3, 3, 1, 2 };
+    static const int split_2_p[6] = { 0, 3, 1, 3, 2, 1 };
+
+    int32_t * quads = NULL;
+    int32_t * dirs = NULL;
+    int64_t quad_count = 0;
+    int64_t quad_capacity = 0;
+    uint8_t * referenced = (uint8_t *) calloc((size_t) coord_count, sizeof(uint8_t));
+    int32_t * vertex_map = (int32_t *) malloc((size_t) coord_count * sizeof(int32_t));
+    if (referenced == NULL || vertex_map == NULL) {
+        free(referenced);
+        free(vertex_map);
+        return 0;
+    }
+
+    int ok = 0;
+    for (int64_t i = 0; i < coord_count; ++i) {
+        for (int axis = 0; axis < 3; ++axis) {
+            int32_t dir = intersected[(size_t) i * 3u + (size_t) axis];
+            if (dir == 0) continue;
+            int32_t q[4];
+            int valid = 1;
+            for (int k = 0; k < 4; ++k) {
+                int32_t x = coords[i].x + neighbor_offsets[axis][k][0];
+                int32_t y = coords[i].y + neighbor_offsets[axis][k][1];
+                int32_t z = coords[i].z + neighbor_offsets[axis][k][2];
+                uint32_t idx = vkmesh_hash_lookup(active_hash, vkmesh_remesh_coord_key(x, y, z, resolution));
+                if (idx == UINT32_MAX) {
+                    valid = 0;
+                    break;
+                }
+                q[k] = (int32_t) idx;
+            }
+            if (!valid) continue;
+            if (!vkmesh_remesh_append_quad(&quads, &dirs, &quad_count, &quad_capacity, q, dir)) goto cleanup;
+            for (int k = 0; k < 4; ++k) referenced[q[k]] = 1u;
+        }
+    }
+
+    int64_t vertex_count = 0;
+    for (int64_t i = 0; i < coord_count; ++i) {
+        if (referenced[i]) {
+            if (vertex_count > INT32_MAX) goto cleanup;
+            vertex_map[i] = (int32_t) vertex_count++;
+        } else {
+            vertex_map[i] = -1;
+        }
+    }
+    if (vertex_count <= 0 || quad_count <= 0 || quad_count > INT64_MAX / 2) goto cleanup;
+    if ((uint64_t) vertex_count > (uint64_t) SIZE_MAX / (3u * sizeof(float)) ||
+        (uint64_t) quad_count > (uint64_t) SIZE_MAX / (6u * sizeof(int32_t))) {
+        goto cleanup;
+    }
+    out->vertices = (float *) malloc((size_t) vertex_count * 3u * sizeof(float));
+    out->faces = (int32_t *) malloc((size_t) quad_count * 6u * sizeof(int32_t));
+    if (out->vertices == NULL || out->faces == NULL) goto cleanup;
+    out->n_vertices = vertex_count;
+    out->vertex_capacity = vertex_count;
+    out->n_faces = quad_count * 2;
+    out->face_capacity = out->n_faces;
+
+    const float inv_res = 1.0f / (float) resolution;
+    for (int64_t i = 0; i < coord_count; ++i) {
+        int32_t dst = vertex_map[i];
+        if (dst < 0) continue;
+        out->vertices[(size_t) dst * 3u + 0u] = (dual[(size_t) i * 3u + 0u] * inv_res - 0.5f) * scale + center[0];
+        out->vertices[(size_t) dst * 3u + 1u] = (dual[(size_t) i * 3u + 1u] * inv_res - 0.5f) * scale + center[1];
+        out->vertices[(size_t) dst * 3u + 2u] = (dual[(size_t) i * 3u + 2u] * inv_res - 0.5f) * scale + center[2];
+    }
+
+    int64_t face_dst = 0;
+    for (int64_t i = 0; i < quad_count; ++i) {
+        int32_t q[4];
+        for (int k = 0; k < 4; ++k) q[k] = vertex_map[quads[(size_t) i * 4u + (size_t) k]];
+        const int * split1 = dirs[i] == 1 ? split_1_p : split_1_n;
+        const int * split2 = dirs[i] == 1 ? split_2_p : split_2_n;
+        float align0 = vkmesh_remesh_split_align(out->vertices, q, split1);
+        float align1 = vkmesh_remesh_split_align(out->vertices, q, split2);
+        const int * split = align0 > align1 ? split1 : split2;
+        for (int k = 0; k < 6; ++k) {
+            out->faces[(size_t) face_dst * 3u + (size_t) k] = q[split[k]];
+        }
+        face_dst += 2;
+    }
+    ok = 1;
+
+cleanup:
+    free(quads);
+    free(dirs);
+    free(referenced);
+    free(vertex_map);
+    if (!ok) mesh_free(out);
+    return ok;
+}
+
+static void vkmesh_closest_point_triangle(
+    const float p[3],
+    const float a[3],
+    const float b[3],
+    const float c[3],
+    float q[3]) {
+    float ab[3] = { b[0] - a[0], b[1] - a[1], b[2] - a[2] };
+    float ac[3] = { c[0] - a[0], c[1] - a[1], c[2] - a[2] };
+    float ap[3] = { p[0] - a[0], p[1] - a[1], p[2] - a[2] };
+    float d1 = vkmesh_dot3(ab, ap);
+    float d2 = vkmesh_dot3(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) {
+        memcpy(q, a, 3u * sizeof(float));
+        return;
+    }
+
+    float bp[3] = { p[0] - b[0], p[1] - b[1], p[2] - b[2] };
+    float d3 = vkmesh_dot3(ab, bp);
+    float d4 = vkmesh_dot3(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3) {
+        memcpy(q, b, 3u * sizeof(float));
+        return;
+    }
+
+    float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
+        float v = d1 / (d1 - d3);
+        q[0] = a[0] + v * ab[0];
+        q[1] = a[1] + v * ab[1];
+        q[2] = a[2] + v * ab[2];
+        return;
+    }
+
+    float cp[3] = { p[0] - c[0], p[1] - c[1], p[2] - c[2] };
+    float d5 = vkmesh_dot3(ab, cp);
+    float d6 = vkmesh_dot3(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6) {
+        memcpy(q, c, 3u * sizeof(float));
+        return;
+    }
+
+    float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
+        float w = d2 / (d2 - d6);
+        q[0] = a[0] + w * ac[0];
+        q[1] = a[1] + w * ac[1];
+        q[2] = a[2] + w * ac[2];
+        return;
+    }
+
+    float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
+        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        q[0] = b[0] + w * (c[0] - b[0]);
+        q[1] = b[1] + w * (c[1] - b[1]);
+        q[2] = b[2] + w * (c[2] - b[2]);
+        return;
+    }
+
+    float denom = 1.0f / fmaxf(va + vb + vc, 1e-30f);
+    float v = vb * denom;
+    float w = vc * denom;
+    q[0] = a[0] + ab[0] * v + ac[0] * w;
+    q[1] = a[1] + ab[1] * v + ac[1] * w;
+    q[2] = a[2] + ab[2] * v + ac[2] * w;
+}
+
+static int vkmesh_remesh_project_back(
+    vkmesh_mesh * mesh,
+    const vkmesh_mesh * source,
+    const vkmesh_bvh_node * nodes,
+    uint32_t node_count,
+    const uint32_t * tri_indices,
+    float project_back) {
+    if (project_back <= 0.0f) return 1;
+    float * distances = NULL;
+    uint32_t * face_ids = NULL;
+    if (!vkmesh_unsigned_distance_vulkan_with_bvh(
+            source,
+            nodes,
+            node_count,
+            tri_indices,
+            mesh->vertices,
+            mesh->n_vertices,
+            &distances,
+            &face_ids)) {
+        return 0;
+    }
+    (void) distances;
+    for (int64_t i = 0; i < mesh->n_vertices; ++i) {
+        uint32_t face_id = face_ids[i];
+        if (face_id >= (uint32_t) source->n_faces) continue;
+        const int32_t * f = source->faces + (size_t) face_id * 3u;
+        const float * a = source->vertices + (size_t) f[0] * 3u;
+        const float * b = source->vertices + (size_t) f[1] * 3u;
+        const float * c = source->vertices + (size_t) f[2] * 3u;
+        float * p = mesh->vertices + (size_t) i * 3u;
+        float q[3];
+        vkmesh_closest_point_triangle(p, a, b, c, q);
+        p[0] -= project_back * (p[0] - q[0]);
+        p[1] -= project_back * (p[1] - q[1]);
+        p[2] -= project_back * (p[2] - q[2]);
+    }
+    free(distances);
+    free(face_ids);
+    return 1;
+}
+
+static int vkmesh_remesh_narrow_band_dc(
+    vkmesh_mesh * mesh,
+    int resolution,
+    float band,
+    float project_back) {
+    if (mesh == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
+        mesh->n_vertices <= 0 || mesh->n_faces <= 0 || mesh->n_faces > UINT32_MAX) {
+        return 0;
+    }
+    if (resolution <= 0) resolution = 1024;
+    if (band <= 0.0f) band = 1.0f;
+    if (project_back < 0.0f) project_back = 0.0f;
+
+    float bmin[3];
+    float bmax[3];
+    if (!vkmesh_mesh_bounds(mesh, bmin, bmax)) return 0;
+    float center[3] = {
+        0.5f * (bmin[0] + bmax[0]),
+        0.5f * (bmin[1] + bmax[1]),
+        0.5f * (bmin[2] + bmax[2]),
+    };
+    float base_scale = fmaxf(fmaxf(bmax[0] - bmin[0], bmax[1] - bmin[1]), bmax[2] - bmin[2]);
+    if (!(base_scale > 0.0f)) return 0;
+    float scale = ((float) resolution + 3.0f * band) / (float) resolution * base_scale;
+    float eps = band * scale / (float) resolution;
+
+    fprintf(stderr,
+        "vkmesh: remesh_narrow_band_dc begin resolution=%d band=%.9g project=%.9g scale=%.9g eps=%.9g\n",
+        resolution,
+        band,
+        project_back,
+        scale,
+        eps);
+
+    vkmesh_bvh_node * nodes = NULL;
+    uint32_t node_count = 0;
+    uint32_t * tri_indices = NULL;
+    vkmesh_remesh_coord * coords = NULL;
+    int64_t coord_count = 0;
+    vkmesh_u64_u32_hash active_hash;
+    vkmesh_u64_u32_hash vert_hash;
+    memset(&active_hash, 0, sizeof(active_hash));
+    memset(&vert_hash, 0, sizeof(vert_hash));
+    vkmesh_remesh_coord * grid_verts = NULL;
+    int64_t grid_vert_count = 0;
+    float * grid_points = NULL;
+    float * grid_values = NULL;
+    float * dual = NULL;
+    int32_t * intersected = NULL;
+    vkmesh_mesh out;
+    memset(&out, 0, sizeof(out));
+    int ok = 0;
+
+    if (!vkmesh_build_bvh(mesh, &nodes, &node_count, &tri_indices)) goto cleanup;
+    if (!vkmesh_remesh_refine_sparse_grid(
+            mesh,
+            nodes,
+            node_count,
+            tri_indices,
+            resolution,
+            center,
+            scale,
+            band,
+            &coords,
+            &coord_count)) {
+        goto cleanup;
+    }
+    fprintf(stderr, "vkmesh: remesh active_voxels=%" PRId64 "\n", coord_count);
+    if (!vkmesh_remesh_build_active_hash(coords, coord_count, resolution, &active_hash)) goto cleanup;
+    if (!vkmesh_remesh_collect_grid_vertices(coords, coord_count, resolution, &grid_verts, &grid_vert_count, &vert_hash)) goto cleanup;
+    fprintf(stderr, "vkmesh: remesh active_grid_vertices=%" PRId64 "\n", grid_vert_count);
+    if (!vkmesh_remesh_build_points(grid_verts, grid_vert_count, resolution, center, scale, 0, &grid_points) ||
+        !vkmesh_unsigned_distance_vulkan_with_bvh(
+            mesh,
+            nodes,
+            node_count,
+            tri_indices,
+            grid_points,
+            grid_vert_count,
+            &grid_values,
+            NULL)) {
+        goto cleanup;
+    }
+    for (int64_t i = 0; i < grid_vert_count; ++i) grid_values[i] -= eps;
+
+    if (!vkmesh_remesh_simple_dual_contour(coords, coord_count, &vert_hash, grid_values, resolution, &dual, &intersected) ||
+        !vkmesh_remesh_build_mesh_from_dc(coords, coord_count, &active_hash, dual, intersected, resolution, center, scale, &out)) {
+        goto cleanup;
+    }
+    fprintf(stderr, "vkmesh: remesh after_dual_contour vertices=%" PRId64 " faces=%" PRId64 "\n", out.n_vertices, out.n_faces);
+    if (!vkmesh_remesh_project_back(&out, mesh, nodes, node_count, tri_indices, project_back)) goto cleanup;
+
+    mesh_free(mesh);
+    *mesh = out;
+    memset(&out, 0, sizeof(out));
+    fprintf(stderr, "vkmesh: remesh_narrow_band_dc done vertices=%" PRId64 " faces=%" PRId64 "\n", mesh->n_vertices, mesh->n_faces);
+    ok = 1;
+
+cleanup:
+    mesh_free(&out);
+    free(nodes);
+    free(tri_indices);
+    free(coords);
+    vkmesh_hash_destroy(&active_hash);
+    vkmesh_hash_destroy(&vert_hash);
+    free(grid_verts);
+    free(grid_points);
+    free(grid_values);
+    free(dual);
+    free(intersected);
+    return ok;
 }
 
 static uint32_t vkmesh_find_parent_u32(const uint32_t * parent, uint32_t count, uint32_t x) {
@@ -6212,6 +7084,15 @@ static int vkmesh_log_remove_small_connected_components(vkmesh_mesh * mesh, floa
     return 1;
 }
 
+static int vkmesh_log_simplify(
+    vkmesh_mesh * mesh,
+    int target_faces,
+    float lambda_edge_length,
+    float lambda_skinny,
+    float simplify_threshold,
+    int simplify_steps,
+    const char * label);
+
 static int vkmesh_log_small_components_fill_holes_device_cluster(
     vkmesh_mesh * mesh,
     float min_component_area,
@@ -6479,7 +7360,11 @@ static int vkmesh_trellis_postprocess_device_inner(
     float lambda_skinny,
     float simplify_threshold,
     int simplify_steps,
-    int run_degenerate_cleanup) {
+    int run_degenerate_cleanup,
+    int remesh,
+    int remesh_resolution,
+    float remesh_band,
+    float remesh_project) {
     if (mesh == NULL || mesh->n_vertices <= 0 || mesh->n_vertices > UINT32_MAX ||
         mesh->n_faces <= 0 || mesh->n_faces > UINT32_MAX) {
         return 0;
@@ -6495,6 +7380,8 @@ static int vkmesh_trellis_postprocess_device_inner(
     memset(&dm, 0, sizeof(dm));
     vkmesh_mesh projection_candidate;
     memset(&projection_candidate, 0, sizeof(projection_candidate));
+    vkmesh_mesh remesh_work;
+    memset(&remesh_work, 0, sizeof(remesh_work));
     int ok = 0;
     if (!vkmesh_device_mesh_upload(vk, mesh, &dm)) goto cleanup;
 
@@ -6529,6 +7416,40 @@ static int vkmesh_trellis_postprocess_device_inner(
                 projection_candidate.n_faces);
             if (!wrote_projection) goto cleanup;
         }
+    }
+
+    if (remesh) {
+        if (projection_candidate.vertices != NULL) {
+            if (!mesh_clone(&projection_candidate, &remesh_work)) goto cleanup;
+        } else if (!vkmesh_device_mesh_download(&dm, &remesh_work)) {
+            goto cleanup;
+        }
+        vkmesh_device_mesh_destroy(&dm);
+        if (!vkmesh_remesh_narrow_band_dc(&remesh_work, remesh_resolution, remesh_band, remesh_project)) goto cleanup;
+        if (remesh_work.n_faces > (int64_t) decimation_target) {
+            if (!vkmesh_log_simplify(
+                    &remesh_work,
+                    decimation_target,
+                    lambda_edge_length,
+                    lambda_skinny,
+                    simplify_threshold,
+                    simplify_steps,
+                    "trellis.remesh")) {
+                goto cleanup;
+            }
+        } else {
+            fprintf(stderr, "vkmesh: trellis.remesh simplify skipped faces=%" PRId64 " target=%d\n", remesh_work.n_faces, decimation_target);
+        }
+        mesh_free(mesh);
+        *mesh = remesh_work;
+        memset(&remesh_work, 0, sizeof(remesh_work));
+        if (projection_mesh_out != NULL && projection_candidate.vertices != NULL) {
+            *projection_mesh_out = projection_candidate;
+            memset(&projection_candidate, 0, sizeof(projection_candidate));
+        }
+        fprintf(stderr, "vkmesh: trellis_postprocess done vertices=%" PRId64 " faces=%" PRId64 "\n", mesh->n_vertices, mesh->n_faces);
+        ok = 1;
+        goto cleanup;
     }
 
     int64_t first_target = (int64_t) decimation_target * 3;
@@ -6622,6 +7543,7 @@ static int vkmesh_trellis_postprocess_device_inner(
     ok = 1;
 
 cleanup:
+    mesh_free(&remesh_work);
     mesh_free(&projection_candidate);
     vkmesh_device_mesh_destroy(&dm);
     if (owns_vk) vkmesh_vk_destroy(vk);
@@ -6686,7 +7608,11 @@ static int vkmesh_trellis_postprocess_inner(
     float lambda_skinny,
     float simplify_threshold,
     int simplify_steps,
-    int run_degenerate_cleanup) {
+    int run_degenerate_cleanup,
+    int remesh,
+    int remesh_resolution,
+    float remesh_band,
+    float remesh_project) {
     if (vkmesh_trellis_postprocess_device_inner(
             mesh,
             projection_output,
@@ -6700,7 +7626,11 @@ static int vkmesh_trellis_postprocess_inner(
             lambda_skinny,
             simplify_threshold,
             simplify_steps,
-            run_degenerate_cleanup)) {
+            run_degenerate_cleanup,
+            remesh,
+            remesh_resolution,
+            remesh_band,
+            remesh_project)) {
         return 1;
     }
 
@@ -6722,6 +7652,26 @@ static int vkmesh_trellis_postprocess_inner(
                 mesh->n_faces);
         }
         if (projection_mesh_out != NULL && !mesh_clone(mesh, projection_mesh_out)) return 0;
+    }
+
+    if (remesh) {
+        if (!vkmesh_remesh_narrow_band_dc(mesh, remesh_resolution, remesh_band, remesh_project)) return 0;
+        if (mesh->n_faces > decimation_target) {
+            if (!vkmesh_log_simplify(
+                    mesh,
+                    decimation_target,
+                    lambda_edge_length,
+                    lambda_skinny,
+                    simplify_threshold,
+                    simplify_steps,
+                    "trellis.remesh")) {
+                return 0;
+            }
+        } else {
+            fprintf(stderr, "vkmesh: trellis.remesh simplify skipped faces=%" PRId64 " target=%d\n", mesh->n_faces, decimation_target);
+        }
+        fprintf(stderr, "vkmesh: trellis_postprocess done vertices=%" PRId64 " faces=%" PRId64 "\n", mesh->n_vertices, mesh->n_faces);
+        return 1;
     }
 
     int64_t first_target = (int64_t) decimation_target * 3;
@@ -6825,7 +7775,11 @@ static int vkmesh_trellis_postprocess(
     float lambda_skinny,
     float simplify_threshold,
     int simplify_steps,
-    int run_degenerate_cleanup) {
+    int run_degenerate_cleanup,
+    int remesh,
+    int remesh_resolution,
+    float remesh_band,
+    float remesh_project) {
     if (g_active_vkmesh_vk != NULL) {
         return vkmesh_trellis_postprocess_inner(
             mesh,
@@ -6840,7 +7794,11 @@ static int vkmesh_trellis_postprocess(
             lambda_skinny,
             simplify_threshold,
             simplify_steps,
-            run_degenerate_cleanup);
+            run_degenerate_cleanup,
+            remesh,
+            remesh_resolution,
+            remesh_band,
+            remesh_project);
     }
 
     vkmesh_vk vk;
@@ -6863,7 +7821,11 @@ static int vkmesh_trellis_postprocess(
         lambda_skinny,
         simplify_threshold,
         simplify_steps,
-        run_degenerate_cleanup);
+        run_degenerate_cleanup,
+        remesh,
+        remesh_resolution,
+        remesh_band,
+        remesh_project);
     g_active_vkmesh_vk = NULL;
     vkmesh_vk_destroy(&vk);
     return ok;
@@ -6966,6 +7928,13 @@ trellis_status trellis_vkmesh_postprocess(
         options != NULL && options->simplify_threshold > 0.0f ? options->simplify_threshold : 1e-8f;
     const int simplify_steps = options != NULL ? options->simplify_steps : 0;
     const int run_degenerate_cleanup = options != NULL && options->run_degenerate_cleanup;
+    const int remesh = options != NULL && options->remesh;
+    const int remesh_resolution =
+        options != NULL && options->remesh_resolution > 0 ? options->remesh_resolution : 1024;
+    const float remesh_band =
+        options != NULL && options->remesh_band > 0.0f ? options->remesh_band : 1.0f;
+    const float remesh_project =
+        options != NULL && options->remesh_project > 0.0f ? options->remesh_project : 0.0f;
 
     if (!vkmesh_trellis_postprocess(
             &work,
@@ -6980,7 +7949,11 @@ trellis_status trellis_vkmesh_postprocess(
             lambda_skinny,
             simplify_threshold,
             simplify_steps,
-            run_degenerate_cleanup)) {
+            run_degenerate_cleanup,
+            remesh,
+            remesh_resolution,
+            remesh_band,
+            remesh_project)) {
         status = TRELLIS_STATUS_ERROR;
         goto cleanup;
     }
@@ -7027,6 +8000,8 @@ static void print_usage(const char * argv0) {
         "  --unify-face-orientations     Make winding consistent per manifold component\n"
         "  --simplify                    Run CuMesh-style simplify loop\n"
         "  --no-simplify                 Disable simplify even if --target-faces was set\n"
+        "  --remesh                      Run narrow-band dual-contouring remesh\n"
+        "  --no-remesh                   Disable remesh in --postprocess preset\n"
         "  --uv-unwrap                   Run xatlas unwrap and store UVs in meshbin\n"
         "  --no-uv-unwrap                Disable UV unwrap after a preset enabled it\n"
         "\n"
@@ -7035,19 +8010,20 @@ static void print_usage(const char * argv0) {
         "  --degenerate-abs X            Default 1e-24\n"
         "  --degenerate-rel X            Default 1e-12\n"
         "  --min-component-area X        Default 1e-5\n"
-        "  --target-faces N              Enables simplify to N faces; TRELLIS default is 1000000\n"
+        "  --target-faces N              Enables simplify to N faces\n"
         "  --decimation-target N         Alias of --target-faces\n"
         "  --simplify-steps N            0 means no explicit step limit\n"
         "  --simplify-threshold X        Default 1e-8\n"
         "  --lambda-edge-length X        Default 1e-2\n"
         "  --lambda-skinny X             Default 1e-3\n"
+        "  --remesh-resolution N         Dual-contouring resolution, default 1024\n"
+        "  --remesh-band X               Narrow-band size in voxels, default 1\n"
+        "  --remesh-project X            Project remesh vertices back to source, default 0\n"
         "  --texture-size N              xatlas pack resolution, default 1024\n"
         "  --unsigned-distance pts.txt   Compute UDF for text points: x y z per line\n"
         "  --distance-output out.txt     Required with --unsigned-distance unless --output is enough for mesh only\n"
         "  --projection-mesh-output FILE With --postprocess, write post-fill source meshbin for texture projection\n"
-        "\n"
-        "Note: unsigned_distance is currently a Vulkan compute brute-force kernel;\n"
-        "      remesh_narrow_band_dc is the remaining optional stage.\n",
+        "\n",
         argv0);
 }
 
@@ -7064,8 +8040,11 @@ int main(int argc, char ** argv) {
     float simplify_threshold = 1e-8f;
     float lambda_edge_length = 1e-2f;
     float lambda_skinny = 1e-3f;
+    float remesh_band = 1.0f;
+    float remesh_project = 0.0f;
     int target_faces = 0;
     int simplify_steps = 0;
+    int remesh_resolution = 1024;
     int texture_size = 1024;
     int trellis_postprocess = 0;
     int fill_holes = 1;
@@ -7076,6 +8055,8 @@ int main(int argc, char ** argv) {
     int unify_face_orientations = 0;
     int simplify = 0;
     int disable_simplify = 0;
+    int simplify_option_seen = 0;
+    int remesh = 0;
     int uv_unwrap = 0;
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--input") == 0 && i + 1 < argc) {
@@ -7086,6 +8067,10 @@ int main(int argc, char ** argv) {
             projection_output = argv[++i];
         } else if (strcmp(argv[i], "--postprocess") == 0 || strcmp(argv[i], "--trellis-postprocess") == 0) {
             trellis_postprocess = 1;
+            remesh = 1;
+            if (!simplify_option_seen) {
+                disable_simplify = 1;
+            }
             uv_unwrap = 1;
         } else if (strcmp(argv[i], "--cleanup") == 0) {
             fill_holes = 1;
@@ -7106,6 +8091,7 @@ int main(int argc, char ** argv) {
             target_faces = atoi(argv[++i]);
             simplify = 1;
             disable_simplify = 0;
+            simplify_option_seen = 1;
         } else if (strcmp(argv[i], "--simplify-steps") == 0 && i + 1 < argc) {
             simplify_steps = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--simplify-threshold") == 0 && i + 1 < argc) {
@@ -7114,6 +8100,12 @@ int main(int argc, char ** argv) {
             lambda_edge_length = (float) atof(argv[++i]);
         } else if (strcmp(argv[i], "--lambda-skinny") == 0 && i + 1 < argc) {
             lambda_skinny = (float) atof(argv[++i]);
+        } else if (strcmp(argv[i], "--remesh-resolution") == 0 && i + 1 < argc) {
+            remesh_resolution = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--remesh-band") == 0 && i + 1 < argc) {
+            remesh_band = (float) atof(argv[++i]);
+        } else if (strcmp(argv[i], "--remesh-project") == 0 && i + 1 < argc) {
+            remesh_project = (float) atof(argv[++i]);
         } else if (strcmp(argv[i], "--texture-size") == 0 && i + 1 < argc) {
             texture_size = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--unsigned-distance") == 0 && i + 1 < argc) {
@@ -7137,9 +8129,15 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "--simplify") == 0) {
             simplify = 1;
             disable_simplify = 0;
+            simplify_option_seen = 1;
         } else if (strcmp(argv[i], "--no-simplify") == 0) {
             simplify = 0;
             disable_simplify = 1;
+            simplify_option_seen = 1;
+        } else if (strcmp(argv[i], "--remesh") == 0) {
+            remesh = 1;
+        } else if (strcmp(argv[i], "--no-remesh") == 0) {
+            remesh = 0;
         } else if (strcmp(argv[i], "--uv-unwrap") == 0) {
             uv_unwrap = 1;
         } else if (strcmp(argv[i], "--no-uv-unwrap") == 0) {
@@ -7159,6 +8157,10 @@ int main(int argc, char ** argv) {
     }
     if (points_path != NULL && distance_output == NULL) {
         fprintf(stderr, "vkmesh: --distance-output is required with --unsigned-distance\n");
+        return 2;
+    }
+    if (remesh && (remesh_resolution <= 0 || remesh_band <= 0.0f || remesh_project < 0.0f)) {
+        fprintf(stderr, "vkmesh: invalid remesh parameters\n");
         return 2;
     }
 
@@ -7184,7 +8186,11 @@ int main(int argc, char ** argv) {
                 lambda_skinny,
                 simplify_threshold,
                 simplify_steps,
-                remove_degenerate_faces)) {
+                remove_degenerate_faces,
+                remesh,
+                remesh_resolution,
+                remesh_band,
+                remesh_project)) {
             mesh_free(&mesh);
             return 1;
         }
@@ -7212,6 +8218,12 @@ int main(int argc, char ** argv) {
         if (unify_face_orientations && !vkmesh_log_unify_face_orientations(&mesh, "stage")) {
             mesh_free(&mesh);
             return 1;
+        }
+        if (remesh) {
+            if (!vkmesh_remesh_narrow_band_dc(&mesh, remesh_resolution, remesh_band, remesh_project)) {
+                mesh_free(&mesh);
+                return 1;
+            }
         }
         if (simplify && !disable_simplify) {
             if (target_faces <= 0) target_faces = (int) (mesh.n_faces / 2);

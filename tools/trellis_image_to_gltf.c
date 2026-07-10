@@ -38,8 +38,14 @@ static void usage(FILE * out, const char * argv0) {
         "  --pipeline NAME         512, 1024, or 1024_cascade, default 1024_cascade\n"
         "  --mesh-postprocess      Run vkmesh TRELLIS topology cleanup before GLB/glTF export, default on\n"
         "  --no-mesh-postprocess   Disable topology cleanup for raw/debug exports\n"
-        "  --mesh-postprocess-no-simplify Skip vkmesh simplify, keeping cleanup/orientation only\n"
+        "  --mesh-postprocess-simplify Run vkmesh simplify after remesh/cleanup, default off\n"
+        "  --mesh-postprocess-no-simplify Skip vkmesh simplify, default on\n"
         "  --mesh-decimation-target N Postprocess final face target, default 1000000\n"
+        "  --mesh-remesh           Run narrow-band remesh during postprocess, default on\n"
+        "  --no-mesh-remesh        Disable remesh and use cleanup/simplify only\n"
+        "  --mesh-remesh-resolution N Override remesh grid resolution\n"
+        "  --mesh-remesh-band X    Remesh narrow-band size in voxels, default 1\n"
+        "  --mesh-remesh-project X Project remesh vertices back to source, default 0\n"
         "  --vkmesh FILE           vkmesh executable path; default searches sibling binary then PATH\n"
         "  --no-model-cache        Disable persistent model weight cache\n"
         "  --model-cache-budget-mib N GPU-resident weight cache budget; 0/unset means unlimited\n"
@@ -158,7 +164,12 @@ int main(int argc, char ** argv) {
     options.flow_blocks_override = -1;
     options.flow_block_parts_override = -1;
     options.mesh_postprocess = 1;
+    options.mesh_postprocess_no_simplify = 1;
     options.mesh_postprocess_decimation_target = 1000000;
+    options.mesh_remesh = 1;
+    options.mesh_remesh_resolution = 0;
+    options.mesh_remesh_band = 1.0f;
+    options.mesh_remesh_project = 0.0f;
     options.max_num_tokens = 49152;
     options.model_cache = 1;
     options.model_cache_budget_mib = 0;
@@ -185,8 +196,23 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "--mesh-postprocess-no-simplify") == 0) {
             options.mesh_postprocess = 1;
             options.mesh_postprocess_no_simplify = 1;
+        } else if (strcmp(argv[i], "--mesh-postprocess-simplify") == 0) {
+            options.mesh_postprocess = 1;
+            options.mesh_postprocess_no_simplify = 0;
         } else if (strcmp(argv[i], "--mesh-decimation-target") == 0) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options.mesh_postprocess_decimation_target)) goto bad_args;
+            options.mesh_postprocess_no_simplify = 0;
+        } else if (strcmp(argv[i], "--mesh-remesh") == 0) {
+            options.mesh_postprocess = 1;
+            options.mesh_remesh = 1;
+        } else if (strcmp(argv[i], "--no-mesh-remesh") == 0) {
+            options.mesh_remesh = 0;
+        } else if (strcmp(argv[i], "--mesh-remesh-resolution") == 0) {
+            if (!parse_int_arg(arg_value(argc, argv, &i), &options.mesh_remesh_resolution)) goto bad_args;
+        } else if (strcmp(argv[i], "--mesh-remesh-band") == 0) {
+            if (!parse_float_arg(arg_value(argc, argv, &i), &options.mesh_remesh_band)) goto bad_args;
+        } else if (strcmp(argv[i], "--mesh-remesh-project") == 0) {
+            if (!parse_float_arg(arg_value(argc, argv, &i), &options.mesh_remesh_project)) goto bad_args;
         } else if (strcmp(argv[i], "--vkmesh") == 0) {
             options.vkmesh_path = arg_value(argc, argv, &i);
         } else if (strcmp(argv[i], "--model-cache") == 0) {
@@ -284,6 +310,9 @@ int main(int argc, char ** argv) {
         options.sparse_resolution <= 0 || options.texture_size <= 0 ||
         options.max_num_tokens <= 0 ||
         options.mesh_postprocess_decimation_target <= 0 ||
+        options.mesh_remesh_resolution < 0 ||
+        options.mesh_remesh_band <= 0.0f ||
+        options.mesh_remesh_project < 0.0f ||
         options.model_cache_budget_mib < 0 ||
         (options.resolution != 512 && options.resolution != 1024)) {
         goto bad_args;

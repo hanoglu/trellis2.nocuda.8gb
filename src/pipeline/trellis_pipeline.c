@@ -102,8 +102,8 @@ static const trellis_component_status g_status[] = {
     {
         TRELLIS_COMPONENT_OVOXEL_POSTPROCESS,
         "O-Voxel postprocess",
-        false,
-        "vkmesh topology cleanup and Vulkan compute UV-space PBR texture bake are implemented; optional remesh_narrow_band_dc is pending",
+        true,
+        "vkmesh topology cleanup, narrow-band remesh, simplify, and Vulkan compute UV-space PBR texture bake are implemented",
     },
 };
 
@@ -970,9 +970,19 @@ static int run_vkmesh_postprocess_command(
     const char * output_mesh,
     const char * projection_mesh,
     int decimation_target,
-    int no_simplify) {
+    int no_simplify,
+    int remesh,
+    int remesh_resolution,
+    float remesh_band,
+    float remesh_project) {
     char target[64];
+    char remesh_resolution_buf[64];
+    char remesh_band_buf[64];
+    char remesh_project_buf[64];
     snprintf(target, sizeof(target), "%d", decimation_target > 0 ? decimation_target : 1000000);
+    snprintf(remesh_resolution_buf, sizeof(remesh_resolution_buf), "%d", remesh_resolution > 0 ? remesh_resolution : 1024);
+    snprintf(remesh_band_buf, sizeof(remesh_band_buf), "%.9g", remesh_band > 0.0f ? remesh_band : 1.0f);
+    snprintf(remesh_project_buf, sizeof(remesh_project_buf), "%.9g", remesh_project > 0.0f ? remesh_project : 0.0f);
     char sibling_vkmesh[PATH_MAX];
     const char * exe = vkmesh_path != NULL && vkmesh_path[0] != '\0' ? vkmesh_path : NULL;
     if (exe == NULL) {
@@ -996,7 +1006,7 @@ static int run_vkmesh_postprocess_command(
         exe = "vkmesh";
     }
     TRELLIS_INFO("mesh postprocess: using vkmesh executable %s", exe);
-    char * argv[16];
+    char * argv[28];
     int argc = 0;
     argv[argc++] = (char *) exe;
     argv[argc++] = (char *) "--input";
@@ -1008,6 +1018,17 @@ static int run_vkmesh_postprocess_command(
         argv[argc++] = (char *) projection_mesh;
     }
     argv[argc++] = (char *) "--postprocess";
+    if (remesh) {
+        argv[argc++] = (char *) "--remesh";
+        argv[argc++] = (char *) "--remesh-resolution";
+        argv[argc++] = remesh_resolution_buf;
+        argv[argc++] = (char *) "--remesh-band";
+        argv[argc++] = remesh_band_buf;
+        argv[argc++] = (char *) "--remesh-project";
+        argv[argc++] = remesh_project_buf;
+    } else {
+        argv[argc++] = (char *) "--no-remesh";
+    }
     argv[argc++] = (char *) "--decimation-target";
     argv[argc++] = target;
     if (no_simplify) {
@@ -1025,7 +1046,11 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     trellis_mesh_host * projection_mesh_out,
     const char * vkmesh_path,
     int decimation_target,
-    int no_simplify) {
+    int no_simplify,
+    int remesh,
+    int remesh_resolution,
+    float remesh_band,
+    float remesh_project) {
     if (mesh == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
         mesh->n_vertices <= 0 || mesh->n_faces <= 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
@@ -1040,6 +1065,10 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     memset(&vkmesh_options, 0, sizeof(vkmesh_options));
     vkmesh_options.decimation_target = decimation_target > 0 ? decimation_target : 1000000;
     vkmesh_options.no_simplify = no_simplify ? 1 : 0;
+    vkmesh_options.remesh = remesh ? 1 : 0;
+    vkmesh_options.remesh_resolution = remesh_resolution > 0 ? remesh_resolution : 1024;
+    vkmesh_options.remesh_band = remesh_band > 0.0f ? remesh_band : 1.0f;
+    vkmesh_options.remesh_project = remesh_project > 0.0f ? remesh_project : 0.0f;
 
     trellis_mesh_host processed;
     trellis_mesh_host projection;
@@ -1047,9 +1076,13 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     memset(&projection, 0, sizeof(projection));
 
     TRELLIS_INFO(
-        "mesh postprocess: running vkmesh C API target=%d no_simplify=%d input_faces=%lld",
+        "mesh postprocess: running vkmesh C API target=%d no_simplify=%d remesh=%d resolution=%d band=%.9g project=%.9g input_faces=%lld",
         vkmesh_options.decimation_target,
         no_simplify ? 1 : 0,
+        vkmesh_options.remesh,
+        vkmesh_options.remesh_resolution,
+        vkmesh_options.remesh_band,
+        vkmesh_options.remesh_project,
         (long long) mesh->n_faces);
     trellis_status status = trellis_vkmesh_postprocess(
         mesh,
@@ -1101,9 +1134,13 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     }
 
     TRELLIS_INFO(
-        "mesh postprocess: running vkmesh target=%d no_simplify=%d input_faces=%lld",
+        "mesh postprocess: running vkmesh target=%d no_simplify=%d remesh=%d resolution=%d band=%.9g project=%.9g input_faces=%lld",
         decimation_target > 0 ? decimation_target : 1000000,
         no_simplify ? 1 : 0,
+        remesh ? 1 : 0,
+        remesh_resolution > 0 ? remesh_resolution : 1024,
+        remesh_band > 0.0f ? remesh_band : 1.0f,
+        remesh_project > 0.0f ? remesh_project : 0.0f,
         (long long) mesh->n_faces);
     if (!run_vkmesh_postprocess_command(
             vkmesh_path,
@@ -1111,7 +1148,11 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
             output_mesh,
             projection_mesh_out != NULL ? projection_mesh : NULL,
             decimation_target,
-            no_simplify)) {
+            no_simplify,
+            remesh,
+            remesh_resolution,
+            remesh_band,
+            remesh_project)) {
         TRELLIS_ERROR("mesh postprocess: vkmesh failed; pass --vkmesh /path/to/vkmesh if it is not in PATH");
         unlink_if_set(input_mesh);
         unlink_if_set(output_mesh);
@@ -1584,7 +1625,11 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
             &gltf_projection_mesh,
             options->vkmesh_path,
             options->mesh_postprocess_decimation_target > 0 ? options->mesh_postprocess_decimation_target : 1000000,
-            options->mesh_postprocess_no_simplify);
+            options->mesh_postprocess_no_simplify,
+            options->mesh_remesh,
+            options->mesh_remesh_resolution > 0 ? options->mesh_remesh_resolution : shape_latent.resolution,
+            options->mesh_remesh_band > 0.0f ? options->mesh_remesh_band : 1.0f,
+            options->mesh_remesh_project > 0.0f ? options->mesh_remesh_project : 0.0f);
         if (status != TRELLIS_STATUS_OK) {
             goto cleanup;
         }

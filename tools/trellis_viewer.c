@@ -174,6 +174,7 @@ typedef struct viewer_options {
     int decode_max_levels;
     int64_t decode_max_input_tokens;
     int texture_size;
+    int mesh_postprocess_remesh;
     int mesh_postprocess_no_simplify;
     int mesh_postprocess_decimation_target;
     int model_cache;
@@ -1096,6 +1097,8 @@ static void viewer_options_defaults(viewer_options * options) {
     options->flow_blocks_override = -1;
     options->flow_block_parts_override = -1;
     options->texture_size = 1024;
+    options->mesh_postprocess_remesh = 1;
+    options->mesh_postprocess_no_simplify = 1;
     options->mesh_postprocess_decimation_target = 1000000;
     options->model_cache = 1;
     options->use_ggml_flash_attn = 1;
@@ -1119,7 +1122,9 @@ static void usage(FILE * out, const char * argv0) {
         "  --steps N, --sparse-structure-steps N, --structured-latent-steps N\n"
         "  --texture-size N, --seed N, --noise-seed N\n"
         "  --flow PATH, --decoder PATH\n"
-        "  --mesh-decimation-target N, --mesh-postprocess-no-simplify\n"
+        "  --mesh-remesh, --no-mesh-remesh\n"
+        "  --mesh-postprocess-simplify, --mesh-postprocess-no-simplify\n"
+        "  --mesh-decimation-target N\n"
         "  --no-model-cache, --model-cache-budget-mib N\n"
         "  --use-ggml-flash-attn, --no-ggml-flash-attn\n"
         "  --decode-max-levels N, --decode-max-input-tokens N\n"
@@ -1212,10 +1217,17 @@ static int parse_options(int argc, char ** argv, viewer_options * options) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options->decode_max_levels)) return 0;
         } else if (strcmp(argv[i], "--decode-max-input-tokens") == 0) {
             if (!parse_i64_arg(arg_value(argc, argv, &i), &options->decode_max_input_tokens)) return 0;
+        } else if (strcmp(argv[i], "--mesh-remesh") == 0) {
+            options->mesh_postprocess_remesh = 1;
+        } else if (strcmp(argv[i], "--no-mesh-remesh") == 0) {
+            options->mesh_postprocess_remesh = 0;
+        } else if (strcmp(argv[i], "--mesh-postprocess-simplify") == 0) {
+            options->mesh_postprocess_no_simplify = 0;
         } else if (strcmp(argv[i], "--mesh-postprocess-no-simplify") == 0) {
             options->mesh_postprocess_no_simplify = 1;
         } else if (strcmp(argv[i], "--mesh-decimation-target") == 0) {
             if (!parse_int_arg(arg_value(argc, argv, &i), &options->mesh_postprocess_decimation_target)) return 0;
+            options->mesh_postprocess_no_simplify = 0;
         } else if (strcmp(argv[i], "--model-cache") == 0) {
             options->model_cache = 1;
         } else if (strcmp(argv[i], "--no-model-cache") == 0) {
@@ -2052,7 +2064,9 @@ static int run_vkmesh_external(
     trellis_mesh_host * processed_out,
     trellis_mesh_host * projection_out,
     int target,
-    int no_simplify) {
+    int no_simplify,
+    int remesh,
+    int remesh_resolution) {
     char exe[VIEWER_MAX_PATH];
     if (!find_vkmesh_executable(exe, sizeof(exe))) {
         return -1;
@@ -2069,8 +2083,10 @@ static int run_vkmesh_external(
         return 0;
     }
     char target_text[64];
+    char remesh_resolution_text[64];
     snprintf(target_text, sizeof(target_text), "%d", target > 0 ? target : 1000000);
-    char * argv[16];
+    snprintf(remesh_resolution_text, sizeof(remesh_resolution_text), "%d", remesh_resolution > 0 ? remesh_resolution : 512);
+    char * argv[28];
     int argc = 0;
     argv[argc++] = exe;
     argv[argc++] = (char *) "--input";
@@ -2080,6 +2096,17 @@ static int run_vkmesh_external(
     argv[argc++] = (char *) "--projection-mesh-output";
     argv[argc++] = projection_mesh;
     argv[argc++] = (char *) "--postprocess";
+    if (remesh) {
+        argv[argc++] = (char *) "--remesh";
+        argv[argc++] = (char *) "--remesh-resolution";
+        argv[argc++] = remesh_resolution_text;
+        argv[argc++] = (char *) "--remesh-band";
+        argv[argc++] = (char *) "1";
+        argv[argc++] = (char *) "--remesh-project";
+        argv[argc++] = (char *) "0";
+    } else {
+        argv[argc++] = (char *) "--no-remesh";
+    }
     argv[argc++] = (char *) "--decimation-target";
     argv[argc++] = target_text;
     if (no_simplify) {
@@ -2119,6 +2146,10 @@ static trellis_status run_mesh_postprocess(
     memset(&pp, 0, sizeof(pp));
     pp.decimation_target = options->mesh_postprocess_decimation_target > 0 ? options->mesh_postprocess_decimation_target : 1000000;
     pp.no_simplify = options->mesh_postprocess_no_simplify ? 1 : 0;
+    pp.remesh = options->mesh_postprocess_remesh ? 1 : 0;
+    pp.remesh_resolution = options->resolution > 0 ? options->resolution : 512;
+    pp.remesh_band = 1.0f;
+    pp.remesh_project = 0.0f;
     trellis_status status = trellis_vkmesh_postprocess(mesh, &processed, &projection, &pp);
     if (status != TRELLIS_STATUS_OK) {
         trellis_mesh_free(&processed);
@@ -2131,7 +2162,9 @@ static trellis_status run_mesh_postprocess(
             &processed,
             &projection,
             options->mesh_postprocess_decimation_target,
-            options->mesh_postprocess_no_simplify);
+            options->mesh_postprocess_no_simplify,
+            options->mesh_postprocess_remesh,
+            options->resolution);
     if (external_status < 0) {
         return TRELLIS_STATUS_NOT_FOUND;
     }
@@ -2519,7 +2552,12 @@ done:
 static trellis_status run_postprocess_job(viewer_worker_args * args) {
     viewer_shared * shared = args->shared;
     const viewer_options * options = &args->options;
-    shared_set_stage(shared, "Postprocess", "cleaning topology with vkmesh", 0.22f, 1);
+    shared_set_stage(
+        shared,
+        "Postprocess",
+        options->mesh_postprocess_remesh ? "remeshing topology with vkmesh" : "cleaning topology with vkmesh",
+        0.22f,
+        1);
 
     pthread_mutex_lock(&shared->mutex);
     int ready = shared->mesh_ready && shared->artifacts.has_mesh;
@@ -2531,7 +2569,11 @@ static trellis_status run_postprocess_job(viewer_worker_args * args) {
     trellis_status status = run_mesh_postprocess(options, &shared->artifacts.mesh, &shared->artifacts.projection_mesh);
     if (status == TRELLIS_STATUS_OK) {
         shared->artifacts.has_postprocess = 1;
-        publish_mesh_snapshot(shared, &shared->artifacts.mesh, NULL, "Postprocessed mesh");
+        publish_mesh_snapshot(
+            shared,
+            &shared->artifacts.mesh,
+            NULL,
+            options->mesh_postprocess_remesh ? "Remeshed mesh" : "Postprocessed mesh");
         pthread_mutex_lock(&shared->mutex);
         shared->postprocess_ready = 1;
         shared->texture_ready = 0;
@@ -3454,12 +3496,15 @@ static void draw_left_panel(
         options->use_ggml_flash_attn = !options->no_ggml_flash_attn;
     }
     y += 38.0f;
-    if (ui_small_button((Rectangle) {panel.x + 18.0f, y, bw, 30.0f}, "Post no-simplify", options->mesh_postprocess_no_simplify, !worker_running)) {
+    if (ui_small_button((Rectangle) {panel.x + 18.0f, y, (bw - 8.0f) * 0.5f, 30.0f}, "Remesh", options->mesh_postprocess_remesh, !worker_running)) {
+        options->mesh_postprocess_remesh = !options->mesh_postprocess_remesh;
+    }
+    if (ui_small_button((Rectangle) {panel.x + 18.0f + (bw + 8.0f) * 0.5f, y, (bw - 8.0f) * 0.5f, 30.0f}, "Simplify", !options->mesh_postprocess_no_simplify, !worker_running)) {
         options->mesh_postprocess_no_simplify = !options->mesh_postprocess_no_simplify;
     }
     y += 40.0f;
     int target_k = options->mesh_postprocess_decimation_target / 1000;
-    if (ui_stepper((Rectangle) {panel.x + 18.0f, y, bw, 48.0f}, "Post target K faces", &target_k, 250, 100, 2000, !worker_running)) {
+    if (ui_stepper((Rectangle) {panel.x + 18.0f, y, bw, 48.0f}, "Post target K faces", &target_k, 250, 100, 2000, !worker_running && !options->mesh_postprocess_no_simplify)) {
         options->mesh_postprocess_decimation_target = target_k * 1000;
     }
 

@@ -40,7 +40,7 @@ structured-latent shape flow, shape decode, texture decode, TRELLIS topology
 postprocess, and writes a GLB or glTF in one command. It does not open raylib.
 Sparse coords and DINO condition data are passed directly in memory, so no stage
 handoff files are written by default. The CLI defaults to the PyTorch app-style
-`1024_cascade` pipeline and vkmesh postprocess to roughly one million faces. If
+`1024_cascade` pipeline and vkmesh remesh postprocess without simplification. If
 no output path is passed, it writes `output.glb`. WebP inputs are converted to a
 temporary PNG because the current
 stb_image loader does not decode WebP directly.
@@ -49,10 +49,9 @@ stb_image loader does not decode WebP directly.
 `trellis_pipeline_image_to_gltf()` from `src/pipeline/trellis_pipeline.c`.
 
 `vkmesh` runs the Vulkan compute mesh postprocess path. The TRELLIS preset
-mirrors the standard PyTorch/o-voxel export cleanup order: fill small holes,
-simplify toward `3 * target`, remove duplicate/non-manifold/small-component
-artifacts, fill again, simplify to the final target, repeat cleanup, fill once
-more, unify winding, then unwrap UVs by default.
+fills small holes, remeshes with narrow-band dual contouring by default, and
+unwraps UVs by default. Pass an explicit simplify target when you want face
+decimation.
 The implementation lives under `tools/vkmesh/`; compute shaders, including the
 glTF texture bake/dilate/fill shaders, live under `tools/vkmesh/shaders/`.
 
@@ -65,8 +64,7 @@ glTF texture bake/dilate/fill shaders, live under `tools/vkmesh/shaders/`.
   --gltf benchmark_outputs/output_post.glb \
   --backend vulkan \
   --mesh-postprocess \
-  --mesh-postprocess-no-simplify \
-  --mesh-decimation-target 1000000
+  --mesh-remesh
 ```
 
 In the full pipeline, `vkmesh` cleans topology before PBR voxel baking, so the
