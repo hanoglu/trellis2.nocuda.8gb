@@ -642,7 +642,7 @@ if (TRELLIS2_C_BUILD_TOOLS)
             "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse")
         target_link_libraries(trellis-gui PRIVATE trellis2_c ggml raylib)
         if (WIN32)
-            target_link_libraries(trellis-gui PRIVATE comdlg32)
+            target_link_libraries(trellis-gui PRIVATE comdlg32 shell32)
             set_target_properties(trellis-gui PROPERTIES WIN32_EXECUTABLE TRUE)
             target_link_options(trellis-gui PRIVATE /ENTRY:mainCRTStartup)
             add_custom_command(TARGET trellis-gui POST_BUILD

@@ -16,12 +16,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <wchar.h>
 
 #ifndef _WIN32
 #include <dirent.h>
 #include <pthread.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#else
+#include <shellapi.h>
 #endif
 
 #ifndef PATH_MAX
@@ -207,10 +210,12 @@ typedef struct viewer_artifacts {
     trellis_sparse_c2s_guides shape_subs;
     trellis_mesh_host mesh;
     trellis_mesh_host projection_mesh;
+    trellis_pbr_voxels pbr_voxels;
     int has_sparse;
     int has_shape;
     int has_mesh;
     int has_postprocess;
+    int has_pbr_voxels;
     int pipeline_resolution;
 } viewer_artifacts;
 
@@ -982,7 +987,7 @@ static int make_default_gltf_path(const viewer_options * options, char * out, si
         copy_text(out, out_size, options->gltf_path);
         return 1;
     }
-    int n = snprintf(out, out_size, "%s/trellis_viewer_output.gltf", options->out_dir);
+    int n = snprintf(out, out_size, "%s/trellis_viewer_output.glb", options->out_dir);
     return n >= 0 && (size_t) n < out_size;
 }
 
@@ -1288,6 +1293,7 @@ static void viewer_artifacts_free(viewer_artifacts * artifacts) {
     trellis_sparse_c2s_guides_free(&artifacts->shape_subs);
     trellis_mesh_free(&artifacts->mesh);
     trellis_mesh_free(&artifacts->projection_mesh);
+    trellis_pbr_voxels_free(&artifacts->pbr_voxels);
     memset(artifacts, 0, sizeof(*artifacts));
 }
 
@@ -2532,6 +2538,10 @@ static trellis_status run_texture_job(viewer_worker_args * args) {
     make_base_color_path(gltf_path, base_color_path, sizeof(base_color_path));
     publish_mesh_snapshot(shared, &artifacts->mesh, &pbr_voxels, "Textured mesh preview");
     pthread_mutex_lock(&shared->mutex);
+    trellis_pbr_voxels_free(&artifacts->pbr_voxels);
+    artifacts->pbr_voxels = pbr_voxels;
+    artifacts->has_pbr_voxels = 1;
+    memset(&pbr_voxels, 0, sizeof(pbr_voxels));
     shared->texture_ready = 1;
     copy_text(shared->gltf_output_path, sizeof(shared->gltf_output_path), gltf_path);
     copy_text(shared->uv_texture_path, sizeof(shared->uv_texture_path), base_color_path);
@@ -2566,26 +2576,97 @@ static trellis_status run_postprocess_job(viewer_worker_args * args) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
 
-    trellis_status status = run_mesh_postprocess(options, &shared->artifacts.mesh, &shared->artifacts.projection_mesh);
-    if (status == TRELLIS_STATUS_OK) {
-        shared->artifacts.has_postprocess = 1;
+    viewer_artifacts * artifacts = &shared->artifacts;
+    trellis_status status = run_mesh_postprocess(options, &artifacts->mesh, &artifacts->projection_mesh);
+    if (status != TRELLIS_STATUS_OK) {
+        return status;
+    }
+
+    artifacts->has_postprocess = 1;
+    const int has_cached_pbr =
+        artifacts->has_pbr_voxels &&
+        artifacts->pbr_voxels.coords_bxyz != NULL &&
+        artifacts->pbr_voxels.attrs != NULL &&
+        artifacts->pbr_voxels.n_coords > 0 &&
+        artifacts->pbr_voxels.channels >= 3;
+
+    char gltf_path[VIEWER_MAX_PATH];
+    char base_color_path[VIEWER_MAX_PATH];
+    gltf_path[0] = '\0';
+    base_color_path[0] = '\0';
+
+    if (has_cached_pbr) {
+        shared_set_stage(shared, "UV bake", "rebaking cached PBR voxels", 0.82f, 1);
+        if (!mkdir_p_simple(options->out_dir) || !make_default_gltf_path(options, gltf_path, sizeof(gltf_path))) {
+            status = TRELLIS_STATUS_IO_ERROR;
+            goto rebake_failed;
+        }
+        const trellis_mesh_host * sample_mesh =
+            artifacts->projection_mesh.vertices != NULL && artifacts->projection_mesh.faces != NULL ?
+                &artifacts->projection_mesh :
+                NULL;
+        status = trellis_pipeline_write_gltf(
+            gltf_path,
+            &artifacts->mesh,
+            sample_mesh,
+            &artifacts->pbr_voxels,
+            options->texture_size);
+        if (status != TRELLIS_STATUS_OK) {
+            goto rebake_failed;
+        }
+        make_base_color_path(gltf_path, base_color_path, sizeof(base_color_path));
         publish_mesh_snapshot(
             shared,
-            &shared->artifacts.mesh,
+            &artifacts->mesh,
+            &artifacts->pbr_voxels,
+            options->mesh_postprocess_remesh ? "Remeshed textured mesh" : "Postprocessed textured mesh");
+    } else {
+        publish_mesh_snapshot(
+            shared,
+            &artifacts->mesh,
             NULL,
             options->mesh_postprocess_remesh ? "Remeshed mesh" : "Postprocessed mesh");
-        pthread_mutex_lock(&shared->mutex);
-        shared->postprocess_ready = 1;
-        shared->texture_ready = 0;
+    }
+
+    pthread_mutex_lock(&shared->mutex);
+    shared->postprocess_ready = 1;
+    shared->texture_ready = has_cached_pbr ? 1 : 0;
+    if (has_cached_pbr) {
+        copy_text(shared->gltf_output_path, sizeof(shared->gltf_output_path), gltf_path);
+        copy_text(shared->uv_texture_path, sizeof(shared->uv_texture_path), base_color_path);
+    } else {
         shared->uv_texture_path[0] = '\0';
         shared->gltf_output_path[0] = '\0';
-        shared->uv_version += 1;
-        copy_text(shared->stage, sizeof(shared->stage), "Postprocess ready");
-        snprintf(shared->detail, sizeof(shared->detail), "%lld vertices, %lld faces", (long long) shared->artifacts.mesh.n_vertices, (long long) shared->artifacts.mesh.n_faces);
-        shared->progress = 1.0f;
-        shared->indeterminate = 0;
-        pthread_mutex_unlock(&shared->mutex);
     }
+    shared->uv_version += 1;
+    copy_text(shared->stage, sizeof(shared->stage), "Postprocess ready");
+    if (has_cached_pbr) {
+        snprintf(shared->detail, sizeof(shared->detail), "rebaked %s", gltf_path);
+    } else {
+        snprintf(shared->detail, sizeof(shared->detail), "%lld vertices, %lld faces", (long long) artifacts->mesh.n_vertices, (long long) artifacts->mesh.n_faces);
+    }
+    shared->progress = 1.0f;
+    shared->indeterminate = 0;
+    pthread_mutex_unlock(&shared->mutex);
+    return TRELLIS_STATUS_OK;
+
+rebake_failed:
+    publish_mesh_snapshot(
+        shared,
+        &artifacts->mesh,
+        NULL,
+        options->mesh_postprocess_remesh ? "Remeshed mesh" : "Postprocessed mesh");
+    pthread_mutex_lock(&shared->mutex);
+    shared->postprocess_ready = 1;
+    shared->texture_ready = 0;
+    shared->uv_texture_path[0] = '\0';
+    shared->gltf_output_path[0] = '\0';
+    shared->uv_version += 1;
+    copy_text(shared->stage, sizeof(shared->stage), "Postprocess ready");
+    copy_text(shared->detail, sizeof(shared->detail), "texture rebake failed");
+    shared->progress = 1.0f;
+    shared->indeterminate = 0;
+    pthread_mutex_unlock(&shared->mutex);
     return status;
 }
 
@@ -2749,6 +2830,94 @@ static int open_image_file_dialog(char * out, size_t out_size, int * dialog_avai
     }
 #endif
     return 0;
+}
+
+static int viewer_open_folder_native(const char * folder) {
+    if (text_is_empty(folder)) {
+        return 0;
+    }
+#ifdef _WIN32
+    WCHAR wide[VIEWER_MAX_PATH];
+    if (!viewer_utf8_to_wide(folder, wide, sizeof(wide) / sizeof(wide[0]))) {
+        return 0;
+    }
+    HINSTANCE result = ShellExecuteW(NULL, L"open", wide, NULL, NULL, 1);
+    return (INT_PTR) result > 32;
+#else
+    const char * command = NULL;
+#ifdef __APPLE__
+    if (command_available("open")) {
+        command = "open";
+    }
+#else
+    if (command_available("xdg-open")) {
+        command = "xdg-open";
+    }
+#endif
+    if (command == NULL) {
+        return 0;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        return 0;
+    }
+    if (pid == 0) {
+        execlp(command, command, folder, (char *) NULL);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return 0;
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+#endif
+}
+
+static int viewer_resolve_output_folder(const viewer_options * options, viewer_shared * shared, char * out, size_t out_size) {
+    if (options == NULL || out == NULL || out_size == 0) {
+        return 0;
+    }
+    out[0] = '\0';
+
+    char gltf_path[VIEWER_MAX_PATH];
+    gltf_path[0] = '\0';
+    pthread_mutex_lock(&shared->mutex);
+    copy_text(gltf_path, sizeof(gltf_path), shared->gltf_output_path);
+    pthread_mutex_unlock(&shared->mutex);
+
+    const char * target = !text_is_empty(gltf_path) ? gltf_path :
+        (!text_is_empty(options->gltf_path) ? options->gltf_path : options->out_dir);
+    if (text_is_empty(target)) {
+        target = ".";
+    }
+
+    if (viewer_dir_exists(target)) {
+        copy_text(out, out_size, target);
+        return out[0] != '\0';
+    }
+
+    char parent[VIEWER_MAX_PATH];
+    if (viewer_parent_path(target, parent, sizeof(parent))) {
+        copy_text(out, out_size, parent);
+    } else {
+        copy_text(out, out_size, ".");
+    }
+    return out[0] != '\0';
+}
+
+static void viewer_open_generated_model_folder(const viewer_options * options, viewer_shared * shared) {
+    char folder[VIEWER_MAX_PATH];
+    char message[VIEWER_MAX_PATH + 64];
+    if (!viewer_resolve_output_folder(options, shared, folder, sizeof(folder)) ||
+        !mkdir_p_simple(folder) ||
+        !viewer_open_folder_native(folder)) {
+        snprintf(message, sizeof(message), "could not open %s", text_is_empty(folder) ? "output folder" : folder);
+        shared_set_error(shared, "Open folder", message);
+        return;
+    }
+    shared_clear_error(shared);
+    shared_set_stage(shared, "Output folder", folder, 1.0f, 0);
 }
 
 static void * file_picker_main(void * user_data) {
@@ -3389,7 +3558,7 @@ static void draw_left_panel(
     if (CheckCollisionPointRec(GetMousePosition(), panel)) {
         ui->panel_scroll -= GetMouseWheelMove() * 38.0f;
         if (ui->panel_scroll < 0.0f) ui->panel_scroll = 0.0f;
-        if (ui->panel_scroll > 500.0f) ui->panel_scroll = 500.0f;
+        if (ui->panel_scroll > 560.0f) ui->panel_scroll = 560.0f;
     }
 
     int worker_running = 0;
@@ -3449,6 +3618,10 @@ static void draw_left_panel(
     y += 50.0f;
     if (ui_button((Rectangle) {panel.x + 18.0f, y, bw, 42.0f}, "Postprocess Mesh", !worker_running && mesh_ready)) {
         if (start_worker(shared, options, VIEWER_JOB_POSTPROCESS, current_image, worker_thread) && thread_active != NULL) *thread_active = 1;
+    }
+    y += 50.0f;
+    if (ui_button((Rectangle) {panel.x + 18.0f, y, bw, 38.0f}, "Open Output Folder", !worker_running)) {
+        viewer_open_generated_model_folder(options, shared);
     }
     y += 58.0f;
 
@@ -3520,7 +3693,7 @@ static void draw_left_panel(
     if (ui->panel_scroll > 1.0f) {
         DrawRectangleRounded((Rectangle) {panel.x + panel.width - 8.0f, 70.0f, 4.0f, GetScreenHeight() - 110.0f}, 0.5f, 4, (Color) {42, 49, 58, 180});
         float thumb_h = fmaxf(54.0f, (GetScreenHeight() - 110.0f) * 0.62f);
-        float thumb_y = 70.0f + (GetScreenHeight() - 110.0f - thumb_h) * (ui->panel_scroll / 500.0f);
+        float thumb_y = 70.0f + (GetScreenHeight() - 110.0f - thumb_h) * (ui->panel_scroll / 560.0f);
         DrawRectangleRounded((Rectangle) {panel.x + panel.width - 8.0f, thumb_y, 4.0f, thumb_h}, 0.5f, 4, (Color) {101, 205, 196, 210});
     }
     DrawText(status, (int) panel.x + 18, GetScreenHeight() - 28, 13, (Color) {139, 149, 158, 255});
