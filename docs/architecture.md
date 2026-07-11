@@ -39,10 +39,12 @@ dtype belong to a package/component instance.  They are not process-global
 model identity.  This lets two package instances use different safe numeric
 policies in the same process.  Flash K/V dtype is part of that policy: legacy
 Flash means F16, while BF16 Flash is represented by a separate ABI-compatible
-mode. Pixal3D requests strict BF16 Flash: the CUDA Ampere+ lowering uses native
-BF16 K/V with F32 online accumulation, while Trellis2 keeps the faster F16 MMA
-lowering. Backend selection is therefore driven by the component contract and
-must never silently narrow a strict BF16 request to F16.
+mode. Pixal3D requests strict BF16 Flash for every flow. Trellis2 keeps the
+faster F16 MMA lowering for sparse and 512-resolution components, but its 1024
+shape and texture components request BF16 after long-sequence functional tests
+proved that F16 accumulation can overflow there. Backend selection is driven
+by each component contract and must never silently narrow a strict BF16 request
+to F16.
 
 ## Adding another task
 

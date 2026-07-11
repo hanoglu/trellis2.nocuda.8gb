@@ -733,9 +733,9 @@ static const legacy_component_template g_trellis2_legacy_components[] = {
     { "sparse_structure_flow", "trellis_dit_flow", "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors", TRELLIS_DTYPE_BF16, TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_F16, 0 },
     { "sparse_structure_decoder", "sparse_structure_decoder", "ckpts/ss_dec_conv3d_16l8_fp16.safetensors", TRELLIS_DTYPE_F16, TRELLIS_ATTENTION_NONE, TRELLIS_DTYPE_UNKNOWN, 0 },
     { "shape_flow_512", "trellis_dit_flow", "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors", TRELLIS_DTYPE_BF16, TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_F16, 0 },
-    { "shape_flow_1024", "trellis_dit_flow", "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors", TRELLIS_DTYPE_BF16, TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_F16, 0 },
+    { "shape_flow_1024", "trellis_dit_flow", "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors", TRELLIS_DTYPE_BF16, TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_BF16, 0 },
     { "texture_flow_512", "trellis_dit_flow", "ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors", TRELLIS_DTYPE_BF16, TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_F16, 0 },
-    { "texture_flow_1024", "trellis_dit_flow", "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors", TRELLIS_DTYPE_BF16, TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_F16, 0 },
+    { "texture_flow_1024", "trellis_dit_flow", "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors", TRELLIS_DTYPE_BF16, TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_BF16, 0 },
     { "shape_decoder", "sparse_unet_vae_decoder", "ckpts/shape_dec_next_dc_f16c32_fp16.safetensors", TRELLIS_DTYPE_F16, TRELLIS_ATTENTION_NONE, TRELLIS_DTYPE_UNKNOWN, 0 },
     { "texture_decoder", "sparse_unet_vae_decoder", "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors", TRELLIS_DTYPE_F16, TRELLIS_ATTENTION_NONE, TRELLIS_DTYPE_UNKNOWN, 0 },
 };

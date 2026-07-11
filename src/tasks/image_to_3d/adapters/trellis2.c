@@ -4,9 +4,9 @@ static const trellis_image_to_3d_component_requirement g_trellis2_components[] =
     { "sparse_structure_flow", "trellis_dit_flow", TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_F16, 0 },
     { "sparse_structure_decoder", "sparse_structure_decoder", TRELLIS_ATTENTION_NONE, TRELLIS_DTYPE_UNKNOWN, 0 },
     { "shape_flow_512", "trellis_dit_flow", TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_F16, 0 },
-    { "shape_flow_1024", "trellis_dit_flow", TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_F16, 0 },
+    { "shape_flow_1024", "trellis_dit_flow", TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_BF16, 0 },
     { "texture_flow_512", "trellis_dit_flow", TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_F16, 0 },
-    { "texture_flow_1024", "trellis_dit_flow", TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_F16, 0 },
+    { "texture_flow_1024", "trellis_dit_flow", TRELLIS_ATTENTION_FLASH, TRELLIS_DTYPE_BF16, 0 },
     { "shape_decoder", "sparse_unet_vae_decoder", TRELLIS_ATTENTION_NONE, TRELLIS_DTYPE_UNKNOWN, 0 },
     { "texture_decoder", "sparse_unet_vae_decoder", TRELLIS_ATTENTION_NONE, TRELLIS_DTYPE_UNKNOWN, 0 },
 };

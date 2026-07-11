@@ -147,9 +147,11 @@ Pixal3D defaults to BF16-style block rounding and BF16 Flash Attention.
 On NVIDIA Ampere or newer GPUs, BF16 K/V select ggml's streaming vector kernel:
 Q/K dot products, online softmax state, and V accumulation stay in F32, and KV
 tail rows are bounds checked. This avoids the BF16-to-F16 narrowing and F16
-accumulator overflow of ggml's current MMA kernel. TRELLIS.2 remains on its
-existing F16 MMA Flash path, so its numerical and performance policy is
-unchanged. `--no-ggml-flash-attn` explicitly selects SDPA; that path can require
+accumulator overflow of ggml's current MMA kernel. TRELLIS.2 keeps the faster
+F16 MMA path for its sparse and 512-resolution flows, while its 1024 shape and
+texture components use strict BF16 Flash because real long-sequence regression
+testing exposes the same F16 accumulator overflow there. `--no-ggml-flash-attn`
+explicitly selects SDPA; that path can require
 quadratic score memory for long sparse sequences. The package-level policies
 are instance scoped, so loading Trellis2 and Pixal3D in one process does not
 change either model's attention mode.

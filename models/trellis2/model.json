@@ -43,7 +43,7 @@
       "execution": {
         "compute_dtype": "bf16",
         "attention": "flash",
-        "flash_kv_dtype": "f16",
+        "flash_kv_dtype": "bf16",
         "emulate_bf16_blocks": false
       }
     },
@@ -65,7 +65,7 @@
       "execution": {
         "compute_dtype": "bf16",
         "attention": "flash",
-        "flash_kv_dtype": "f16",
+        "flash_kv_dtype": "bf16",
         "emulate_bf16_blocks": false
       }
     },

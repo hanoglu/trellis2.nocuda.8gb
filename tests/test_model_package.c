@@ -125,7 +125,7 @@ static void test_repository_templates(void) {
     const trellis_model_component_instance * flow =
         trellis_model_package_find_component(&package, "shape_flow_1024");
     CHECK_TRUE(flow != NULL && flow->execution.attention == TRELLIS_ATTENTION_FLASH);
-    CHECK_TRUE(flow->execution.flash_kv_dtype == TRELLIS_DTYPE_F16);
+    CHECK_TRUE(flow->execution.flash_kv_dtype == TRELLIS_DTYPE_BF16);
     CHECK_TRUE(flow->execution.emulate_bf16_blocks == 0);
     char resolved[PATH_MAX];
     CHECK_TRUE(trellis_model_package_resolve_component_path(
