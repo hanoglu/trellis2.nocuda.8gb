@@ -100,6 +100,8 @@ endif()
 
 set(TRELLIS2_C_SOURCES
     src/runtime/trellis_runtime.c
+    src/runtime/trellis_model_package.c
+    src/runtime/trellis_registry.c
     src/model/trellis_sparse_guides.c
     src/model/trellis_sparse_structure_decoder.c
     src/model/trellis_dino.c
@@ -391,6 +393,7 @@ target_include_directories(trellis2_c
     PUBLIC
         "${CMAKE_CURRENT_LIST_DIR}/include"
     PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/runtime"
         "${CMAKE_CURRENT_LIST_DIR}/src/model"
         "${CMAKE_CURRENT_BINARY_DIR}/generated"
         "${CMAKE_CURRENT_LIST_DIR}/3rd/cgltf"
@@ -442,6 +445,25 @@ endif()
 
 if (TRELLIS2_C_BUILD_TESTS)
     enable_testing()
+
+    add_executable(trellis2_c_model_package_tests
+        tests/test_model_package.c
+    )
+    target_compile_definitions(trellis2_c_model_package_tests PRIVATE
+        TRELLIS_TEST_SOURCE_DIR="${CMAKE_CURRENT_LIST_DIR}")
+    target_include_directories(trellis2_c_model_package_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/runtime")
+    target_link_libraries(trellis2_c_model_package_tests PRIVATE trellis2_c)
+    add_test(NAME trellis2_c_model_package_tests COMMAND trellis2_c_model_package_tests)
+
+    add_executable(trellis2_c_model_registry_tests
+        tests/test_model_registry.c
+    )
+    target_include_directories(trellis2_c_model_registry_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/runtime")
+    target_link_libraries(trellis2_c_model_registry_tests PRIVATE trellis2_c)
+    add_test(NAME trellis2_c_model_registry_tests COMMAND trellis2_c_model_registry_tests)
+
     if (TRELLIS2_C_BACKEND STREQUAL "cuda")
         add_executable(trellis2_c_tests
             tests/test_trellis.c
