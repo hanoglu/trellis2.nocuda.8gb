@@ -14,7 +14,8 @@
   <img src="img.png" alt="trellis2.c local workspace">
 </p>
 
-Native TRELLIS.2 image-to-3D inference tool with CUDA and Vulkan support. The main command is `trellis-image-to-gltf`.
+Native TRELLIS.2 and Pixal3D image-to-3D inference tool with CUDA and Vulkan
+support. The main command is `trellis-image-to-gltf`.
 
 ## Build
 
@@ -100,6 +101,53 @@ Linux:
   --image example_image/T.png \
   --gltf output.glb
 ```
+
+### Pixal3D
+
+Pixal3D uses the same executable and is detected from the checkpoint tensor
+layout. Its projected image conditioning also needs the ValeoAI NAF checkpoint,
+converted once from the release `.pth` file to safetensors (this command needs
+Python `torch` and `safetensors`):
+
+```sh
+python3 tools/convert_naf_weights.py \
+  https://github.com/valeoai/NAF/releases/download/model/naf_release.pth \
+  ../Pixal3D/Pixal3D/ckpts/naf_release.safetensors
+```
+
+Run the 1024 cascade on CUDA or Vulkan with:
+
+```sh
+./build/trellis-image-to-gltf \
+  --model ../Pixal3D/Pixal3D \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --naf ../Pixal3D/Pixal3D/ckpts/naf_release.safetensors \
+  --image example_image/T.png \
+  --gltf pixal3d.glb \
+  --pipeline 1024_cascade
+```
+
+`1536_cascade` is also supported. `--naf` may be omitted when
+`ckpts/naf_release.safetensors` exists below the model directory, or when
+`TRELLIS_NAF_PATH` is set. If GPU memory is constrained, use
+`--no-model-cache` or a finite `--model-cache-budget-mib` value. Pixal3D camera
+projection defaults to the reference horizontal FOV `0.857556`, distance `2`,
+and mesh scale `1`; override them with `--fov`, `--camera-distance`, and
+`--mesh-scale`. These are explicit projection parameters, not automatic camera
+estimation. The input must already contain a transparent foreground mask, or
+`--birefnet FILE` must be supplied so Pixal3D can apply its subject crop.
+TRELLIS.2 checkpoints ignore the NAF and camera options.
+
+C callers that need explicit Pixal3D overrides can initialize
+`trellis_pixal3d_options` with `TRELLIS_PIXAL3D_OPTIONS_INIT` and call
+`trellis_pipeline_image_to_gltf_ex()`; the legacy entry point keeps the default
+camera and automatic NAF lookup.
+
+Pixal3D automatically uses BF16-style block rounding and the explicit SDPA
+path. This avoids FP16 overflow in the current ggml flash-attention K/V path on
+long 1024-resolution sparse sequences; TRELLIS.2 keeps its existing flash
+attention default. `--use-ggml-flash-attn` is retained as an explicit debug
+override.
 
 Windows:
 

@@ -228,6 +228,200 @@ static int test_pixel_shuffle_3d(trellis_backend_context * backend) {
     return 1;
 }
 
+static int test_project_attention(trellis_backend_context * backend) {
+    enum {
+        CHANNELS = 4,
+        PROJ_IN = 3,
+        GLOBAL_CHANNELS = 3,
+        TOKENS = 3,
+        GLOBAL_TOKENS = 2,
+        HEADS = 2,
+        HEAD_DIM = CHANNELS / HEADS,
+        BATCHES = 2,
+    };
+
+    float x_data[CHANNELS * TOKENS * BATCHES];
+    float global_data[GLOBAL_CHANNELS * GLOBAL_TOKENS * BATCHES];
+    float projected_data[PROJ_IN * TOKENS * BATCHES];
+    float q_w_data[CHANNELS * CHANNELS];
+    float q_b_data[CHANNELS];
+    float kv_w_data[2 * CHANNELS * GLOBAL_CHANNELS];
+    float kv_b_data[2 * CHANNELS];
+    float out_w_data[CHANNELS * CHANNELS];
+    float out_b_data[CHANNELS];
+    float proj_w_data[CHANNELS * PROJ_IN];
+    float proj_b_data[CHANNELS];
+    float got[CHANNELS * TOKENS * BATCHES];
+    float exp[CHANNELS * TOKENS * BATCHES];
+
+    for (int b = 0; b < BATCHES; ++b) {
+        for (int t = 0; t < TOKENS; ++t) {
+            for (int c = 0; c < CHANNELS; ++c) {
+                x_data[(b * TOKENS + t) * CHANNELS + c] =
+                    0.09f * (float) (b + 1) + 0.04f * (float) t - 0.025f * (float) c;
+            }
+            for (int c = 0; c < PROJ_IN; ++c) {
+                projected_data[(b * TOKENS + t) * PROJ_IN + c] =
+                    -0.08f + 0.06f * (float) b + 0.035f * (float) t + 0.02f * (float) c;
+            }
+        }
+        for (int t = 0; t < GLOBAL_TOKENS; ++t) {
+            for (int c = 0; c < GLOBAL_CHANNELS; ++c) {
+                global_data[(b * GLOBAL_TOKENS + t) * GLOBAL_CHANNELS + c] =
+                    0.11f * (float) (t + 1) - 0.045f * (float) b + 0.03f * (float) c;
+            }
+        }
+    }
+    for (int o = 0; o < CHANNELS; ++o) {
+        q_b_data[o] = 0.012f * (float) (o - 1);
+        out_b_data[o] = -0.017f + 0.009f * (float) o;
+        proj_b_data[o] = 0.021f - 0.008f * (float) o;
+        for (int i = 0; i < CHANNELS; ++i) {
+            q_w_data[o * CHANNELS + i] = 0.035f * (float) (o + 1) - 0.012f * (float) i;
+            out_w_data[o * CHANNELS + i] = 0.028f * (float) (i + 1) - 0.01f * (float) o;
+        }
+        for (int i = 0; i < PROJ_IN; ++i) {
+            proj_w_data[o * PROJ_IN + i] = -0.03f + 0.014f * (float) (2 * o + i);
+        }
+    }
+    for (int o = 0; o < 2 * CHANNELS; ++o) {
+        kv_b_data[o] = -0.015f + 0.006f * (float) o;
+        for (int i = 0; i < GLOBAL_CHANNELS; ++i) {
+            kv_w_data[o * GLOBAL_CHANNELS + i] =
+                0.018f * (float) (o + 1) - 0.011f * (float) i;
+        }
+    }
+
+    for (int b = 0; b < BATCHES; ++b) {
+        for (int t = 0; t < TOKENS; ++t) {
+            float q[CHANNELS];
+            float attended[CHANNELS];
+            for (int o = 0; o < CHANNELS; ++o) {
+                q[o] = q_b_data[o];
+                attended[o] = 0.0f;
+                for (int i = 0; i < CHANNELS; ++i) {
+                    q[o] += q_w_data[o * CHANNELS + i] *
+                        x_data[(b * TOKENS + t) * CHANNELS + i];
+                }
+            }
+            for (int h = 0; h < HEADS; ++h) {
+                float logits[GLOBAL_TOKENS];
+                float values[GLOBAL_TOKENS][HEAD_DIM];
+                float max_logit = -1e30f;
+                for (int kt = 0; kt < GLOBAL_TOKENS; ++kt) {
+                    float dot = 0.0f;
+                    for (int d = 0; d < HEAD_DIM; ++d) {
+                        const int channel = h * HEAD_DIM + d;
+                        float key = kv_b_data[channel];
+                        float value = kv_b_data[CHANNELS + channel];
+                        for (int i = 0; i < GLOBAL_CHANNELS; ++i) {
+                            const float input = global_data[
+                                (b * GLOBAL_TOKENS + kt) * GLOBAL_CHANNELS + i];
+                            key += kv_w_data[channel * GLOBAL_CHANNELS + i] * input;
+                            value += kv_w_data[(CHANNELS + channel) * GLOBAL_CHANNELS + i] * input;
+                        }
+                        dot += q[channel] * key;
+                        values[kt][d] = value;
+                    }
+                    logits[kt] = dot / sqrtf((float) HEAD_DIM);
+                    if (logits[kt] > max_logit) max_logit = logits[kt];
+                }
+                float denom = 0.0f;
+                for (int kt = 0; kt < GLOBAL_TOKENS; ++kt) {
+                    logits[kt] = expf(logits[kt] - max_logit);
+                    denom += logits[kt];
+                }
+                for (int d = 0; d < HEAD_DIM; ++d) {
+                    for (int kt = 0; kt < GLOBAL_TOKENS; ++kt) {
+                        attended[h * HEAD_DIM + d] += logits[kt] / denom * values[kt][d];
+                    }
+                }
+            }
+
+            for (int o = 0; o < CHANNELS; ++o) {
+                float value = out_b_data[o] + proj_b_data[o];
+                for (int i = 0; i < CHANNELS; ++i) {
+                    value += out_w_data[o * CHANNELS + i] * attended[i];
+                }
+                for (int i = 0; i < PROJ_IN; ++i) {
+                    value += proj_w_data[o * PROJ_IN + i] *
+                        projected_data[(b * TOKENS + t) * PROJ_IN + i];
+                }
+                exp[(b * TOKENS + t) * CHANNELS + o] = value;
+            }
+        }
+    }
+
+    struct ggml_context * ctx = make_graph_ctx();
+    CHECK_TRUE(ctx != NULL);
+    struct ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, CHANNELS, TOKENS, BATCHES);
+    struct ggml_tensor * global = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, GLOBAL_CHANNELS, GLOBAL_TOKENS, BATCHES);
+    struct ggml_tensor * projected = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, PROJ_IN, TOKENS, BATCHES);
+    struct ggml_tensor * q_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, CHANNELS, CHANNELS);
+    struct ggml_tensor * q_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, CHANNELS);
+    struct ggml_tensor * kv_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, GLOBAL_CHANNELS, 2 * CHANNELS);
+    struct ggml_tensor * kv_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 2 * CHANNELS);
+    struct ggml_tensor * out_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, CHANNELS, CHANNELS);
+    struct ggml_tensor * out_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, CHANNELS);
+    struct ggml_tensor * proj_w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, PROJ_IN, CHANNELS);
+    struct ggml_tensor * proj_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, CHANNELS);
+    CHECK_TRUE(x != NULL && global != NULL && projected != NULL && q_w != NULL && q_b != NULL &&
+        kv_w != NULL && kv_b != NULL && out_w != NULL && out_b != NULL && proj_w != NULL && proj_b != NULL);
+
+    struct ggml_tensor * y = trellis_ggml_project_attention(
+        ctx, x, global, projected, HEADS,
+        q_w, q_b, kv_w, kv_b, NULL, NULL, out_w, out_b, proj_w, proj_b);
+    CHECK_TRUE(y != NULL);
+    CHECK_TRUE(y->ne[0] == CHANNELS && y->ne[1] == TOKENS && y->ne[2] == BATCHES);
+
+    struct ggml_tensor * bad_tokens = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, PROJ_IN, TOKENS + 1, BATCHES);
+    struct ggml_tensor * bad_batches = ggml_new_tensor_3d(
+        ctx, GGML_TYPE_F32, PROJ_IN, TOKENS, BATCHES + 1);
+    struct ggml_tensor * bad_proj_w = ggml_new_tensor_2d(
+        ctx, GGML_TYPE_F32, PROJ_IN + 1, CHANNELS);
+    CHECK_TRUE(trellis_ggml_project_attention(
+        ctx, x, global, bad_tokens, HEADS,
+        q_w, q_b, kv_w, kv_b, NULL, NULL, out_w, out_b, proj_w, proj_b) == NULL);
+    CHECK_TRUE(trellis_ggml_project_attention(
+        ctx, x, global, bad_batches, HEADS,
+        q_w, q_b, kv_w, kv_b, NULL, NULL, out_w, out_b, proj_w, proj_b) == NULL);
+    CHECK_TRUE(trellis_ggml_project_attention(
+        ctx, x, global, projected, HEADS,
+        q_w, q_b, kv_w, kv_b, NULL, NULL, out_w, out_b, bad_proj_w, proj_b) == NULL);
+
+    struct ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, y);
+    ggml_gallocr_t alloc = trellis_backend_new_graph_allocator(backend);
+    CHECK_TRUE(alloc != NULL);
+    CHECK_TRUE(ggml_gallocr_alloc_graph(alloc, graph));
+    ggml_backend_tensor_set(x, x_data, 0, ggml_nbytes(x));
+    ggml_backend_tensor_set(global, global_data, 0, ggml_nbytes(global));
+    ggml_backend_tensor_set(projected, projected_data, 0, ggml_nbytes(projected));
+    ggml_backend_tensor_set(q_w, q_w_data, 0, ggml_nbytes(q_w));
+    ggml_backend_tensor_set(q_b, q_b_data, 0, ggml_nbytes(q_b));
+    ggml_backend_tensor_set(kv_w, kv_w_data, 0, ggml_nbytes(kv_w));
+    ggml_backend_tensor_set(kv_b, kv_b_data, 0, ggml_nbytes(kv_b));
+    ggml_backend_tensor_set(out_w, out_w_data, 0, ggml_nbytes(out_w));
+    ggml_backend_tensor_set(out_b, out_b_data, 0, ggml_nbytes(out_b));
+    ggml_backend_tensor_set(proj_w, proj_w_data, 0, ggml_nbytes(proj_w));
+    ggml_backend_tensor_set(proj_b, proj_b_data, 0, ggml_nbytes(proj_b));
+    CHECK_TRUE(trellis_backend_compute_graph(backend, graph) == TRELLIS_STATUS_OK);
+    ggml_backend_tensor_get(y, got, 0, ggml_nbytes(y));
+
+    int ok = 1;
+    for (int i = 0; i < CHANNELS * TOKENS * BATCHES; ++i) {
+        if (!check_close(got[i], exp[i], 2e-3f, "project_attention", i)) {
+            ok = 0;
+            break;
+        }
+    }
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    return ok;
+}
+
 static float attention_input_value(int index, float phase, float scale) {
     return scale * (sinf((float) index * phase) + 0.5f * cosf((float) (index + 17) * (phase * 0.37f)));
 }
@@ -366,6 +560,7 @@ int main(int argc, char ** argv) {
 
     int ok = test_conv3d(&backend);
     ok = ok && test_pixel_shuffle_3d(&backend);
+    ok = ok && test_project_attention(&backend);
     ok = ok && test_sdpa_flash_attention(&backend, 512, 1);
     ok = ok && test_sdpa_flash_attention(&backend, 1024, 1);
     ok = ok && test_sdpa_flash_attention(&backend, 512, 2);

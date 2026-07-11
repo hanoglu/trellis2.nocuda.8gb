@@ -2,6 +2,10 @@
 #include "trellis_dit_flow_executor.h"
 #include "trellis_ggml_layers.h"
 #include "trellis_pipeline_internal.h"
+#include "trellis_pixal_condition.h"
+#include "trellis_pixal_naf.h"
+#include "trellis_pixal_naf_attention.h"
+#include "sparse/trellis_sparse_backend.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -132,6 +136,7 @@ void trellis_image_condition_result_free(trellis_image_condition_result * result
         return;
     }
     free(result->cond);
+    free(result->projected);
     memset(result, 0, sizeof(*result));
 }
 
@@ -207,7 +212,7 @@ static int load_sparse_structure_flow(
     const trellis_backend_context * backend,
     const char * model_dir,
     trellis_tensor_store * store,
-    trellis_dit_flow_weights * weights) {
+    trellis_dit_flow_model * model) {
     char path[4096];
     if (!choose_path(model_dir, "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors", path, sizeof(path))) {
         return 0;
@@ -223,7 +228,7 @@ static int load_sparse_structure_flow(
         return 0;
     }
     char issue[256];
-    trellis_status status = trellis_ss_flow_bind_weights(store, weights, issue, sizeof(issue));
+    trellis_status status = trellis_ss_flow_model_bind_weights(store, model, issue, sizeof(issue));
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_ERROR("sparse-structure flow: bind failed: %s%s%s",
             trellis_status_string(status), issue[0] == '\0' ? "" : " ", issue);
@@ -231,7 +236,12 @@ static int load_sparse_structure_flow(
         return 0;
     }
     TRELLIS_INFO("sparse-structure flow: ready blocks=%d channels=%d",
-        weights->n_blocks, weights->in_channels);
+        model->base.n_blocks, model->base.in_channels);
+    if (model->projection.enabled) {
+        TRELLIS_INFO(
+            "sparse-structure flow: Pixal3D projection channels=%d",
+            model->projection.proj_channels);
+    }
     return 1;
 }
 
@@ -354,13 +364,16 @@ static float lanczos3_f32(float x) {
 static int preprocess_image_for_dino(
     const char * image_path,
     int edge,
+    float foreground_crop_scale,
     float ** image_out,
+    float ** guide_out,
     int * src_w_out,
     int * src_h_out) {
     if (image_path == NULL || edge <= 0 || image_out == NULL) {
         return 0;
     }
     *image_out = NULL;
+    if (guide_out != NULL) *guide_out = NULL;
     if (src_w_out != NULL) *src_w_out = 0;
     if (src_h_out != NULL) *src_h_out = 0;
 
@@ -375,16 +388,22 @@ static int preprocess_image_for_dino(
     }
 
     float * image = (float *) malloc(3u * (size_t) edge * (size_t) edge * sizeof(float));
-    if (image == NULL) {
+    float * guide = guide_out != NULL ?
+        (float *) malloc(3u * (size_t) edge * (size_t) edge * sizeof(float)) : NULL;
+    if (image == NULL || (guide_out != NULL && guide == NULL)) {
+        free(image);
+        free(guide);
         stbi_image_free(rgba);
         return 0;
     }
 
     const float mean[3] = {0.485f, 0.456f, 0.406f};
     const float std[3] = {0.229f, 0.224f, 0.225f};
+    const int pixal_preprocess = foreground_crop_scale > 0.0f && foreground_crop_scale < 1.13f;
     int crop_left = 0;
     int crop_top = 0;
-    int crop_size = src_w > src_h ? src_w : src_h;
+    int crop_w = src_w > src_h ? src_w : src_h;
+    int crop_h = crop_w;
     int use_alpha_composite = 0;
     int min_x = src_w, min_y = src_h, max_x = -1, max_y = -1;
     for (int yy = 0; yy < src_h; ++yy) {
@@ -393,7 +412,7 @@ static int preprocess_image_for_dino(
             if (p[3] != 255) {
                 use_alpha_composite = 1;
             }
-            if (p[3] > 8) {
+            if (p[3] > (pixal_preprocess ? 204 : 8)) {
                 if (xx < min_x) min_x = xx;
                 if (yy < min_y) min_y = yy;
                 if (xx + 1 > max_x) max_x = xx + 1;
@@ -405,23 +424,30 @@ static int preprocess_image_for_dino(
         const float center_x = 0.5f * (float) (min_x + max_x);
         const float center_y = 0.5f * (float) (min_y + max_y);
         int side = max_x - min_x > max_y - min_y ? max_x - min_x : max_y - min_y;
-        side = (int) floorf((float) side * 1.16f + 0.5f);
+        const float crop_scale = foreground_crop_scale > 0.0f ? foreground_crop_scale : 1.16f;
+        side = (int) floorf((float) side * crop_scale + 0.5f);
         if (side < 1) side = 1;
         const int max_side = 2 * (src_w > src_h ? src_w : src_h);
         if (side > max_side) side = max_side;
         crop_left = (int) floorf(center_x - 0.5f * (float) side + 0.5f);
         crop_top = (int) floorf(center_y - 0.5f * (float) side + 0.5f);
-        crop_size = side;
+        crop_w = side;
+        crop_h = side;
     } else {
         crop_left = 0;
         crop_top = 0;
-        crop_size = src_w;
-        if (src_h > crop_size) crop_size = src_h;
+        if (pixal_preprocess) {
+            crop_w = src_w;
+            crop_h = src_h;
+        } else {
+            crop_w = src_w > src_h ? src_w : src_h;
+            crop_h = crop_w;
+        }
     }
     for (int y = 0; y < edge; ++y) {
         for (int x = 0; x < edge; ++x) {
-            const float sx = ((float) x + 0.5f) * (float) crop_size / (float) edge - 0.5f;
-            const float sy = ((float) y + 0.5f) * (float) crop_size / (float) edge - 0.5f;
+            const float sx = ((float) x + 0.5f) * (float) crop_w / (float) edge - 0.5f;
+            const float sy = ((float) y + 0.5f) * (float) crop_h / (float) edge - 0.5f;
             const int x_begin = (int) floorf(sx - 3.0f + 1.0f);
             const int x_end = (int) floorf(sx + 3.0f);
             const int y_begin = (int) floorf(sy - 3.0f + 1.0f);
@@ -429,7 +455,7 @@ static int preprocess_image_for_dino(
             float acc[3] = {0.0f, 0.0f, 0.0f};
             float wsum = 0.0f;
             for (int yy = y_begin; yy <= y_end; ++yy) {
-                if (yy < 0 || yy >= crop_size) {
+                if (yy < 0 || yy >= crop_h) {
                     continue;
                 }
                 const float wy = lanczos3_f32(sy - (float) yy);
@@ -437,7 +463,7 @@ static int preprocess_image_for_dino(
                     continue;
                 }
                 for (int xx = x_begin; xx <= x_end; ++xx) {
-                    if (xx < 0 || xx >= crop_size) {
+                    if (xx < 0 || xx >= crop_w) {
                         continue;
                     }
                     const float wx = lanczos3_f32(sx - (float) xx);
@@ -461,6 +487,9 @@ static int preprocess_image_for_dino(
                 float v = wsum == 0.0f ? 0.0f : acc[c] / wsum;
                 v = clampf_local(v, 0.0f, 255.0f);
                 const float rgb = v / 255.0f;
+                if (guide != NULL) {
+                    guide[((size_t) c * (size_t) edge + (size_t) y) * (size_t) edge + (size_t) x] = rgb;
+                }
                 image[((size_t) c * (size_t) edge + (size_t) y) * (size_t) edge + (size_t) x] =
                     (rgb - mean[c]) / std[c];
             }
@@ -471,6 +500,7 @@ static int preprocess_image_for_dino(
     if (src_w_out != NULL) *src_w_out = src_w;
     if (src_h_out != NULL) *src_h_out = src_h;
     *image_out = image;
+    if (guide_out != NULL) *guide_out = guide;
     return 1;
 }
 
@@ -480,6 +510,8 @@ static int run_dino_condition(
     const char * dino_dir,
     const char * image_path,
     int cond_resolution,
+    int pixal_preprocess,
+    float ** guide_out,
     const trellis_dino_vit_weights * preloaded_dino,
     float ** context_out,
     int * cond_tokens_out) {
@@ -489,6 +521,7 @@ static int run_dino_condition(
     }
     *context_out = NULL;
     *cond_tokens_out = 0;
+    if (guide_out != NULL) *guide_out = NULL;
 
     trellis_tensor_store dino_store;
     memset(&dino_store, 0, sizeof(dino_store));
@@ -523,7 +556,15 @@ static int run_dino_condition(
 
     int src_w = 0;
     int src_h = 0;
-    if (!preprocess_image_for_dino(image_path, cond_resolution, &image, &src_w, &src_h)) {
+    float * guide = NULL;
+    if (!preprocess_image_for_dino(
+            image_path,
+            cond_resolution,
+            pixal_preprocess ? 1.1f : 1.16f,
+            &image,
+            guide_out != NULL ? &guide : NULL,
+            &src_w,
+            &src_h)) {
         goto cleanup;
     }
     TRELLIS_INFO("sparse structure: preprocessed %s from %dx%d to %dx%d",
@@ -547,16 +588,43 @@ static int run_dino_condition(
         image_path, src_w, src_h, cond_resolution, cond_resolution, n_patches, total_tokens, dino->hidden_size);
     *context_out = output_tokens;
     *cond_tokens_out = total_tokens;
+    if (guide_out != NULL) {
+        *guide_out = guide;
+        guide = NULL;
+    }
     output_tokens = NULL;
     rc = 1;
 
 cleanup:
     free(image);
+    free(guide);
     free(output_tokens);
     if (owns_dino_store) {
         trellis_tensor_store_free(&dino_store);
     }
     return rc;
+}
+
+int trellis_pipeline_sparse_structure_checkpoint_uses_pixal_projection(
+    const char * model_dir) {
+    char path[4096];
+    if (!choose_path(
+            model_dir,
+            "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
+            path,
+            sizeof(path))) {
+        return 0;
+    }
+    trellis_safetensors st;
+    memset(&st, 0, sizeof(st));
+    if (trellis_safetensors_open(path, &st) != TRELLIS_STATUS_OK) {
+        return 0;
+    }
+    const int projected = trellis_safetensors_find(
+        &st,
+        "blocks.0.cross_attn.proj_linear.weight") != NULL;
+    trellis_safetensors_close(&st);
+    return projected;
 }
 
 static int run_sparse_structure_image(
@@ -574,6 +642,9 @@ static int run_sparse_structure_image(
     int flow_no_rope,
     int use_ggml_flash_attn,
     float threshold,
+    float camera_angle_x,
+    float camera_distance,
+    float mesh_scale,
     trellis_pipeline_model_cache * cache,
     trellis_sparse_structure_result * result) {
     if (result != NULL) {
@@ -594,9 +665,22 @@ static int run_sparse_structure_image(
         (unsigned) seed);
 
     float * context = NULL;
+    float * projected_context = NULL;
     int cond_tokens = 0;
     const int64_t dino_start_us = ggml_time_us();
-    if (!run_dino_condition(backend, cache, dino_dir, image_path, cond_resolution, NULL, &context, &cond_tokens)) {
+    const int pixal_checkpoint =
+        trellis_pipeline_sparse_structure_checkpoint_uses_pixal_projection(model_dir);
+    if (!run_dino_condition(
+            backend,
+            cache,
+            dino_dir,
+            image_path,
+            cond_resolution,
+            pixal_checkpoint,
+            NULL,
+            NULL,
+            &context,
+            &cond_tokens)) {
         free(context);
         return 1;
     }
@@ -609,8 +693,10 @@ static int run_sparse_structure_image(
     memset(&flow_store, 0, sizeof(flow_store));
     memset(&decoder_store, 0, sizeof(decoder_store));
     trellis_dit_flow_weights flow;
+    trellis_dit_flow_model flow_model;
     trellis_ss_decoder_weights decoder;
     memset(&flow, 0, sizeof(flow));
+    memset(&flow_model, 0, sizeof(flow_model));
     memset(&decoder, 0, sizeof(decoder));
     int owns_flow_store = 0;
     int owns_decoder_store = 0;
@@ -624,6 +710,7 @@ static int run_sparse_structure_image(
     int rc = 1;
 
     float * neg_context = NULL;
+    float * neg_projected_context = NULL;
     float * latent = NULL;
     float * pred_pos = NULL;
     float * pred_neg = NULL;
@@ -639,9 +726,9 @@ static int run_sparse_structure_image(
     trellis_status status = TRELLIS_STATUS_OK;
 
     if (cache != NULL) {
-        const trellis_dit_flow_weights * cached_flow = NULL;
+        const trellis_dit_flow_model * cached_flow = NULL;
         const trellis_ss_decoder_weights * cached_decoder = NULL;
-        status = trellis_pipeline_model_cache_get_sparse_structure_flow(cache, model_dir, &cached_flow);
+        status = trellis_pipeline_model_cache_get_sparse_structure_flow_model(cache, model_dir, &cached_flow);
         if (status != TRELLIS_STATUS_OK) {
             TRELLIS_ERROR("sparse-structure flow: cache load failed: %s", trellis_status_string(status));
             goto cleanup;
@@ -651,12 +738,14 @@ static int run_sparse_structure_image(
             TRELLIS_ERROR("sparse-structure decoder: cache load failed: %s", trellis_status_string(status));
             goto cleanup;
         }
-        flow = *cached_flow;
+        flow_model = *cached_flow;
+        flow = flow_model.base;
         decoder = *cached_decoder;
     } else {
-        if (!load_sparse_structure_flow(backend, model_dir, &flow_store, &flow)) {
+        if (!load_sparse_structure_flow(backend, model_dir, &flow_store, &flow_model)) {
             goto cleanup;
         }
+        flow = flow_model.base;
         owns_flow_store = 1;
         if (!load_sparse_structure_decoder(backend, model_dir, &decoder_store, &decoder)) {
             goto cleanup;
@@ -689,13 +778,79 @@ static int run_sparse_structure_image(
         fprintf(stderr, "sparse structure: unexpected flow cond channels %d\n", flow.cond_channels);
         goto cleanup;
     }
+    const int tokens = latent_size * latent_size * latent_size;
+    if (flow_model.projection.enabled) {
+        const int special_tokens = 5;
+        const int patch_side = cond_resolution / 16;
+        const int patch_tokens = patch_side * patch_side;
+        if (latent_size != 16 || cond_resolution != 512 || sparse_resolution != 32 ||
+            flow_model.projection.proj_channels != 1024 ||
+            cond_resolution % 16 != 0 || cond_tokens != special_tokens + patch_tokens) {
+            TRELLIS_ERROR(
+                "sparse structure: Pixal3D stage mismatch latent=%d cond_resolution=%d sparse_resolution=%d global=%d total=%d patches=%d proj_channels=%d",
+                latent_size,
+                cond_resolution,
+                sparse_resolution,
+                special_tokens,
+                cond_tokens,
+                patch_tokens,
+                flow_model.projection.proj_channels);
+            goto cleanup;
+        }
+        const size_t global_count = (size_t) special_tokens * (size_t) flow.cond_channels;
+        const size_t projected_count =
+            (size_t) tokens * (size_t) flow_model.projection.proj_channels;
+        float * global_context = (float *) malloc(global_count * sizeof(float));
+        projected_context = (float *) malloc(projected_count * sizeof(float));
+        if (global_context == NULL || projected_context == NULL) {
+            free(global_context);
+            TRELLIS_ERROR("sparse structure: Pixal3D condition allocation failed");
+            goto cleanup;
+        }
+        memcpy(global_context, context, global_count * sizeof(float));
+        trellis_pixal_camera camera = {
+            .camera_angle_x = camera_angle_x > 0.0f ? camera_angle_x : 0.8575560450553894f,
+            .distance = camera_distance > 0.0f ? camera_distance : 2.0f,
+            .mesh_scale = mesh_scale != 0.0f ? mesh_scale : 1.0f,
+        };
+        status = trellis_pixal_project_patch_features_dense_f32(
+            context + global_count,
+            patch_side,
+            patch_side,
+            flow_model.projection.proj_channels,
+            cond_resolution,
+            latent_size,
+            &camera,
+            projected_context,
+            projected_count);
+        if (status != TRELLIS_STATUS_OK) {
+            free(global_context);
+            TRELLIS_ERROR(
+                "sparse structure: Pixal3D projection failed: %s",
+                trellis_status_string(status));
+            goto cleanup;
+        }
+        free(context);
+        context = global_context;
+        cond_tokens = special_tokens;
+        TRELLIS_INFO(
+            "sparse structure: Pixal3D condition global_tokens=%d projected=%d^3x%d",
+            cond_tokens,
+            latent_size,
+            flow_model.projection.proj_channels);
+    }
+    flow_model.base = flow;
     trellis_ggml_set_flash_attn_enabled(use_ggml_flash_attn);
 
-    const int tokens = latent_size * latent_size * latent_size;
     const size_t latent_count = (size_t) flow.in_channels * (size_t) tokens;
     const size_t context_count = (size_t) flow.cond_channels * (size_t) cond_tokens;
+    const size_t projected_count = flow_model.projection.enabled ?
+        (size_t) tokens * (size_t) flow_model.projection.proj_channels : 0u;
     const size_t phase_count = (size_t) (flow.head_dim / 2) * (size_t) tokens;
     neg_context = (float *) calloc(context_count, sizeof(float));
+    if (projected_count > 0) {
+        neg_projected_context = (float *) calloc(projected_count, sizeof(float));
+    }
     latent = (float *) malloc(latent_count * sizeof(float));
     pred_pos = (float *) malloc(latent_count * sizeof(float));
     pred_neg = (float *) malloc(latent_count * sizeof(float));
@@ -706,7 +861,8 @@ static int run_sparse_structure_image(
     pairs = (float *) malloc((size_t) steps * 2u * sizeof(float));
     cos_phase = (float *) malloc(phase_count * sizeof(float));
     sin_phase = (float *) malloc(phase_count * sizeof(float));
-    if (neg_context == NULL || latent == NULL || pred_pos == NULL || pred_neg == NULL || pred == NULL ||
+    if (neg_context == NULL || (projected_count > 0 && neg_projected_context == NULL) ||
+        latent == NULL || pred_pos == NULL || pred_neg == NULL || pred == NULL ||
         next == NULL || x0 == NULL || latent_ncdhw == NULL || pairs == NULL ||
         cos_phase == NULL || sin_phase == NULL) {
         fprintf(stderr, "sparse structure: host allocation failed\n");
@@ -722,40 +878,81 @@ static int run_sparse_structure_image(
         fprintf(stderr, "sparse structure: schedule/rope failed: %s\n", trellis_status_string(status));
         goto cleanup;
     }
-    status = trellis_dit_flow_executor_init_cfg_batch(
-        &flow_executor_cfg,
-        backend,
-        &flow,
-        tokens,
-        cond_tokens,
-        context,
-        neg_context,
-        cos_phase,
-        sin_phase);
-    if (status != TRELLIS_STATUS_OK) {
-        TRELLIS_WARN(
-            "sparse structure: fused CFG executor init failed (%s); falling back to separate cond/uncond graphs",
-            trellis_status_string(status));
-        trellis_dit_flow_executor_free(&flow_executor_cfg);
-        status = trellis_dit_flow_executor_init_single(
-            &flow_executor_cond,
+    if (flow_model.projection.enabled) {
+        status = trellis_dit_flow_executor_init_cfg_batch_projected(
+            &flow_executor_cfg,
+            backend,
+            &flow_model,
+            tokens,
+            cond_tokens,
+            context,
+            neg_context,
+            projected_context,
+            neg_projected_context,
+            cos_phase,
+            sin_phase);
+    } else {
+        status = trellis_dit_flow_executor_init_cfg_batch(
+            &flow_executor_cfg,
             backend,
             &flow,
             tokens,
             cond_tokens,
             context,
+            neg_context,
             cos_phase,
             sin_phase);
-        if (status == TRELLIS_STATUS_OK) {
+    }
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_WARN(
+            "sparse structure: fused CFG executor init failed (%s); falling back to separate cond/uncond graphs",
+            trellis_status_string(status));
+        trellis_dit_flow_executor_free(&flow_executor_cfg);
+        if (flow_model.projection.enabled) {
+            status = trellis_dit_flow_executor_init_single_projected(
+                &flow_executor_cond,
+                backend,
+                &flow_model,
+                tokens,
+                cond_tokens,
+                context,
+                projected_context,
+                cos_phase,
+                sin_phase);
+        } else {
             status = trellis_dit_flow_executor_init_single(
-                &flow_executor_uncond,
+                &flow_executor_cond,
                 backend,
                 &flow,
                 tokens,
                 cond_tokens,
-                neg_context,
+                context,
                 cos_phase,
                 sin_phase);
+        }
+        if (status == TRELLIS_STATUS_OK) {
+            if (flow_model.projection.enabled) {
+                status = trellis_dit_flow_executor_init_single_projected(
+                    &flow_executor_uncond,
+                    backend,
+                    &flow_model,
+                    tokens,
+                    cond_tokens,
+                    neg_context,
+                    neg_projected_context,
+                    cos_phase,
+                    sin_phase);
+            } else {
+                status = trellis_dit_flow_executor_init_single(
+                    &flow_executor_uncond,
+                    backend,
+                    &flow,
+                    tokens,
+                    cond_tokens,
+                    neg_context,
+                    cos_phase,
+                    sin_phase);
+            }
         }
         if (status != TRELLIS_STATUS_OK) {
             fprintf(stderr, "sparse structure: flow executor init failed: %s\n", trellis_status_string(status));
@@ -873,6 +1070,9 @@ static int run_sparse_structure_image(
             free(logits);
             goto cleanup;
         }
+        if (step + 1 == steps && result != NULL) {
+            result->projected_conditioning = flow_model.projection.enabled;
+        }
         float logit_min = logits_count == 0 ? 0.0f : logits[0];
         float logit_max = logits_count == 0 ? 0.0f : logits[0];
         double logit_sum = 0.0;
@@ -917,7 +1117,9 @@ cleanup:
         trellis_sparse_structure_result_free(result);
     }
     free(context);
+    free(projected_context);
     free(neg_context);
+    free(neg_projected_context);
     free(latent);
     free(pred_pos);
     free(pred_neg);
@@ -965,9 +1167,226 @@ trellis_status trellis_pipeline_run_sparse_structure(
         options->flow_no_rope,
         options->use_ggml_flash_attn,
         options->voxel_threshold,
+        options->camera_angle_x,
+        options->camera_distance,
+        options->mesh_scale,
         options->cache,
         result);
     return rc == 0 ? TRELLIS_STATUS_OK : TRELLIS_STATUS_ERROR;
+}
+
+static int readable_file(const char * path) {
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+    FILE * file = fopen(path, "rb");
+    if (file == NULL) {
+        return 0;
+    }
+    fclose(file);
+    return 1;
+}
+
+static int resolve_pixal_naf_path(
+    const trellis_image_condition_options * options,
+    char * path,
+    size_t path_size) {
+    if (options == NULL || path == NULL || path_size == 0) {
+        return 0;
+    }
+    const char * explicit_path = options->naf_path;
+    if (explicit_path == NULL || explicit_path[0] == '\0') {
+        explicit_path = getenv("TRELLIS_NAF_PATH");
+    }
+    if (explicit_path != NULL && explicit_path[0] != '\0') {
+        const int n = snprintf(path, path_size, "%s", explicit_path);
+        return n >= 0 && (size_t) n < path_size && readable_file(path);
+    }
+    if (options->model_dir == NULL || options->model_dir[0] == '\0') {
+        return 0;
+    }
+    const char * candidates[] = {
+        "ckpts/naf_release.safetensors",
+        "naf_release.safetensors",
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+        if (trellis_make_model_path(
+                options->model_dir,
+                candidates[i],
+                path,
+                path_size) == TRELLIS_STATUS_OK && readable_file(path)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int checked_mul_size_local(size_t a, size_t b, size_t * out) {
+    if (out == NULL || (a != 0 && b > SIZE_MAX / a)) {
+        return 0;
+    }
+    *out = a * b;
+    return 1;
+}
+
+static trellis_status run_pixal_naf_high_projection(
+    const trellis_image_condition_options * options,
+    const trellis_backend_context * backend,
+    const char * naf_path,
+    const float * guide_nchw,
+    const float * dino_patch_values,
+    int patch_side,
+    const trellis_pixal_camera * camera,
+    float ** projected_out) {
+    if (projected_out != NULL) {
+        *projected_out = NULL;
+    }
+    if (options == NULL || backend == NULL || naf_path == NULL || guide_nchw == NULL ||
+        dino_patch_values == NULL || patch_side < TRELLIS_PIXAL_NAF_ATTENTION_KERNEL_SIZE ||
+        camera == NULL || projected_out == NULL || options->naf_target_resolution <= 0 ||
+        options->projection_n_coords <= 0) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+
+    const int query_side = options->naf_target_resolution;
+    size_t query_count = 0;
+    size_t key_count = 0;
+    size_t output_count = 0;
+    if (!checked_mul_size_local((size_t) query_side, (size_t) query_side, &query_count) ||
+        !checked_mul_size_local(
+            query_count,
+            TRELLIS_PIXAL_NAF_ATTENTION_QUERY_CHANNELS,
+            &query_count) ||
+        !checked_mul_size_local((size_t) patch_side, (size_t) patch_side, &key_count) ||
+        !checked_mul_size_local(
+            key_count,
+            TRELLIS_PIXAL_NAF_ATTENTION_QUERY_CHANNELS,
+            &key_count) ||
+        (uint64_t) options->projection_n_coords > (uint64_t) SIZE_MAX ||
+        !checked_mul_size_local(
+            (size_t) options->projection_n_coords,
+            TRELLIS_PIXAL_NAF_ATTENTION_VALUE_CHANNELS,
+            &output_count) ||
+        query_count > SIZE_MAX / sizeof(float) || key_count > SIZE_MAX / sizeof(float) ||
+        output_count > SIZE_MAX / sizeof(float)) {
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+
+    float * queries = (float *) malloc(query_count * sizeof(float));
+    float * keys = (float *) malloc(key_count * sizeof(float));
+    float * high_projected = (float *) malloc(output_count * sizeof(float));
+    if (queries == NULL || keys == NULL || high_projected == NULL) {
+        free(high_projected);
+        free(keys);
+        free(queries);
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+
+    trellis_tensor_store naf_store;
+    trellis_pixal_naf_ggml_weights naf_weights;
+    memset(&naf_store, 0, sizeof(naf_store));
+    memset(&naf_weights, 0, sizeof(naf_weights));
+    trellis_status status = TRELLIS_STATUS_ERROR;
+    if (!trellis_load_tensor_store_f32(
+            backend,
+            "Pixal3D NAF image encoder",
+            naf_path,
+            false,
+            16,
+            &naf_store,
+            NULL)) {
+        goto cleanup;
+    }
+    char issue[256];
+    issue[0] = '\0';
+    status = trellis_pixal_naf_bind_ggml_weights(
+        &naf_store,
+        &naf_weights,
+        issue,
+        sizeof(issue));
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR(
+            "Pixal3D NAF: weight bind failed: %s%s%s",
+            trellis_status_string(status),
+            issue[0] == '\0' ? "" : " ",
+            issue);
+        goto cleanup;
+    }
+
+    status = trellis_pixal_naf_query_key_forward_ggml_host(
+        backend,
+        &naf_weights,
+        guide_nchw,
+        1,
+        options->cond_resolution,
+        options->cond_resolution,
+        query_side,
+        query_side,
+        patch_side,
+        patch_side,
+        queries,
+        query_count,
+        keys,
+        key_count);
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR(
+            "Pixal3D NAF: image encoder failed: %s",
+            trellis_status_string(status));
+        goto cleanup;
+    }
+
+    const trellis_pixal_naf_attention_desc desc = {
+        .batch = 1,
+        .query_h = query_side,
+        .query_w = query_side,
+        .feature_h = patch_side,
+        .feature_w = patch_side,
+        .image_resolution = options->cond_resolution,
+        .grid_resolution = options->projection_grid_resolution,
+    };
+    if (backend->kind == TRELLIS_BACKEND_CUDA) {
+        status = trellis_pixal_naf_attention_project_sparse_cuda_host_f32(
+            queries,
+            keys,
+            dino_patch_values,
+            options->projection_coords_bxyz,
+            options->projection_n_coords,
+            camera,
+            &desc,
+            backend->device,
+            high_projected,
+            output_count);
+    } else if (backend->kind == TRELLIS_BACKEND_VULKAN && options->sparse_backend != NULL) {
+        status = trellis_pixal_naf_attention_project_sparse_vulkan_f32(
+            (trellis_sparse_backend *) options->sparse_backend,
+            queries,
+            keys,
+            dino_patch_values,
+            options->projection_coords_bxyz,
+            options->projection_n_coords,
+            camera,
+            &desc,
+            high_projected,
+            output_count);
+    } else {
+        status = TRELLIS_STATUS_NOT_IMPLEMENTED;
+    }
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR(
+            "Pixal3D NAF: fused neighborhood attention/projection failed: %s",
+            trellis_status_string(status));
+        goto cleanup;
+    }
+
+    *projected_out = high_projected;
+    high_projected = NULL;
+
+cleanup:
+    trellis_tensor_store_free(&naf_store);
+    free(high_projected);
+    free(keys);
+    free(queries);
+    return status;
 }
 
 trellis_status trellis_pipeline_run_image_condition(
@@ -977,7 +1396,9 @@ trellis_status trellis_pipeline_run_image_condition(
         memset(result, 0, sizeof(*result));
     }
     if (options == NULL || result == NULL || options->dino_dir == NULL ||
-        options->image_path == NULL || options->cond_resolution <= 0) {
+        options->image_path == NULL || options->cond_resolution <= 0 ||
+        (options->projection_channels != 0 && options->projection_channels != 1024 &&
+         options->projection_channels != 2048)) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     const trellis_backend_context * backend = options->backend != NULL ? options->backend : options->cuda;
@@ -986,6 +1407,7 @@ trellis_status trellis_pipeline_run_image_condition(
     }
 
     float * cond = NULL;
+    float * guide = NULL;
     int cond_tokens = 0;
     if (!run_dino_condition(
             backend,
@@ -993,12 +1415,144 @@ trellis_status trellis_pipeline_run_image_condition(
             options->dino_dir,
             options->image_path,
             options->cond_resolution,
+            options->projection_channels > 0,
+            options->projection_channels == 2048 ? &guide : NULL,
             NULL,
             &cond,
             &cond_tokens)) {
         free(cond);
+        free(guide);
         return TRELLIS_STATUS_ERROR;
     }
+    if (options->projection_channels > 0) {
+        const int special_tokens = 5;
+        const int patch_side = options->cond_resolution / 16;
+        const int patch_tokens = patch_side * patch_side;
+        if (options->cond_resolution % 16 != 0 ||
+            options->projection_grid_resolution <= 0 ||
+            options->projection_coords_bxyz == NULL || options->projection_n_coords <= 0 ||
+            cond_tokens != special_tokens + patch_tokens ||
+            (uint64_t) options->projection_n_coords >
+                (uint64_t) SIZE_MAX / (uint64_t) options->projection_channels) {
+            free(cond);
+            free(guide);
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
+        }
+        trellis_pixal_camera camera = {
+            .camera_angle_x = options->camera_angle_x > 0.0f ?
+                options->camera_angle_x : 0.8575560450553894f,
+            .distance = options->camera_distance > 0.0f ? options->camera_distance : 2.0f,
+            .mesh_scale = options->mesh_scale > 0.0f ? options->mesh_scale : 1.0f,
+        };
+        const size_t low_count = (size_t) options->projection_n_coords * 1024u;
+        float * global = (float *) malloc((size_t) special_tokens * 1024u * sizeof(float));
+        float * low_projected = (float *) malloc(low_count * sizeof(float));
+        if (global == NULL || low_projected == NULL) {
+            free(global);
+            free(low_projected);
+            free(cond);
+            free(guide);
+            return TRELLIS_STATUS_OUT_OF_MEMORY;
+        }
+        memcpy(global, cond, (size_t) special_tokens * 1024u * sizeof(float));
+        const float * dino_patch_values = cond + (size_t) special_tokens * 1024u;
+        trellis_status status = trellis_pixal_project_patch_features_sparse_f32(
+            dino_patch_values,
+            patch_side,
+            patch_side,
+            1024,
+            options->cond_resolution,
+            options->projection_grid_resolution,
+            &camera,
+            options->projection_coords_bxyz,
+            options->projection_n_coords,
+            low_projected,
+            low_count);
+        if (status != TRELLIS_STATUS_OK) {
+            free(global);
+            free(low_projected);
+            free(cond);
+            free(guide);
+            return status;
+        }
+        if (options->projection_channels == 2048) {
+            char naf_path[4096];
+            if (!resolve_pixal_naf_path(options, naf_path, sizeof(naf_path))) {
+                TRELLIS_ERROR(
+                    "Pixal3D requires NAF safetensors; pass --naf FILE or place naf_release.safetensors under the model/ckpts directory (convert with tools/convert_naf_weights.py)");
+                free(global);
+                free(low_projected);
+                free(cond);
+                free(guide);
+                return TRELLIS_STATUS_NOT_FOUND;
+            }
+            float * high_projected = NULL;
+            const int64_t naf_start_us = ggml_time_us();
+            status = run_pixal_naf_high_projection(
+                options,
+                backend,
+                naf_path,
+                guide,
+                dino_patch_values,
+                patch_side,
+                &camera,
+                &high_projected);
+            trellis_perf_stage_log(
+                options->naf_target_resolution == 1024 ?
+                    "pixal_naf_1024" : "pixal_naf_512",
+                ggml_time_us() - naf_start_us);
+            if (status != TRELLIS_STATUS_OK) {
+                free(high_projected);
+                free(global);
+                free(low_projected);
+                free(cond);
+                free(guide);
+                return status;
+            }
+            const size_t projected_count =
+                (size_t) options->projection_n_coords * 2048u;
+            float * projected = (float *) malloc(projected_count * sizeof(float));
+            if (projected == NULL) {
+                free(high_projected);
+                free(global);
+                free(low_projected);
+                free(cond);
+                free(guide);
+                return TRELLIS_STATUS_OUT_OF_MEMORY;
+            }
+            for (int64_t token = 0; token < options->projection_n_coords; ++token) {
+                memcpy(
+                    projected + (size_t) token * 2048u,
+                    low_projected + (size_t) token * 1024u,
+                    1024u * sizeof(float));
+                memcpy(
+                    projected + (size_t) token * 2048u + 1024u,
+                    high_projected + (size_t) token * 1024u,
+                    1024u * sizeof(float));
+            }
+            free(high_projected);
+            free(low_projected);
+            free(cond);
+            free(guide);
+            result->cond = global;
+            result->cond_tokens = special_tokens;
+            result->projected = projected;
+            result->projected_tokens = options->projection_n_coords;
+            result->projected_channels = 2048;
+            result->resolution = options->cond_resolution;
+            return TRELLIS_STATUS_OK;
+        }
+        free(cond);
+        free(guide);
+        result->cond = global;
+        result->cond_tokens = special_tokens;
+        result->projected = low_projected;
+        result->projected_tokens = options->projection_n_coords;
+        result->projected_channels = 1024;
+        result->resolution = options->cond_resolution;
+        return TRELLIS_STATUS_OK;
+    }
+    free(guide);
     result->cond = cond;
     result->cond_tokens = cond_tokens;
     result->resolution = options->cond_resolution;

@@ -113,6 +113,17 @@ static int should_set_context(const trellis_dit_flow_weights * weights) {
     return debug_parts >= 2;
 }
 
+static int should_set_projection(const trellis_dit_flow_executor * executor) {
+    if (executor == NULL || executor->model == NULL ||
+        !executor->model->projection.enabled || executor->weights == NULL ||
+        executor->weights->n_blocks <= 0) {
+        return 0;
+    }
+    const int debug_parts = executor->weights->debug_block_parts < 0 ?
+        3 : executor->weights->debug_block_parts;
+    return debug_parts >= 2;
+}
+
 static int should_set_timestep(const trellis_dit_flow_weights * weights) {
     return weights != NULL && weights->n_blocks > 0;
 }
@@ -121,6 +132,8 @@ static int set_static_inputs(
     trellis_dit_flow_executor * executor,
     const float * context,
     const float * neg_context,
+    const float * projected_context,
+    const float * neg_projected_context,
     const float * cos_phase_data,
     const float * sin_phase_data) {
     const trellis_dit_flow_weights * weights = executor->weights;
@@ -154,6 +167,29 @@ static int set_static_inputs(
             0,
             ggml_nbytes(executor->c));
     }
+    if (should_set_projection(executor)) {
+        if (projected_context == NULL || executor->projected_host == NULL || executor->p == NULL) {
+            return 0;
+        }
+        memcpy(
+            executor->projected_host,
+            projected_context,
+            executor->single_projected_count * sizeof(float));
+        if (executor->batch > 1) {
+            if (neg_projected_context == NULL) {
+                return 0;
+            }
+            memcpy(
+                executor->projected_host + executor->single_projected_count,
+                neg_projected_context,
+                executor->single_projected_count * sizeof(float));
+        }
+        ggml_backend_tensor_set(
+            executor->p,
+            executor->projected_host,
+            0,
+            ggml_nbytes(executor->p));
+    }
     return 1;
 }
 
@@ -161,22 +197,35 @@ static trellis_status init_executor(
     trellis_dit_flow_executor * executor,
     const trellis_backend_context * backend,
     const trellis_dit_flow_weights * weights,
+    const trellis_dit_flow_model * model,
     int64_t tokens,
     int cond_tokens,
     int batch,
     const float * context,
     const float * neg_context,
+    const float * projected_context,
+    const float * neg_projected_context,
     const float * cos_phase_data,
     const float * sin_phase_data) {
+    if (model != NULL) {
+        weights = &model->base;
+    }
     if (executor == NULL || backend == NULL || backend->backend == NULL || weights == NULL ||
         tokens <= 0 || cond_tokens <= 0 || weights->in_channels <= 0 ||
         weights->cond_channels <= 0 || weights->head_dim <= 0 || batch <= 0) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    const int projected_mode = model != NULL && model->projection.enabled;
+    if (projected_mode &&
+        (model->projection.proj_channels <= 0 || projected_context == NULL ||
+         (batch > 1 && neg_projected_context == NULL))) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
 
     memset(executor, 0, sizeof(*executor));
     executor->backend = backend;
     executor->weights = weights;
+    executor->model = model;
     executor->tokens = tokens;
     executor->cond_tokens = cond_tokens;
     executor->batch = batch;
@@ -189,12 +238,26 @@ static trellis_status init_executor(
         !checked_mul_size(executor->single_context_count, (size_t) batch, &executor->context_count)) {
         return TRELLIS_STATUS_OUT_OF_MEMORY;
     }
+    if (projected_mode &&
+        (!checked_mul_size(
+             (size_t) tokens,
+             (size_t) model->projection.proj_channels,
+             &executor->single_projected_count) ||
+         !checked_mul_size(
+             executor->single_projected_count,
+             (size_t) batch,
+             &executor->projected_count))) {
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
 
     executor->x_host = (float *) malloc(executor->input_count * sizeof(float));
     executor->y_host = (float *) malloc(executor->output_count * sizeof(float));
     executor->context_host = (float *) malloc(executor->context_count * sizeof(float));
+    if (projected_mode) {
+        executor->projected_host = (float *) malloc(executor->projected_count * sizeof(float));
+    }
     if (executor->x_host == NULL || executor->y_host == NULL ||
-        executor->context_host == NULL) {
+        executor->context_host == NULL || (projected_mode && executor->projected_host == NULL)) {
         trellis_dit_flow_executor_free(executor);
         return TRELLIS_STATUS_OUT_OF_MEMORY;
     }
@@ -225,6 +288,14 @@ static trellis_status init_executor(
         weights->cond_channels,
         cond_tokens,
         batch);
+    if (projected_mode) {
+        executor->p = ggml_new_tensor_3d(
+            executor->ctx,
+            GGML_TYPE_F32,
+            model->projection.proj_channels,
+            tokens,
+            batch);
+    }
     executor->cos_phase = ggml_new_tensor_4d(
         executor->ctx,
         GGML_TYPE_F32,
@@ -240,6 +311,7 @@ static trellis_status init_executor(
         tokens,
         1);
     if (executor->x == NULL || executor->t == NULL || executor->c == NULL ||
+        (projected_mode && executor->p == NULL) ||
         executor->cos_phase == NULL || executor->sin_phase == NULL) {
         trellis_dit_flow_executor_free(executor);
         return TRELLIS_STATUS_ERROR;
@@ -247,20 +319,36 @@ static trellis_status init_executor(
     ggml_set_input(executor->x);
     ggml_set_input(executor->t);
     ggml_set_input(executor->c);
+    if (executor->p != NULL) {
+        ggml_set_input(executor->p);
+        ggml_set_output(executor->p);
+    }
     ggml_set_input(executor->cos_phase);
     ggml_set_input(executor->sin_phase);
     ggml_set_output(executor->c);
     ggml_set_output(executor->cos_phase);
     ggml_set_output(executor->sin_phase);
 
-    executor->y = trellis_dit_flow_forward(
-        executor->ctx,
-        executor->x,
-        executor->t,
-        executor->c,
-        executor->cos_phase,
-        executor->sin_phase,
-        weights);
+    if (projected_mode) {
+        executor->y = trellis_dit_flow_forward_projected(
+            executor->ctx,
+            executor->x,
+            executor->t,
+            executor->c,
+            executor->p,
+            executor->cos_phase,
+            executor->sin_phase,
+            model);
+    } else {
+        executor->y = trellis_dit_flow_forward(
+            executor->ctx,
+            executor->x,
+            executor->t,
+            executor->c,
+            executor->cos_phase,
+            executor->sin_phase,
+            weights);
+    }
     if (executor->y == NULL) {
         trellis_dit_flow_executor_free(executor);
         return TRELLIS_STATUS_ERROR;
@@ -280,7 +368,14 @@ static trellis_status init_executor(
         return TRELLIS_STATUS_OUT_OF_MEMORY;
     }
 
-    if (!set_static_inputs(executor, context, neg_context, cos_phase_data, sin_phase_data)) {
+    if (!set_static_inputs(
+            executor,
+            context,
+            neg_context,
+            projected_context,
+            neg_projected_context,
+            cos_phase_data,
+            sin_phase_data)) {
         trellis_dit_flow_executor_free(executor);
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
@@ -301,10 +396,42 @@ trellis_status trellis_dit_flow_executor_init_single(
         executor,
         backend,
         weights,
+        NULL,
         tokens,
         cond_tokens,
         1,
         context,
+        NULL,
+        NULL,
+        NULL,
+        cos_phase_data,
+        sin_phase_data);
+}
+
+trellis_status trellis_dit_flow_executor_init_single_projected(
+    trellis_dit_flow_executor * executor,
+    const trellis_backend_context * backend,
+    const trellis_dit_flow_model * model,
+    int64_t tokens,
+    int global_tokens,
+    const float * global_context,
+    const float * projected_context,
+    const float * cos_phase_data,
+    const float * sin_phase_data) {
+    if (model == NULL || !model->projection.enabled) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    return init_executor(
+        executor,
+        backend,
+        &model->base,
+        model,
+        tokens,
+        global_tokens,
+        1,
+        global_context,
+        NULL,
+        projected_context,
         NULL,
         cos_phase_data,
         sin_phase_data);
@@ -357,11 +484,46 @@ trellis_status trellis_dit_flow_executor_init_cfg_batch(
         executor,
         backend,
         weights,
+        NULL,
         tokens,
         cond_tokens,
         2,
         context,
         neg_context,
+        NULL,
+        NULL,
+        cos_phase_data,
+        sin_phase_data);
+}
+
+trellis_status trellis_dit_flow_executor_init_cfg_batch_projected(
+    trellis_dit_flow_executor * executor,
+    const trellis_backend_context * backend,
+    const trellis_dit_flow_model * model,
+    int64_t tokens,
+    int global_tokens,
+    const float * global_context,
+    const float * neg_global_context,
+    const float * projected_context,
+    const float * neg_projected_context,
+    const float * cos_phase_data,
+    const float * sin_phase_data) {
+    if (model == NULL || !model->projection.enabled ||
+        !cfg_batch_attention_is_reasonable(&model->base, tokens, global_tokens, 2)) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    return init_executor(
+        executor,
+        backend,
+        &model->base,
+        model,
+        tokens,
+        global_tokens,
+        2,
+        global_context,
+        neg_global_context,
+        projected_context,
+        neg_projected_context,
         cos_phase_data,
         sin_phase_data);
 }
@@ -420,6 +582,7 @@ void trellis_dit_flow_executor_free(trellis_dit_flow_executor * executor) {
     }
     free(executor->x_host);
     free(executor->context_host);
+    free(executor->projected_host);
     free(executor->y_host);
     memset(executor, 0, sizeof(*executor));
 }

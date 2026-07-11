@@ -477,6 +477,23 @@ trellis_status trellis_sparse_cpu_backend_create(trellis_sparse_backend ** out) 
     return TRELLIS_STATUS_OK;
 }
 
+trellis_status trellis_sparse_backend_trim(
+    trellis_sparse_backend * backend,
+    unsigned flags,
+    size_t * released_bytes) {
+    if (released_bytes != NULL) {
+        *released_bytes = 0;
+    }
+    if (backend == NULL || backend->ops == NULL ||
+        (flags & ~(unsigned) TRELLIS_SPARSE_TRIM_ALL) != 0) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (flags == 0 || backend->ops->trim == NULL) {
+        return TRELLIS_STATUS_OK;
+    }
+    return backend->ops->trim(backend, flags, released_bytes);
+}
+
 void trellis_sparse_backend_destroy(trellis_sparse_backend * backend) {
     if (backend != NULL && backend->ops != NULL && backend->ops->destroy != NULL) {
         backend->ops->destroy(backend);

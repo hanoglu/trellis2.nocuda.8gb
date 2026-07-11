@@ -24,6 +24,7 @@ const char * trellis_dtype_name(trellis_dtype dtype) {
         case TRELLIS_DTYPE_I32: return "I32";
         case TRELLIS_DTYPE_U8: return "U8";
         case TRELLIS_DTYPE_BOOL: return "BOOL";
+        case TRELLIS_DTYPE_C64: return "C64";
         default: return "UNKNOWN";
     }
 }
@@ -37,6 +38,7 @@ size_t trellis_dtype_size(trellis_dtype dtype) {
         case TRELLIS_DTYPE_I32: return 4;
         case TRELLIS_DTYPE_U8: return 1;
         case TRELLIS_DTYPE_BOOL: return 1;
+        case TRELLIS_DTYPE_C64: return 8;
         default: return 0;
     }
 }
@@ -49,6 +51,7 @@ static trellis_dtype parse_dtype(const char * s) {
     if (strcmp(s, "I32") == 0) return TRELLIS_DTYPE_I32;
     if (strcmp(s, "U8") == 0) return TRELLIS_DTYPE_U8;
     if (strcmp(s, "BOOL") == 0) return TRELLIS_DTYPE_BOOL;
+    if (strcmp(s, "C64") == 0) return TRELLIS_DTYPE_C64;
     return TRELLIS_DTYPE_UNKNOWN;
 }
 
@@ -504,6 +507,9 @@ trellis_status trellis_safetensors_read_f32(
         meta->data_end < meta->data_begin ||
         meta->data_end - meta->data_begin != n * (uint64_t) elem_size) {
         return TRELLIS_STATUS_PARSE_ERROR;
+    }
+    if (meta->dtype == TRELLIS_DTYPE_C64) {
+        return TRELLIS_STATUS_NOT_IMPLEMENTED;
     }
 
     FILE * f = fopen(st->path, "rb");

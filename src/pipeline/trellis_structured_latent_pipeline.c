@@ -170,6 +170,49 @@ static void normalize_slat_f32(
     }
 }
 
+static int log_finite_stats_f32(
+    const char * label,
+    const char * value_label,
+    const float * values,
+    size_t count) {
+    if (values == NULL || count == 0) {
+        return 0;
+    }
+    float minimum = INFINITY;
+    float maximum = -INFINITY;
+    double sum = 0.0;
+    size_t finite_count = 0;
+    size_t nan_count = 0;
+    size_t inf_count = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const float value = values[i];
+        if (isnan(value)) {
+            ++nan_count;
+            continue;
+        }
+        if (!isfinite(value)) {
+            ++inf_count;
+            continue;
+        }
+        if (value < minimum) minimum = value;
+        if (value > maximum) maximum = value;
+        sum += value;
+        ++finite_count;
+    }
+    TRELLIS_INFO(
+        "structured latent %s: %s[min=%.6g mean=%.6g max=%.6g finite=%zu/%zu nan=%zu inf=%zu]",
+        label,
+        value_label,
+        finite_count > 0 ? minimum : NAN,
+        finite_count > 0 ? sum / (double) finite_count : NAN,
+        finite_count > 0 ? maximum : NAN,
+        finite_count,
+        count,
+        nan_count,
+        inf_count);
+    return finite_count == count;
+}
+
 static float lcg_uniform(uint32_t * state) {
     *state = (*state * 1664525u) + 1013904223u;
     return ((float) ((*state >> 8) & 0x00ffffffu) + 0.5f) / 16777216.0f;
@@ -205,11 +248,11 @@ static int make_slat_flow_path(
     }
     const char * rel = NULL;
     if (component == TRELLIS_COMPONENT_TEX_SLAT_FLOW) {
-        rel = resolution == 1024 ?
+        rel = resolution >= 1024 ?
             "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors" :
             "ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors";
     } else {
-        rel = resolution == 1024 ?
+        rel = resolution >= 1024 ?
             "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors" :
             "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors";
     }
@@ -222,7 +265,7 @@ static int load_slat_flow(
     trellis_model_component component,
     const char * label,
     trellis_tensor_store * store,
-    trellis_dit_flow_weights * flow) {
+    trellis_dit_flow_model * model) {
     char load_label[128];
     snprintf(load_label, sizeof(load_label), "structured-latent %s flow", label);
     if (!trellis_load_tensor_store(backend, load_label, path, true, 64, store, NULL)) {
@@ -230,25 +273,32 @@ static int load_slat_flow(
     }
     char issue[256];
     trellis_status status = component == TRELLIS_COMPONENT_TEX_SLAT_FLOW ?
-        trellis_tex_slat_flow_bind_weights(store, flow, issue, sizeof(issue)) :
-        trellis_shape_slat_flow_bind_weights(store, flow, issue, sizeof(issue));
+        trellis_tex_slat_flow_model_bind_weights(store, model, issue, sizeof(issue)) :
+        trellis_shape_slat_flow_model_bind_weights(store, model, issue, sizeof(issue));
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_ERROR("structured-latent %s flow: bind failed: %s%s%s",
             label,
             trellis_status_string(status),
             issue[0] == '\0' ? "" : " ",
             issue);
+        trellis_tensor_store_free(store);
         return 0;
     }
     TRELLIS_INFO(
         "structured-latent %s flow: ready blocks=%d in=%d out=%d cond=%d heads=%d head_dim=%d",
         label,
-        flow->n_blocks,
-        flow->in_channels,
-        flow->out_channels,
-        flow->cond_channels,
-        flow->heads,
-        flow->head_dim);
+        model->base.n_blocks,
+        model->base.in_channels,
+        model->base.out_channels,
+        model->base.cond_channels,
+        model->base.heads,
+        model->base.head_dim);
+    if (model->projection.enabled) {
+        TRELLIS_INFO(
+            "structured-latent %s flow: Pixal3D projection channels=%d",
+            label,
+            model->projection.proj_channels);
+    }
     return 1;
 }
 
@@ -350,8 +400,10 @@ trellis_status trellis_pipeline_run_structured_latent(
 
     char flow_path[4096];
     trellis_tensor_store flow_store;
+    trellis_dit_flow_model flow_model;
     trellis_dit_flow_weights flow;
     memset(&flow_store, 0, sizeof(flow_store));
+    memset(&flow_model, 0, sizeof(flow_model));
     memset(&flow, 0, sizeof(flow));
     int owns_flow_store = 0;
     trellis_dit_flow_executor flow_executor_cfg;
@@ -363,6 +415,7 @@ trellis_status trellis_pipeline_run_structured_latent(
     int use_cfg_batch = 0;
 
     float * neg_cond = NULL;
+    float * neg_projected_cond = NULL;
     float * latent = NULL;
     float * pred_pos = NULL;
     float * pred_neg = NULL;
@@ -396,8 +449,8 @@ trellis_status trellis_pipeline_run_structured_latent(
         (unsigned) options->noise_seed);
 
     if (options->cache != NULL) {
-        const trellis_dit_flow_weights * cached_flow = NULL;
-        status = trellis_pipeline_model_cache_get_slat_flow(
+        const trellis_dit_flow_model * cached_flow = NULL;
+        status = trellis_pipeline_model_cache_get_slat_flow_model(
             options->cache,
             options->model_dir,
             options->flow_override_path,
@@ -409,11 +462,13 @@ trellis_status trellis_pipeline_run_structured_latent(
             TRELLIS_ERROR("structured latent %s: cache flow load failed: %s", label, trellis_status_string(status));
             goto cleanup;
         }
-        flow = *cached_flow;
+        flow_model = *cached_flow;
+        flow = flow_model.base;
     } else {
-        if (!load_slat_flow(backend, flow_path, component, label, &flow_store, &flow)) {
+        if (!load_slat_flow(backend, flow_path, component, label, &flow_store, &flow_model)) {
             goto cleanup;
         }
+        flow = flow_model.base;
         owns_flow_store = 1;
     }
     const int state_channels = flow.out_channels;
@@ -456,6 +511,25 @@ trellis_status trellis_pipeline_run_structured_latent(
             state_channels);
         goto cleanup;
     }
+    if (flow_model.projection.enabled) {
+        if (options->projected_cond == NULL ||
+            options->projected_tokens != options->n_coords ||
+            options->projected_channels != flow_model.projection.proj_channels) {
+            TRELLIS_ERROR(
+                "structured latent %s: Pixal3D projected condition mismatch tokens=%lld expected=%lld channels=%d expected=%d",
+                label,
+                (long long) options->projected_tokens,
+                (long long) options->n_coords,
+                options->projected_channels,
+                flow_model.projection.proj_channels);
+            goto cleanup;
+        }
+        TRELLIS_INFO(
+            "structured latent %s: Pixal3D projected conditioning tokens=%lld channels=%d",
+            label,
+            (long long) options->projected_tokens,
+            options->projected_channels);
+    }
     if (!load_slat_normalization(options->model_dir, normalization_key, label, slat_mean, slat_std)) {
         goto cleanup;
     }
@@ -487,11 +561,15 @@ trellis_status trellis_pipeline_run_structured_latent(
         flow.emulate_bf16_blocks = 1;
         TRELLIS_INFO("structured latent %s: bf16 block activation round-trip enabled", label);
     }
+    flow_model.base = flow;
     trellis_ggml_set_flash_attn_enabled(options->use_ggml_flash_attn);
 
     const size_t state_count = (size_t) options->n_coords * (size_t) state_channels;
     const size_t input_count = (size_t) options->n_coords * (size_t) flow.in_channels;
     const size_t context_count = (size_t) options->cond_tokens * (size_t) flow.cond_channels;
+    const size_t projected_count = flow_model.projection.enabled ?
+        (size_t) options->projected_tokens * (size_t) options->projected_channels :
+        0u;
     const size_t phase_count = (size_t) options->n_coords * (size_t) (flow.head_dim / 2);
     const size_t concat_count = component == TRELLIS_COMPONENT_TEX_SLAT_FLOW ?
         (size_t) options->n_coords * (size_t) options->concat_channels :
@@ -499,6 +577,9 @@ trellis_status trellis_pipeline_run_structured_latent(
 
     if (options->neg_cond == NULL) {
         neg_cond = (float *) calloc(context_count, sizeof(float));
+    }
+    if (flow_model.projection.enabled && options->neg_projected_cond == NULL) {
+        neg_projected_cond = (float *) calloc(projected_count, sizeof(float));
     }
     latent = (float *) malloc(state_count * sizeof(float));
     pred_pos = (float *) malloc(state_count * sizeof(float));
@@ -515,7 +596,9 @@ trellis_status trellis_pipeline_run_structured_latent(
     cos_phase = (float *) malloc(phase_count * sizeof(float));
     sin_phase = (float *) malloc(phase_count * sizeof(float));
     latent_out->coords_bxyz = (int32_t *) malloc((size_t) options->n_coords * 4u * sizeof(int32_t));
-    if ((options->neg_cond == NULL && neg_cond == NULL) || latent == NULL || pred_pos == NULL ||
+    if ((options->neg_cond == NULL && neg_cond == NULL) ||
+        (flow_model.projection.enabled && options->neg_projected_cond == NULL && neg_projected_cond == NULL) ||
+        latent == NULL || pred_pos == NULL ||
         pred_neg == NULL || pred == NULL || next == NULL || x0 == NULL || denorm == NULL ||
         run_input == NULL || (concat_count > 0 && concat_norm == NULL) ||
         pairs == NULL || cos_phase == NULL || sin_phase == NULL || latent_out->coords_bxyz == NULL) {
@@ -558,41 +641,84 @@ trellis_status trellis_pipeline_run_structured_latent(
     }
 
     const float * neg_context = options->neg_cond != NULL ? options->neg_cond : neg_cond;
-    status = trellis_dit_flow_executor_init_cfg_batch(
-        &flow_executor_cfg,
-        backend,
-        &flow,
-        options->n_coords,
-        options->cond_tokens,
-        options->cond,
-        neg_context,
-        cos_phase,
-        sin_phase);
+    const float * neg_projected_context = options->neg_projected_cond != NULL ?
+        options->neg_projected_cond : neg_projected_cond;
+    if (flow_model.projection.enabled) {
+        status = trellis_dit_flow_executor_init_cfg_batch_projected(
+            &flow_executor_cfg,
+            backend,
+            &flow_model,
+            options->n_coords,
+            options->cond_tokens,
+            options->cond,
+            neg_context,
+            options->projected_cond,
+            neg_projected_context,
+            cos_phase,
+            sin_phase);
+    } else {
+        status = trellis_dit_flow_executor_init_cfg_batch(
+            &flow_executor_cfg,
+            backend,
+            &flow,
+            options->n_coords,
+            options->cond_tokens,
+            options->cond,
+            neg_context,
+            cos_phase,
+            sin_phase);
+    }
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_WARN(
             "structured latent %s: fused CFG executor init failed (%s); falling back to separate cond/uncond graphs",
             label,
             trellis_status_string(status));
         trellis_dit_flow_executor_free(&flow_executor_cfg);
-        status = trellis_dit_flow_executor_init_single(
-            &flow_executor_cond,
-            backend,
-            &flow,
-            options->n_coords,
-            options->cond_tokens,
-            options->cond,
-            cos_phase,
-            sin_phase);
-        if (status == TRELLIS_STATUS_OK) {
+        if (flow_model.projection.enabled) {
+            status = trellis_dit_flow_executor_init_single_projected(
+                &flow_executor_cond,
+                backend,
+                &flow_model,
+                options->n_coords,
+                options->cond_tokens,
+                options->cond,
+                options->projected_cond,
+                cos_phase,
+                sin_phase);
+        } else {
             status = trellis_dit_flow_executor_init_single(
-                &flow_executor_uncond,
+                &flow_executor_cond,
                 backend,
                 &flow,
                 options->n_coords,
                 options->cond_tokens,
-                neg_context,
+                options->cond,
                 cos_phase,
                 sin_phase);
+        }
+        if (status == TRELLIS_STATUS_OK) {
+            if (flow_model.projection.enabled) {
+                status = trellis_dit_flow_executor_init_single_projected(
+                    &flow_executor_uncond,
+                    backend,
+                    &flow_model,
+                    options->n_coords,
+                    options->cond_tokens,
+                    neg_context,
+                    neg_projected_context,
+                    cos_phase,
+                    sin_phase);
+            } else {
+                status = trellis_dit_flow_executor_init_single(
+                    &flow_executor_uncond,
+                    backend,
+                    &flow,
+                    options->n_coords,
+                    options->cond_tokens,
+                    neg_context,
+                    cos_phase,
+                    sin_phase);
+            }
         }
         if (status != TRELLIS_STATUS_OK) {
             TRELLIS_ERROR("structured latent %s: flow executor init failed: %s", label, trellis_status_string(status));
@@ -667,7 +793,17 @@ trellis_status trellis_pipeline_run_structured_latent(
         trellis_progress_steps(progress_label, step + 1, steps, ggml_time_us() - step_start_us, detail);
     }
 
+    if (!log_finite_stats_f32(label, "normalized output", latent, state_count)) {
+        TRELLIS_ERROR("structured latent %s: non-finite normalized output", label);
+        status = TRELLIS_STATUS_ERROR;
+        goto cleanup;
+    }
     denormalize_slat_f32(latent, options->n_coords, state_channels, slat_mean, slat_std, denorm);
+    if (!log_finite_stats_f32(label, "denormalized output", denorm, state_count)) {
+        TRELLIS_ERROR("structured latent %s: non-finite denormalized output", label);
+        status = TRELLIS_STATUS_ERROR;
+        goto cleanup;
+    }
     latent_out->feats = denorm;
     denorm = NULL;
     memcpy(latent_out->coords_bxyz, options->coords_bxyz, (size_t) options->n_coords * 4u * sizeof(int32_t));
@@ -682,6 +818,7 @@ cleanup:
         trellis_structured_latent_free(latent_out);
     }
     free(neg_cond);
+    free(neg_projected_cond);
     free(latent);
     free(pred_pos);
     free(pred_neg);

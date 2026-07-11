@@ -10,6 +10,16 @@ typedef struct trellis_sparse_buffer trellis_sparse_buffer;
 typedef struct trellis_sparse_rulebook trellis_sparse_rulebook;
 typedef struct trellis_sparse_c2s_device_map trellis_sparse_c2s_device_map;
 typedef struct trellis_sparse_backend trellis_sparse_backend;
+struct trellis_pixal_camera;
+struct trellis_pixal_naf_attention_desc;
+
+enum {
+    TRELLIS_SPARSE_TRIM_FREE_BUFFERS = 1u << 0,
+    TRELLIS_SPARSE_TRIM_WEIGHTS = 1u << 1,
+    TRELLIS_SPARSE_TRIM_ALL =
+        TRELLIS_SPARSE_TRIM_FREE_BUFFERS |
+        TRELLIS_SPARSE_TRIM_WEIGHTS,
+};
 
 typedef struct trellis_sparse_backend_ops {
     void (*destroy)(trellis_sparse_backend * backend);
@@ -170,6 +180,24 @@ typedef struct trellis_sparse_backend_ops {
         int32_t * parent_out,
         int32_t * subidx_out,
         int64_t n);
+
+    /* Releases backend caches only. Device-resident C2S maps remain valid. */
+    trellis_status (*trim)(
+        trellis_sparse_backend * backend,
+        unsigned flags,
+        size_t * released_bytes);
+
+    trellis_status (*pixal_naf_attention_project_sparse)(
+        trellis_sparse_backend * backend,
+        const float * queries,
+        const float * keys,
+        const float * values,
+        const int32_t * coords_bxyz,
+        int64_t n_coords,
+        const struct trellis_pixal_camera * cameras,
+        const struct trellis_pixal_naf_attention_desc * desc,
+        float * projected_out,
+        size_t projected_count);
 } trellis_sparse_backend_ops;
 
 struct trellis_sparse_backend {
@@ -181,6 +209,10 @@ struct trellis_sparse_backend {
 trellis_status trellis_sparse_cpu_backend_create(trellis_sparse_backend ** out);
 trellis_status trellis_sparse_vulkan_backend_create(int device, trellis_sparse_backend ** out);
 
+trellis_status trellis_sparse_backend_trim(
+    trellis_sparse_backend * backend,
+    unsigned flags,
+    size_t * released_bytes);
 void trellis_sparse_backend_destroy(trellis_sparse_backend * backend);
 
 #endif

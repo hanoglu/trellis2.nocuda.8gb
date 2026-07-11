@@ -1206,7 +1206,10 @@ static int gltf_vk_texture_postprocess(
             }
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->compute_pipelines[TRELLIS_GLTF_COMPUTE_DILATE]);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &set, 0, NULL);
-            vkCmdPushConstants(cmd, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            vkCmdPushConstants(
+                cmd, vk->pipeline_layout,
+                VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+                0, sizeof(push), &push);
             vkCmdDispatch(cmd, image_groups, image_groups, 1);
 
             VkBufferMemoryBarrier barriers[2];
@@ -1248,7 +1251,10 @@ static int gltf_vk_texture_postprocess(
             }
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->compute_pipelines[TRELLIS_GLTF_COMPUTE_FILL_EMPTY]);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &set, 0, NULL);
-            vkCmdPushConstants(cmd, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            vkCmdPushConstants(
+                cmd, vk->pipeline_layout,
+                VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+                0, sizeof(push), &push);
             vkCmdDispatch(cmd, image_groups, image_groups, 1);
 
             VkBufferMemoryBarrier barriers[2];
@@ -1872,7 +1878,10 @@ static int gltf_vk_render_bake(
         vkCmdBindVertexBuffers(cmd, 0, 2, vertex_buffers, vertex_offsets);
         vkCmdBindIndexBuffer(cmd, buffers[2]->buffer, 0, VK_INDEX_TYPE_UINT32);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk->pipeline_layout, 0, 1, &set, 0, NULL);
-        vkCmdPushConstants(cmd, vk->pipeline_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(*push), push);
+        vkCmdPushConstants(
+            cmd, vk->pipeline_layout,
+            VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT,
+            0, sizeof(*push), push);
         vkCmdDrawIndexed(cmd, push->triangle_count * 3u, 1, 0, 0, 0);
         vkCmdEndRenderPass(cmd);
 

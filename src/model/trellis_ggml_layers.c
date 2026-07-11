@@ -397,6 +397,65 @@ struct ggml_tensor * trellis_ggml_cross_attention(
     return trellis_ggml_linear(ctx, h, out_w, out_b);
 }
 
+struct ggml_tensor * trellis_ggml_project_attention(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,
+    struct ggml_tensor * global_context,
+    struct ggml_tensor * projected_context,
+    int n_heads,
+    struct ggml_tensor * q_w,
+    struct ggml_tensor * q_b,
+    struct ggml_tensor * kv_w,
+    struct ggml_tensor * kv_b,
+    struct ggml_tensor * q_rms_gamma,
+    struct ggml_tensor * k_rms_gamma,
+    struct ggml_tensor * out_w,
+    struct ggml_tensor * out_b,
+    struct ggml_tensor * proj_w,
+    struct ggml_tensor * proj_b) {
+    if (ctx == NULL || x == NULL || global_context == NULL || projected_context == NULL ||
+        q_w == NULL || kv_w == NULL || out_w == NULL || proj_w == NULL || n_heads <= 0) {
+        return NULL;
+    }
+
+    const int64_t channels = x->ne[0];
+    const int64_t tokens = x->ne[1];
+    const int64_t batches = x->ne[2];
+    const int64_t proj_in = projected_context->ne[0];
+    if (channels <= 0 || channels % n_heads != 0 ||
+        global_context->ne[2] != batches ||
+        projected_context->ne[1] != tokens || projected_context->ne[2] != batches ||
+        q_w->ne[0] != channels || q_w->ne[1] != channels ||
+        kv_w->ne[0] != global_context->ne[0] || kv_w->ne[1] != 2 * channels ||
+        out_w->ne[0] != channels || out_w->ne[1] != channels ||
+        proj_w->ne[0] != proj_in || proj_w->ne[1] != channels ||
+        (q_b != NULL && q_b->ne[0] != channels) ||
+        (kv_b != NULL && kv_b->ne[0] != 2 * channels) ||
+        (out_b != NULL && out_b->ne[0] != channels) ||
+        (proj_b != NULL && proj_b->ne[0] != channels)) {
+        return NULL;
+    }
+
+    struct ggml_tensor * global_out = trellis_ggml_cross_attention(
+        ctx,
+        x,
+        global_context,
+        n_heads,
+        q_w,
+        q_b,
+        kv_w,
+        kv_b,
+        q_rms_gamma,
+        k_rms_gamma,
+        out_w,
+        out_b);
+    struct ggml_tensor * projected_out = trellis_ggml_linear(ctx, projected_context, proj_w, proj_b);
+    if (global_out == NULL || projected_out == NULL) {
+        return NULL;
+    }
+    return ggml_add(ctx, global_out, projected_out);
+}
+
 static struct ggml_tensor * trellis_mod_chunk(
     struct ggml_context * ctx,
     struct ggml_tensor * mod,
@@ -430,12 +489,16 @@ static struct ggml_tensor * trellis_ggml_modulated_cross_block_impl(
     struct ggml_context * ctx,
     struct ggml_tensor * x,
     struct ggml_tensor * mod6,
-    struct ggml_tensor * context,
+    struct ggml_tensor * global_context,
+    struct ggml_tensor * projected_context,
     int n_heads,
     const trellis_ggml_modulated_cross_block_params * params,
+    struct ggml_tensor * proj_w,
+    struct ggml_tensor * proj_b,
     struct ggml_tensor * cos_phase,
     struct ggml_tensor * sin_phase) {
-    if (ctx == NULL || x == NULL || mod6 == NULL || context == NULL || params == NULL || n_heads <= 0) {
+    if (ctx == NULL || x == NULL || mod6 == NULL || global_context == NULL || params == NULL || n_heads <= 0 ||
+        (projected_context != NULL && proj_w == NULL)) {
         return NULL;
     }
 
@@ -504,19 +567,41 @@ static struct ggml_tensor * trellis_ggml_modulated_cross_block_impl(
     if (params->emulate_bf16) {
         h = trellis_ggml_bf16_roundtrip(ctx, h);
     }
-    h = trellis_ggml_cross_attention(
-        ctx,
-        h,
-        context,
-        n_heads,
-        params->cross_q_w,
-        params->cross_q_b,
-        params->cross_kv_w,
-        params->cross_kv_b,
-        params->cross_q_rms_gamma,
-        params->cross_k_rms_gamma,
-        params->cross_out_w,
-        params->cross_out_b);
+    if (projected_context != NULL) {
+        h = trellis_ggml_project_attention(
+            ctx,
+            h,
+            global_context,
+            projected_context,
+            n_heads,
+            params->cross_q_w,
+            params->cross_q_b,
+            params->cross_kv_w,
+            params->cross_kv_b,
+            params->cross_q_rms_gamma,
+            params->cross_k_rms_gamma,
+            params->cross_out_w,
+            params->cross_out_b,
+            proj_w,
+            proj_b);
+    } else {
+        h = trellis_ggml_cross_attention(
+            ctx,
+            h,
+            global_context,
+            n_heads,
+            params->cross_q_w,
+            params->cross_q_b,
+            params->cross_kv_w,
+            params->cross_kv_b,
+            params->cross_q_rms_gamma,
+            params->cross_k_rms_gamma,
+            params->cross_out_w,
+            params->cross_out_b);
+    }
+    if (h == NULL) {
+        return NULL;
+    }
     if (params->emulate_bf16) {
         h = trellis_ggml_bf16_roundtrip(ctx, h);
     }
@@ -557,7 +642,8 @@ struct ggml_tensor * trellis_ggml_modulated_cross_block(
     struct ggml_tensor * context,
     int n_heads,
     const trellis_ggml_modulated_cross_block_params * params) {
-    return trellis_ggml_modulated_cross_block_impl(ctx, x, mod6, context, n_heads, params, NULL, NULL);
+    return trellis_ggml_modulated_cross_block_impl(
+        ctx, x, mod6, context, NULL, n_heads, params, NULL, NULL, NULL, NULL);
 }
 
 struct ggml_tensor * trellis_ggml_modulated_cross_block_rope(
@@ -569,5 +655,62 @@ struct ggml_tensor * trellis_ggml_modulated_cross_block_rope(
     const trellis_ggml_modulated_cross_block_params * params,
     struct ggml_tensor * cos_phase,
     struct ggml_tensor * sin_phase) {
-    return trellis_ggml_modulated_cross_block_impl(ctx, x, mod6, context, n_heads, params, cos_phase, sin_phase);
+    return trellis_ggml_modulated_cross_block_impl(
+        ctx, x, mod6, context, NULL, n_heads, params, NULL, NULL, cos_phase, sin_phase);
+}
+
+struct ggml_tensor * trellis_ggml_modulated_cross_block_projected(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,
+    struct ggml_tensor * mod6,
+    struct ggml_tensor * global_context,
+    struct ggml_tensor * projected_context,
+    int n_heads,
+    const trellis_ggml_modulated_cross_block_params * params,
+    struct ggml_tensor * proj_w,
+    struct ggml_tensor * proj_b) {
+    if (projected_context == NULL || proj_w == NULL) {
+        return NULL;
+    }
+    return trellis_ggml_modulated_cross_block_impl(
+        ctx,
+        x,
+        mod6,
+        global_context,
+        projected_context,
+        n_heads,
+        params,
+        proj_w,
+        proj_b,
+        NULL,
+        NULL);
+}
+
+struct ggml_tensor * trellis_ggml_modulated_cross_block_projected_rope(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,
+    struct ggml_tensor * mod6,
+    struct ggml_tensor * global_context,
+    struct ggml_tensor * projected_context,
+    int n_heads,
+    const trellis_ggml_modulated_cross_block_params * params,
+    struct ggml_tensor * proj_w,
+    struct ggml_tensor * proj_b,
+    struct ggml_tensor * cos_phase,
+    struct ggml_tensor * sin_phase) {
+    if (projected_context == NULL || proj_w == NULL) {
+        return NULL;
+    }
+    return trellis_ggml_modulated_cross_block_impl(
+        ctx,
+        x,
+        mod6,
+        global_context,
+        projected_context,
+        n_heads,
+        params,
+        proj_w,
+        proj_b,
+        cos_phase,
+        sin_phase);
 }

@@ -164,6 +164,36 @@ static int path_has_ext(const char * path, const char * ext) {
     return *dot == '\0' && *ext == '\0';
 }
 
+static trellis_status image_has_transparent_alpha(
+    const char * image_path,
+    int * has_transparent_alpha_out) {
+    if (image_path == NULL || image_path[0] == '\0' || has_transparent_alpha_out == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    *has_transparent_alpha_out = 0;
+
+    int width = 0;
+    int height = 0;
+    int components = 0;
+    unsigned char * rgba = stbi_load(image_path, &width, &height, &components, 4);
+    if (rgba == NULL || width <= 0 || height <= 0 ||
+        (size_t) width > SIZE_MAX / (size_t) height) {
+        TRELLIS_ERROR("image prep: failed to inspect alpha channel: %s", image_path);
+        stbi_image_free(rgba);
+        return TRELLIS_STATUS_IO_ERROR;
+    }
+
+    const size_t pixels = (size_t) width * (size_t) height;
+    for (size_t i = 0; i < pixels; ++i) {
+        if (rgba[i * 4u + 3u] != 255u) {
+            *has_transparent_alpha_out = 1;
+            break;
+        }
+    }
+    stbi_image_free(rgba);
+    return TRELLIS_STATUS_OK;
+}
+
 static int convert_webp_to_png_ffmpeg(const char * input_path, const char * output_path) {
     char * argv[] = {
         (char *) "ffmpeg",
@@ -569,11 +599,12 @@ static int same_coord4_i32(const int32_t * a, const int32_t * b) {
     return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
 }
 
-static trellis_status quantize_cascade_coords(
+trellis_status trellis_pipeline_quantize_cascade_coords(
     const int32_t * decoder_coords,
     int64_t decoder_n,
     int lr_resolution,
     int hr_resolution,
+    trellis_cascade_coord_quantization quantization,
     int32_t ** coords_out,
     int64_t * n_out) {
     if (coords_out != NULL) {
@@ -584,6 +615,8 @@ static trellis_status quantize_cascade_coords(
     }
     if (decoder_coords == NULL || decoder_n <= 0 || lr_resolution <= 0 ||
         hr_resolution <= 0 || coords_out == NULL || n_out == NULL ||
+        (quantization != TRELLIS_CASCADE_COORD_QUANTIZE_TRELLIS &&
+         quantization != TRELLIS_CASCADE_COORD_QUANTIZE_PIXAL) ||
         decoder_n > INT64_MAX / 4) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
@@ -600,6 +633,11 @@ static trellis_status quantize_cascade_coords(
         for (int axis = 0; axis < 3; ++axis) {
             const int32_t c = decoder_coords[(size_t) i * 4u + 1u + (size_t) axis];
             int q = (int) floorf((((float) c + 0.5f) / (float) lr_resolution) * (float) hr_slat_edge);
+            if (quantization == TRELLIS_CASCADE_COORD_QUANTIZE_PIXAL) {
+                q = (int) roundf(
+                    (((float) c + 0.5f) / (float) lr_resolution) *
+                    (float) (hr_slat_edge - 1));
+            }
             if (q < 0) q = 0;
             if (q >= hr_slat_edge) q = hr_slat_edge - 1;
             tmp[(size_t) i * 4u + 1u + (size_t) axis] = (int32_t) q;
@@ -975,17 +1013,20 @@ static int run_vkmesh_postprocess_command(
     int remesh_resolution,
     float remesh_band,
     float remesh_project,
-    int device) {
+    int device,
+    int gpu_workspace_budget_mib) {
     char target[64];
     char remesh_resolution_buf[64];
     char remesh_band_buf[64];
     char remesh_project_buf[64];
     char device_buf[64];
+    char workspace_budget_buf[64];
     snprintf(target, sizeof(target), "%d", decimation_target > 0 ? decimation_target : 1000000);
     snprintf(remesh_resolution_buf, sizeof(remesh_resolution_buf), "%d", remesh_resolution > 0 ? remesh_resolution : 1024);
     snprintf(remesh_band_buf, sizeof(remesh_band_buf), "%.9g", remesh_band > 0.0f ? remesh_band : 1.0f);
     snprintf(remesh_project_buf, sizeof(remesh_project_buf), "%.9g", remesh_project > 0.0f ? remesh_project : 0.0f);
     snprintf(device_buf, sizeof(device_buf), "%d", device >= 0 ? device : 0);
+    snprintf(workspace_budget_buf, sizeof(workspace_budget_buf), "%d", gpu_workspace_budget_mib > 0 ? gpu_workspace_budget_mib : 0);
     char sibling_vkmesh[PATH_MAX];
     const char * exe = vkmesh_path != NULL && vkmesh_path[0] != '\0' ? vkmesh_path : NULL;
     if (exe == NULL) {
@@ -1009,7 +1050,7 @@ static int run_vkmesh_postprocess_command(
         exe = "vkmesh";
     }
     TRELLIS_INFO("mesh postprocess: using vkmesh executable %s", exe);
-    char * argv[30];
+    char * argv[32];
     int argc = 0;
     argv[argc++] = (char *) exe;
     argv[argc++] = (char *) "--input";
@@ -1023,6 +1064,8 @@ static int run_vkmesh_postprocess_command(
     argv[argc++] = (char *) "--postprocess";
     argv[argc++] = (char *) "--device";
     argv[argc++] = device_buf;
+    argv[argc++] = (char *) "--gpu-workspace-budget-mib";
+    argv[argc++] = workspace_budget_buf;
     if (remesh) {
         argv[argc++] = (char *) "--remesh";
         argv[argc++] = (char *) "--remesh-resolution";
@@ -1056,7 +1099,8 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     int remesh_resolution,
     float remesh_band,
     float remesh_project,
-    int device) {
+    int device,
+    int gpu_workspace_budget_mib) {
     if (mesh == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
         mesh->n_vertices <= 0 || mesh->n_faces <= 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
@@ -1076,6 +1120,7 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     vkmesh_options.remesh_band = remesh_band > 0.0f ? remesh_band : 1.0f;
     vkmesh_options.remesh_project = remesh_project > 0.0f ? remesh_project : 0.0f;
     vkmesh_options.device = device >= 0 ? device : 0;
+    vkmesh_options.gpu_workspace_budget_mib = gpu_workspace_budget_mib > 0 ? gpu_workspace_budget_mib : 0;
 
     trellis_mesh_host processed;
     trellis_mesh_host projection;
@@ -1083,8 +1128,9 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     memset(&projection, 0, sizeof(projection));
 
     TRELLIS_INFO(
-        "mesh postprocess: running vkmesh C API device=%d target=%d no_simplify=%d remesh=%d resolution=%d band=%.9g project=%.9g input_faces=%lld",
+        "mesh postprocess: running vkmesh C API device=%d workspace_budget_mib=%d target=%d no_simplify=%d remesh=%d resolution=%d band=%.9g project=%.9g input_faces=%lld",
         vkmesh_options.device,
+        vkmesh_options.gpu_workspace_budget_mib,
         vkmesh_options.decimation_target,
         no_simplify ? 1 : 0,
         vkmesh_options.remesh,
@@ -1142,8 +1188,9 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     }
 
     TRELLIS_INFO(
-        "mesh postprocess: running vkmesh device=%d target=%d no_simplify=%d remesh=%d resolution=%d band=%.9g project=%.9g input_faces=%lld",
+        "mesh postprocess: running vkmesh device=%d workspace_budget_mib=%d target=%d no_simplify=%d remesh=%d resolution=%d band=%.9g project=%.9g input_faces=%lld",
         device >= 0 ? device : 0,
+        gpu_workspace_budget_mib > 0 ? gpu_workspace_budget_mib : 0,
         decimation_target > 0 ? decimation_target : 1000000,
         no_simplify ? 1 : 0,
         remesh ? 1 : 0,
@@ -1162,7 +1209,8 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
             remesh_resolution,
             remesh_band,
             remesh_project,
-            device)) {
+            device,
+            gpu_workspace_budget_mib)) {
         TRELLIS_ERROR("mesh postprocess: vkmesh failed; pass --vkmesh /path/to/vkmesh if it is not in PATH");
         unlink_if_set(input_mesh);
         unlink_if_set(output_mesh);
@@ -1206,14 +1254,43 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
 }
 
 trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_options * options) {
-    if (options == NULL || options->model_dir == NULL || options->dino_dir == NULL ||
-        options->image_path == NULL || options->device < 0) {
+    trellis_pixal3d_options pixal_options = TRELLIS_PIXAL3D_OPTIONS_INIT;
+    return trellis_pipeline_image_to_gltf_ex(options, &pixal_options);
+}
+
+trellis_status trellis_pipeline_image_to_gltf_ex(
+    const trellis_image_to_gltf_options * options,
+    const trellis_pixal3d_options * pixal_options) {
+    if (pixal_options == NULL ||
+        pixal_options->struct_size < TRELLIS_PIXAL3D_OPTIONS_V1_SIZE ||
+        !isfinite(pixal_options->camera_angle_x) ||
+        !isfinite(pixal_options->camera_distance) ||
+        !isfinite(pixal_options->mesh_scale) ||
+        pixal_options->camera_angle_x >= 3.14159265358979323846f ||
+        options == NULL || options->model_dir == NULL || options->dino_dir == NULL ||
+        options->image_path == NULL || options->device < 0 ||
+        options->vkmesh_gpu_workspace_budget_mib < 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
+    const char * pixal_naf_path = pixal_options->naf_path;
+    const float pixal_camera_angle_x = pixal_options->camera_angle_x > 0.0f ?
+        pixal_options->camera_angle_x : 0.8575560450553894f;
+    const float pixal_camera_distance = pixal_options->camera_distance > 0.0f ?
+        pixal_options->camera_distance : 2.0f;
+    const float pixal_mesh_scale = pixal_options->mesh_scale > 0.0f ?
+        pixal_options->mesh_scale : 1.0f;
     const char * output_gltf_path =
         options->gltf_path != NULL && options->gltf_path[0] != '\0' ?
             options->gltf_path :
             "output.glb";
+
+    const int pixal_checkpoint =
+        trellis_pipeline_sparse_structure_checkpoint_uses_pixal_projection(options->model_dir);
+    if (pixal_checkpoint && options->model_cache &&
+        model_cache_budget_bytes_from_options(options) == 0) {
+        TRELLIS_WARN(
+            "pipeline: Pixal3D with an unlimited model cache can have a large NAF/1024 workspace peak; use --no-model-cache or --model-cache-budget-mib N on memory-constrained devices");
+    }
 
     char temp_image[4096];
     char temp_birefnet_image[4096];
@@ -1254,6 +1331,23 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
             return TRELLIS_STATUS_IO_ERROR;
         }
         sparse_structure_image_path = temp_image;
+    }
+    if (pixal_checkpoint &&
+        (options->birefnet_path == NULL || options->birefnet_path[0] == '\0')) {
+        int has_transparent_alpha = 0;
+        status = image_has_transparent_alpha(
+            sparse_structure_image_path,
+            &has_transparent_alpha);
+        if (status != TRELLIS_STATUS_OK) {
+            unlink_if_set(temp_image);
+            return status;
+        }
+        if (!has_transparent_alpha) {
+            TRELLIS_ERROR(
+                "pipeline: Pixal3D requires foreground-isolated input; provide --birefnet FILE or a transparent RGBA image");
+            unlink_if_set(temp_image);
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
+        }
     }
     if (options->birefnet_path != NULL && options->birefnet_path[0] != '\0') {
         if (!trellis_make_temp_path(
@@ -1335,6 +1429,7 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     TRELLIS_INFO("SparseUnet backend: %s device=%d", sparse_backend_kind_name(sparse_backend_kind), sparse_device);
 
     trellis_sparse_structure_result sparse_structure_result;
+    trellis_image_condition_result cond_shape_512;
     trellis_image_condition_result cond_1024;
     trellis_structured_latent shape_latent;
     trellis_structured_latent shape_latent_lr;
@@ -1345,6 +1440,7 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     trellis_mesh_host gltf_projection_mesh;
     trellis_pipeline_model_cache model_cache;
     memset(&sparse_structure_result, 0, sizeof(sparse_structure_result));
+    memset(&cond_shape_512, 0, sizeof(cond_shape_512));
     memset(&cond_1024, 0, sizeof(cond_1024));
     memset(&shape_latent, 0, sizeof(shape_latent));
     memset(&shape_latent_lr, 0, sizeof(shape_latent_lr));
@@ -1362,10 +1458,19 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     int32_t * cascade_coords = NULL;
     int64_t cascade_n = 0;
     int use_ggml_flash_attn = options->no_ggml_flash_attn ? 0 : 1;
+    if (pixal_checkpoint && !options->use_ggml_flash_attn) {
+        /* Pixal3D checkpoints use BF16 transformer activations. The current
+           ggml flash path narrows F32 K/V to FP16 and can overflow to NaN on
+           the long 1024 sparse sequence. Keep TRELLIS.2 defaults unchanged. */
+        use_ggml_flash_attn = 0;
+    }
     if (options->use_ggml_flash_attn) {
         use_ggml_flash_attn = 1;
     }
-    TRELLIS_INFO("ggml flash attention: %s", use_ggml_flash_attn ? "enabled" : "disabled");
+    TRELLIS_INFO(
+        "ggml flash attention: %s%s",
+        use_ggml_flash_attn ? "enabled" : "disabled",
+        pixal_checkpoint && !options->use_ggml_flash_attn ? " (Pixal3D safe default)" : "");
 
     const char * pipeline_type =
         options->pipeline_type != NULL && options->pipeline_type[0] != '\0' ?
@@ -1389,6 +1494,11 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
             final_resolution = 1024;
             sparse_cond_resolution = 512;
             sparse_output_resolution = 32;
+        } else if (strcmp(pipeline_type, "1536_cascade") == 0) {
+            use_1024_cascade = 1;
+            final_resolution = 1536;
+            sparse_cond_resolution = 512;
+            sparse_output_resolution = 32;
         } else {
             TRELLIS_ERROR("pipeline: unsupported --pipeline '%s'", pipeline_type);
             status = TRELLIS_STATUS_INVALID_ARGUMENT;
@@ -1397,7 +1507,9 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     }
     TRELLIS_INFO(
         "pipeline: type=%s final_resolution=%d sparse_cond=%d sparse_resolution=%d",
-        use_1024_cascade ? "1024_cascade" : (final_resolution == 1024 ? "1024" : "512"),
+        use_1024_cascade ?
+            (final_resolution == 1536 ? "1536_cascade" : "1024_cascade") :
+            (final_resolution == 1024 ? "1024" : "512"),
         final_resolution,
         sparse_cond_resolution,
         sparse_output_resolution);
@@ -1432,6 +1544,9 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     sparse_structure.flow_no_rope = options->flow_no_rope;
     sparse_structure.use_ggml_flash_attn = use_ggml_flash_attn;
     sparse_structure.voxel_threshold = 0.0f;
+    sparse_structure.camera_angle_x = pixal_camera_angle_x;
+    sparse_structure.camera_distance = pixal_camera_distance;
+    sparse_structure.mesh_scale = pixal_mesh_scale;
     sparse_structure.backend = &graph_backend;
     sparse_structure.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
     sparse_structure.cache = model_cache_ptr;
@@ -1450,6 +1565,46 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
         status = TRELLIS_STATUS_ERROR;
         goto cleanup;
     }
+    if (sparse_structure_result.projected_conditioning && !use_1024_cascade) {
+        TRELLIS_ERROR(
+            "pipeline: Pixal3D checkpoints require a cascade pipeline (use --pipeline 1024_cascade or 1536_cascade)");
+        status = TRELLIS_STATUS_INVALID_ARGUMENT;
+        goto cleanup;
+    }
+
+    const float * shape_lr_cond = sparse_structure_result.cond;
+    int shape_lr_cond_tokens = sparse_structure_result.cond_tokens;
+    if (sparse_structure_result.projected_conditioning) {
+        TRELLIS_INFO("[2a/5] Pixal3D DINOv3 + NAF -> shape-512 projected condition");
+        trellis_image_condition_options cond_options;
+        memset(&cond_options, 0, sizeof(cond_options));
+        cond_options.model_dir = options->model_dir;
+        cond_options.dino_dir = options->dino_dir;
+        cond_options.image_path = sparse_structure_image_path;
+        cond_options.naf_path = pixal_naf_path;
+        cond_options.cond_resolution = 512;
+        cond_options.projection_grid_resolution = 32;
+        cond_options.projection_channels = 2048;
+        cond_options.naf_target_resolution = 512;
+        cond_options.projection_coords_bxyz = sparse_structure_result.coords_bxyz;
+        cond_options.projection_n_coords = sparse_structure_result.n_coords;
+        cond_options.camera_angle_x = sparse_structure.camera_angle_x;
+        cond_options.camera_distance = sparse_structure.camera_distance;
+        cond_options.mesh_scale = sparse_structure.mesh_scale;
+        cond_options.backend = &graph_backend;
+        cond_options.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
+        cond_options.sparse_backend = shared_sparse_backend;
+        cond_options.cache = model_cache_ptr;
+        perf_start_us = ggml_time_us();
+        status = trellis_pipeline_run_image_condition(&cond_options, &cond_shape_512);
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
+        trellis_pipeline_model_cache_unpin_all(model_cache_ptr);
+        trellis_perf_stage_log("pixal_cond_shape_512", ggml_time_us() - perf_start_us);
+        shape_lr_cond = cond_shape_512.cond;
+        shape_lr_cond_tokens = cond_shape_512.cond_tokens;
+    }
 
     TRELLIS_INFO(
         "[2/5] SLatFlowModel image -> shape SLat tokens=%lld cond_tokens=%d resolution=%d",
@@ -1465,8 +1620,11 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     structured_latent.normalization_key = "shape_slat_normalization";
     structured_latent.coords_bxyz = sparse_structure_result.coords_bxyz;
     structured_latent.n_coords = sparse_structure_result.n_coords;
-    structured_latent.cond = sparse_structure_result.cond;
-    structured_latent.cond_tokens = sparse_structure_result.cond_tokens;
+    structured_latent.cond = shape_lr_cond;
+    structured_latent.cond_tokens = shape_lr_cond_tokens;
+    structured_latent.projected_cond = cond_shape_512.projected;
+    structured_latent.projected_tokens = cond_shape_512.projected_tokens;
+    structured_latent.projected_channels = cond_shape_512.projected_channels;
     structured_latent.noise_seed = options->noise_seed == 0 ? 18u : options->noise_seed;
     structured_latent.resolution = use_1024_cascade ? 512 : final_resolution;
     structured_latent.steps = options->structured_latent_steps > 0 ? options->structured_latent_steps : 12;
@@ -1487,7 +1645,7 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     structured_latent.flow_blocks_override = options->flow_blocks_override;
     structured_latent.flow_block_parts_override = options->flow_block_parts_override;
     structured_latent.flow_no_rope = options->flow_no_rope;
-    structured_latent.emulate_bf16_blocks = options->emulate_bf16_blocks;
+    structured_latent.emulate_bf16_blocks = options->emulate_bf16_blocks || pixal_checkpoint;
     structured_latent.use_ggml_flash_attn = use_ggml_flash_attn;
     structured_latent.backend = &graph_backend;
     structured_latent.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
@@ -1502,27 +1660,11 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     trellis_perf_stage_log(
         use_1024_cascade ? "shape_slat_denoise_lr512" : "shape_slat_denoise",
         ggml_time_us() - perf_start_us);
+    trellis_image_condition_result_free(&cond_shape_512);
 
     if (use_1024_cascade) {
         shape_latent_lr = shape_latent;
         memset(&shape_latent, 0, sizeof(shape_latent));
-
-        TRELLIS_INFO("[2a/5] DINOv3 image encoder -> 1024 condition");
-        trellis_image_condition_options cond_options;
-        memset(&cond_options, 0, sizeof(cond_options));
-        cond_options.dino_dir = options->dino_dir;
-        cond_options.image_path = sparse_structure_image_path;
-        cond_options.cond_resolution = 1024;
-        cond_options.backend = &graph_backend;
-        cond_options.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
-        cond_options.cache = model_cache_ptr;
-        perf_start_us = ggml_time_us();
-        status = trellis_pipeline_run_image_condition(&cond_options, &cond_1024);
-        if (status != TRELLIS_STATUS_OK) {
-            goto cleanup;
-        }
-        trellis_pipeline_model_cache_unpin_all(model_cache_ptr);
-        trellis_perf_stage_log("dino_cond_1024", ggml_time_us() - perf_start_us);
 
         TRELLIS_INFO("[2b/5] FlexiDualGridVaeDecoder 512 shape SLat -> cascade HR coords");
         trellis_pipeline_mesh_options cascade_upsample_options;
@@ -1549,13 +1691,30 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
         trellis_pipeline_model_cache_unpin_all(model_cache_ptr);
         trellis_perf_stage_log("shape_cascade_decode_coords", ggml_time_us() - perf_start_us);
         const int64_t decoded_coord_count = cascade_decoder_n;
-        status = quantize_cascade_coords(
-            cascade_decoder_coords,
-            cascade_decoder_n,
-            512,
-            1024,
-            &cascade_coords,
-            &cascade_n);
+        int actual_hr_resolution = final_resolution;
+        for (;;) {
+            free(cascade_coords);
+            cascade_coords = NULL;
+            cascade_n = 0;
+            status = trellis_pipeline_quantize_cascade_coords(
+                cascade_decoder_coords,
+                cascade_decoder_n,
+                512,
+                actual_hr_resolution,
+                sparse_structure_result.projected_conditioning ?
+                    TRELLIS_CASCADE_COORD_QUANTIZE_PIXAL :
+                    TRELLIS_CASCADE_COORD_QUANTIZE_TRELLIS,
+                &cascade_coords,
+                &cascade_n);
+            if (status != TRELLIS_STATUS_OK || options->max_num_tokens <= 0 ||
+                cascade_n < options->max_num_tokens || actual_hr_resolution == 1024) {
+                break;
+            }
+            actual_hr_resolution -= 128;
+            if (actual_hr_resolution < 1024) {
+                actual_hr_resolution = 1024;
+            }
+        }
         free(cascade_decoder_coords);
         cascade_decoder_coords = NULL;
         cascade_decoder_n = 0;
@@ -1563,36 +1722,80 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
             goto cleanup;
         }
         TRELLIS_INFO(
-            "pipeline cascade: decoder_coords=%lld quantized_shape_tokens=%lld",
+            "pipeline cascade: decoder_coords=%lld quantized_shape_tokens=%lld resolution=%d",
             (long long) decoded_coord_count,
-            (long long) cascade_n);
+            (long long) cascade_n,
+            actual_hr_resolution);
         if (options->max_num_tokens > 0 && cascade_n > options->max_num_tokens) {
             TRELLIS_WARN(
-                "pipeline cascade: quantized tokens %lld exceed max_num_tokens=%d; matching PyTorch 1024_cascade keeps resolution 1024",
+                "pipeline cascade: quantized tokens %lld exceed max_num_tokens=%d at minimum resolution 1024",
                 (long long) cascade_n,
                 options->max_num_tokens);
         }
         trellis_structured_latent_free(&shape_latent_lr);
 
         TRELLIS_INFO(
-            "[2c/5] SLatFlowModel 1024 image -> shape SLat tokens=%lld cond_tokens=%d",
+            sparse_structure_result.projected_conditioning ?
+                "[2c/5] Pixal3D DINOv3 + NAF -> shape-1024 projected condition" :
+                "[2c/5] DINOv3 image encoder -> 1024 condition");
+        trellis_image_condition_options cond_options;
+        memset(&cond_options, 0, sizeof(cond_options));
+        cond_options.model_dir = options->model_dir;
+        cond_options.dino_dir = options->dino_dir;
+        cond_options.image_path = sparse_structure_image_path;
+        cond_options.naf_path = pixal_naf_path;
+        cond_options.cond_resolution = 1024;
+        if (sparse_structure_result.projected_conditioning) {
+            cond_options.projection_grid_resolution = actual_hr_resolution / 16;
+            cond_options.projection_channels = 2048;
+            cond_options.naf_target_resolution = 512;
+            cond_options.projection_coords_bxyz = cascade_coords;
+            cond_options.projection_n_coords = cascade_n;
+            cond_options.camera_angle_x = sparse_structure.camera_angle_x;
+            cond_options.camera_distance = sparse_structure.camera_distance;
+            cond_options.mesh_scale = sparse_structure.mesh_scale;
+        }
+        cond_options.backend = &graph_backend;
+        cond_options.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
+        cond_options.sparse_backend = shared_sparse_backend;
+        cond_options.cache = model_cache_ptr;
+        perf_start_us = ggml_time_us();
+        status = trellis_pipeline_run_image_condition(&cond_options, &cond_1024);
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
+        trellis_pipeline_model_cache_unpin_all(model_cache_ptr);
+        trellis_perf_stage_log(
+            sparse_structure_result.projected_conditioning ?
+                "pixal_cond_shape_1024" : "dino_cond_1024",
+            ggml_time_us() - perf_start_us);
+
+        TRELLIS_INFO(
+            "[2c/5] SLatFlowModel 1024 image -> shape SLat tokens=%lld cond_tokens=%d resolution=%d",
             (long long) cascade_n,
-            cond_1024.cond_tokens);
+            cond_1024.cond_tokens,
+            actual_hr_resolution);
         trellis_structured_latent_options hr_shape_options = structured_latent;
-        hr_shape_options.label = "shape1024";
+        hr_shape_options.label = actual_hr_resolution == 1024 ? "shape1024" : "shape_hr";
         hr_shape_options.coords_bxyz = cascade_coords;
         hr_shape_options.n_coords = cascade_n;
         hr_shape_options.cond = cond_1024.cond;
         hr_shape_options.cond_tokens = cond_1024.cond_tokens;
+        hr_shape_options.projected_cond = cond_1024.projected;
+        hr_shape_options.projected_tokens = cond_1024.projected_tokens;
+        hr_shape_options.projected_channels = cond_1024.projected_channels;
         hr_shape_options.noise_seed = options->noise_seed == 0 ? 19u : options->noise_seed + 1u;
-        hr_shape_options.resolution = 1024;
+        hr_shape_options.resolution = actual_hr_resolution;
         perf_start_us = ggml_time_us();
         status = trellis_pipeline_run_structured_latent(&hr_shape_options, &shape_latent);
         if (status != TRELLIS_STATUS_OK) {
             goto cleanup;
         }
         trellis_pipeline_model_cache_unpin_all(model_cache_ptr);
-        trellis_perf_stage_log("shape_slat_denoise_hr1024", ggml_time_us() - perf_start_us);
+        trellis_perf_stage_log(
+            actual_hr_resolution == 1024 ?
+                "shape_slat_denoise_hr1024" : "shape_slat_denoise_hr_dynamic",
+            ggml_time_us() - perf_start_us);
     }
 
     TRELLIS_INFO("[3/5] FlexiDualGridVaeDecoder shape SLat -> mesh/subdivision guides");
@@ -1617,6 +1820,22 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     }
     trellis_pipeline_model_cache_unpin_all(model_cache_ptr);
     trellis_perf_stage_log("shape_slat_decode", ggml_time_us() - perf_start_us);
+    if (shared_sparse_backend != NULL) {
+        size_t released_bytes = 0;
+        status = trellis_sparse_backend_trim(
+            shared_sparse_backend,
+            TRELLIS_SPARSE_TRIM_FREE_BUFFERS | TRELLIS_SPARSE_TRIM_WEIGHTS,
+            &released_bytes);
+        if (status != TRELLIS_STATUS_OK) {
+            TRELLIS_ERROR(
+                "SparseUnet Vulkan decoder backend: post-shape trim failed: %s",
+                trellis_status_string(status));
+            goto cleanup;
+        }
+        TRELLIS_INFO(
+            "SparseUnet Vulkan decoder backend: released %.1f MiB of inactive shape buffers; subdivision guides retained",
+            (double) released_bytes / (1024.0 * 1024.0));
+    }
     if (material_dump_dir != NULL && material_dump_dir[0] != '\0') {
         char raw_mesh_path[4096];
         if (!make_material_dump_path(raw_mesh_path, sizeof(raw_mesh_path), material_dump_dir, "raw.meshbin")) {
@@ -1640,16 +1859,54 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
             options->mesh_remesh_resolution > 0 ? options->mesh_remesh_resolution : shape_latent.resolution,
             options->mesh_remesh_band > 0.0f ? options->mesh_remesh_band : 1.0f,
             options->mesh_remesh_project > 0.0f ? options->mesh_remesh_project : 0.0f,
-            options->device);
+            options->device,
+            options->vkmesh_gpu_workspace_budget_mib);
         if (status != TRELLIS_STATUS_OK) {
             goto cleanup;
         }
     }
 
+    const float * texture_cond = use_1024_cascade ?
+        cond_1024.cond : sparse_structure_result.cond;
+    int texture_cond_tokens = use_1024_cascade ?
+        cond_1024.cond_tokens : sparse_structure_result.cond_tokens;
+    if (sparse_structure_result.projected_conditioning) {
+        trellis_image_condition_result_free(&cond_1024);
+        TRELLIS_INFO("[4a/5] Pixal3D DINOv3 + NAF -> texture projected condition");
+        trellis_image_condition_options cond_options;
+        memset(&cond_options, 0, sizeof(cond_options));
+        cond_options.model_dir = options->model_dir;
+        cond_options.dino_dir = options->dino_dir;
+        cond_options.image_path = sparse_structure_image_path;
+        cond_options.naf_path = pixal_naf_path;
+        cond_options.cond_resolution = 1024;
+        cond_options.projection_grid_resolution = shape_latent.resolution / 16;
+        cond_options.projection_channels = 2048;
+        cond_options.naf_target_resolution = 1024;
+        cond_options.projection_coords_bxyz = shape_latent.coords_bxyz;
+        cond_options.projection_n_coords = shape_latent.n_coords;
+        cond_options.camera_angle_x = sparse_structure.camera_angle_x;
+        cond_options.camera_distance = sparse_structure.camera_distance;
+        cond_options.mesh_scale = sparse_structure.mesh_scale;
+        cond_options.backend = &graph_backend;
+        cond_options.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
+        cond_options.sparse_backend = shared_sparse_backend;
+        cond_options.cache = model_cache_ptr;
+        perf_start_us = ggml_time_us();
+        status = trellis_pipeline_run_image_condition(&cond_options, &cond_1024);
+        if (status != TRELLIS_STATUS_OK) {
+            goto cleanup;
+        }
+        trellis_pipeline_model_cache_unpin_all(model_cache_ptr);
+        trellis_perf_stage_log("pixal_cond_texture", ggml_time_us() - perf_start_us);
+        texture_cond = cond_1024.cond;
+        texture_cond_tokens = cond_1024.cond_tokens;
+    }
+
     TRELLIS_INFO(
         "[4/5] SLatFlowModel image+shape -> texture SLat tokens=%lld cond_tokens=%d resolution=%d",
         (long long) shape_latent.n_coords,
-        use_1024_cascade ? cond_1024.cond_tokens : sparse_structure_result.cond_tokens,
+        texture_cond_tokens,
         shape_latent.resolution);
     trellis_structured_latent_options texture_options;
     memset(&texture_options, 0, sizeof(texture_options));
@@ -1659,8 +1916,11 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     texture_options.normalization_key = "tex_slat_normalization";
     texture_options.coords_bxyz = shape_latent.coords_bxyz;
     texture_options.n_coords = shape_latent.n_coords;
-    texture_options.cond = use_1024_cascade ? cond_1024.cond : sparse_structure_result.cond;
-    texture_options.cond_tokens = use_1024_cascade ? cond_1024.cond_tokens : sparse_structure_result.cond_tokens;
+    texture_options.cond = texture_cond;
+    texture_options.cond_tokens = texture_cond_tokens;
+    texture_options.projected_cond = cond_1024.projected;
+    texture_options.projected_tokens = cond_1024.projected_tokens;
+    texture_options.projected_channels = cond_1024.projected_channels;
     texture_options.concat_cond = shape_latent.feats;
     texture_options.concat_channels = shape_latent.channels;
     texture_options.noise_seed = options->noise_seed == 0 ? (use_1024_cascade ? 20u : 19u) : options->noise_seed + (use_1024_cascade ? 2u : 1u);
@@ -1674,7 +1934,7 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
     texture_options.flow_blocks_override = options->flow_blocks_override;
     texture_options.flow_block_parts_override = options->flow_block_parts_override;
     texture_options.flow_no_rope = options->flow_no_rope;
-    texture_options.emulate_bf16_blocks = options->emulate_bf16_blocks;
+    texture_options.emulate_bf16_blocks = options->emulate_bf16_blocks || pixal_checkpoint;
     texture_options.use_ggml_flash_attn = use_ggml_flash_attn;
     texture_options.backend = &graph_backend;
     texture_options.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
@@ -1715,6 +1975,12 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
         (long long) pbr_voxels.n_coords,
         pbr_voxels.channels,
         pbr_voxels.resolution);
+    if (shared_sparse_backend != NULL) {
+        trellis_sparse_c2s_guides_free(&shape_subs);
+        trellis_sparse_backend_destroy(shared_sparse_backend);
+        shared_sparse_backend = NULL;
+        TRELLIS_INFO("SparseUnet Vulkan decoder backend: released after texture decode");
+    }
 
     if (material_dump_dir != NULL && material_dump_dir[0] != '\0') {
         const trellis_mesh_host * sample_mesh =
@@ -1752,6 +2018,7 @@ cleanup:
     trellis_structured_latent_free(&texture_latent);
     trellis_structured_latent_free(&shape_latent_lr);
     trellis_structured_latent_free(&shape_latent);
+    trellis_image_condition_result_free(&cond_shape_512);
     trellis_image_condition_result_free(&cond_1024);
     trellis_sparse_structure_result_free(&sparse_structure_result);
     if (model_cache_initialized) {

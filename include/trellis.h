@@ -82,6 +82,7 @@ typedef enum trellis_dtype {
     TRELLIS_DTYPE_I32,
     TRELLIS_DTYPE_U8,
     TRELLIS_DTYPE_BOOL,
+    TRELLIS_DTYPE_C64,
 } trellis_dtype;
 
 const char * trellis_dtype_name(trellis_dtype dtype);
@@ -720,6 +721,7 @@ typedef struct trellis_vkmesh_postprocess_options {
     float remesh_band;           /* default 1.0 */
     float remesh_project;        /* default 0.0 for TRELLIS.2 examples */
     int device;                  /* Vulkan physical-device index, default 0 */
+    int gpu_workspace_budget_mib; /* 0=automatic, hard cap for vkmesh VkDeviceMemory workspace */
 } trellis_vkmesh_postprocess_options;
 
 trellis_status trellis_vkmesh_postprocess(
@@ -781,9 +783,29 @@ typedef struct trellis_image_to_gltf_options {
     int model_cache;
     int model_cache_budget_mib;
     const char * vkmesh_path;
+    int vkmesh_gpu_workspace_budget_mib; /* 0=automatic */
 } trellis_image_to_gltf_options;
 
+typedef struct trellis_pixal3d_options {
+    size_t struct_size;           /* set to sizeof(trellis_pixal3d_options) */
+    const char * naf_path;        /* NULL/empty: search model_dir/ckpts automatically */
+    float camera_angle_x;         /* horizontal FOV in radians; <=0 uses 0.857556 */
+    float camera_distance;        /* <=0 uses 2 */
+    float mesh_scale;             /* <=0 uses 1 */
+} trellis_pixal3d_options;
+
+#define TRELLIS_PIXAL3D_OPTIONS_V1_SIZE \
+    (offsetof(trellis_pixal3d_options, mesh_scale) + sizeof(float))
+#define TRELLIS_PIXAL3D_OPTIONS_INIT \
+    { sizeof(trellis_pixal3d_options), NULL, 0.0f, 0.0f, 0.0f }
+
+/* Legacy entry point: Pixal3D uses the default camera and automatic NAF lookup. */
 trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_options * options);
+
+/* Extended entry point for an explicit NAF path or Pixal3D camera parameters. */
+trellis_status trellis_pipeline_image_to_gltf_ex(
+    const trellis_image_to_gltf_options * options,
+    const trellis_pixal3d_options * pixal_options);
 
 #include "trellis_ggml_layers.h"
 #include "trellis_flow_sampler.h"

@@ -157,11 +157,11 @@ static trellis_status make_slat_flow_path(
     }
     const char * rel = NULL;
     if (component == TRELLIS_COMPONENT_TEX_SLAT_FLOW) {
-        rel = resolution == 1024 ?
+        rel = resolution >= 1024 ?
             "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors" :
             "ckpts/slat_flow_imgshape2tex_dit_1_3B_512_bf16.safetensors";
     } else {
-        rel = resolution == 1024 ?
+        rel = resolution >= 1024 ?
             "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors" :
             "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors";
     }
@@ -320,14 +320,14 @@ trellis_status trellis_pipeline_model_cache_get_dino(
     return TRELLIS_STATUS_OK;
 }
 
-trellis_status trellis_pipeline_model_cache_get_sparse_structure_flow(
+trellis_status trellis_pipeline_model_cache_get_sparse_structure_flow_model(
     trellis_pipeline_model_cache * cache,
     const char * model_dir,
-    const trellis_dit_flow_weights ** weights_out) {
-    if (weights_out == NULL) {
+    const trellis_dit_flow_model ** model_out) {
+    if (model_out == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
-    *weights_out = NULL;
+    *model_out = NULL;
     char path[4096];
     trellis_status status = trellis_make_model_path(
         model_dir,
@@ -347,7 +347,11 @@ trellis_status trellis_pipeline_model_cache_get_sparse_structure_flow(
             return TRELLIS_STATUS_ERROR;
         }
         char issue[256];
-        status = trellis_ss_flow_bind_weights(&entry->store, &entry->weights.flow, issue, sizeof(issue));
+        status = trellis_ss_flow_model_bind_weights(
+            &entry->store,
+            &entry->weights.flow_model,
+            issue,
+            sizeof(issue));
         if (status != TRELLIS_STATUS_OK) {
             TRELLIS_ERROR("sparse-structure flow: bind failed: %s%s%s",
                 trellis_status_string(status), issue[0] == '\0' ? "" : " ", issue);
@@ -356,12 +360,34 @@ trellis_status trellis_pipeline_model_cache_get_sparse_structure_flow(
         }
         TRELLIS_INFO(
             "sparse-structure flow: ready blocks=%d channels=%d",
-            entry->weights.flow.n_blocks,
-            entry->weights.flow.in_channels);
+            entry->weights.flow_model.base.n_blocks,
+            entry->weights.flow_model.base.in_channels);
+        if (entry->weights.flow_model.projection.enabled) {
+            TRELLIS_INFO(
+                "sparse-structure flow: Pixal3D projection channels=%d",
+                entry->weights.flow_model.projection.proj_channels);
+        }
         cache_finish_load(cache, entry);
     }
-    *weights_out = &entry->weights.flow;
+    *model_out = &entry->weights.flow_model;
     return TRELLIS_STATUS_OK;
+}
+
+trellis_status trellis_pipeline_model_cache_get_sparse_structure_flow(
+    trellis_pipeline_model_cache * cache,
+    const char * model_dir,
+    const trellis_dit_flow_weights ** weights_out) {
+    if (weights_out == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    *weights_out = NULL;
+    const trellis_dit_flow_model * model = NULL;
+    trellis_status status = trellis_pipeline_model_cache_get_sparse_structure_flow_model(
+        cache, model_dir, &model);
+    if (status == TRELLIS_STATUS_OK) {
+        *weights_out = &model->base;
+    }
+    return status;
 }
 
 trellis_status trellis_pipeline_model_cache_get_sparse_structure_decoder(
@@ -405,22 +431,22 @@ trellis_status trellis_pipeline_model_cache_get_sparse_structure_decoder(
     return TRELLIS_STATUS_OK;
 }
 
-trellis_status trellis_pipeline_model_cache_get_slat_flow(
+trellis_status trellis_pipeline_model_cache_get_slat_flow_model(
     trellis_pipeline_model_cache * cache,
     const char * model_dir,
     const char * override_path,
     trellis_model_component component,
     int resolution,
     const char * label,
-    const trellis_dit_flow_weights ** weights_out) {
-    if (weights_out == NULL) {
+    const trellis_dit_flow_model ** model_out) {
+    if (model_out == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
-    *weights_out = NULL;
+    *model_out = NULL;
     const int is_tex = component == TRELLIS_COMPONENT_TEX_SLAT_FLOW;
     trellis_pipeline_cache_entry * entry = is_tex ?
-        (resolution == 1024 ? &cache->texture_flow_1024 : &cache->texture_flow_512) :
-        (resolution == 1024 ? &cache->shape_flow_1024 : &cache->shape_flow_512);
+        (resolution >= 1024 ? &cache->texture_flow_1024 : &cache->texture_flow_512) :
+        (resolution >= 1024 ? &cache->shape_flow_1024 : &cache->shape_flow_512);
     char path[4096];
     trellis_status status = make_slat_flow_path(model_dir, override_path, component, resolution, path, sizeof(path));
     if (status != TRELLIS_STATUS_OK) {
@@ -438,8 +464,10 @@ trellis_status trellis_pipeline_model_cache_get_slat_flow(
         }
         char issue[256];
         status = is_tex ?
-            trellis_tex_slat_flow_bind_weights(&entry->store, &entry->weights.flow, issue, sizeof(issue)) :
-            trellis_shape_slat_flow_bind_weights(&entry->store, &entry->weights.flow, issue, sizeof(issue));
+            trellis_tex_slat_flow_model_bind_weights(
+                &entry->store, &entry->weights.flow_model, issue, sizeof(issue)) :
+            trellis_shape_slat_flow_model_bind_weights(
+                &entry->store, &entry->weights.flow_model, issue, sizeof(issue));
         if (status != TRELLIS_STATUS_OK) {
             TRELLIS_ERROR("structured-latent %s flow: bind failed: %s%s%s",
                 label != NULL ? label : "slat",
@@ -452,16 +480,49 @@ trellis_status trellis_pipeline_model_cache_get_slat_flow(
         TRELLIS_INFO(
             "structured-latent %s flow: ready blocks=%d in=%d out=%d cond=%d heads=%d head_dim=%d",
             label != NULL ? label : "slat",
-            entry->weights.flow.n_blocks,
-            entry->weights.flow.in_channels,
-            entry->weights.flow.out_channels,
-            entry->weights.flow.cond_channels,
-            entry->weights.flow.heads,
-            entry->weights.flow.head_dim);
+            entry->weights.flow_model.base.n_blocks,
+            entry->weights.flow_model.base.in_channels,
+            entry->weights.flow_model.base.out_channels,
+            entry->weights.flow_model.base.cond_channels,
+            entry->weights.flow_model.base.heads,
+            entry->weights.flow_model.base.head_dim);
+        if (entry->weights.flow_model.projection.enabled) {
+            TRELLIS_INFO(
+                "structured-latent %s flow: Pixal3D projection channels=%d",
+                label != NULL ? label : "slat",
+                entry->weights.flow_model.projection.proj_channels);
+        }
         cache_finish_load(cache, entry);
     }
-    *weights_out = &entry->weights.flow;
+    *model_out = &entry->weights.flow_model;
     return TRELLIS_STATUS_OK;
+}
+
+trellis_status trellis_pipeline_model_cache_get_slat_flow(
+    trellis_pipeline_model_cache * cache,
+    const char * model_dir,
+    const char * override_path,
+    trellis_model_component component,
+    int resolution,
+    const char * label,
+    const trellis_dit_flow_weights ** weights_out) {
+    if (weights_out == NULL) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    *weights_out = NULL;
+    const trellis_dit_flow_model * model = NULL;
+    trellis_status status = trellis_pipeline_model_cache_get_slat_flow_model(
+        cache,
+        model_dir,
+        override_path,
+        component,
+        resolution,
+        label,
+        &model);
+    if (status == TRELLIS_STATUS_OK) {
+        *weights_out = &model->base;
+    }
+    return status;
 }
 
 trellis_status trellis_pipeline_model_cache_get_shape_decoder(

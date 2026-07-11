@@ -2,6 +2,7 @@
 #define TRELLIS2_C_SRC_TRELLIS_PIPELINE_INTERNAL_H
 
 #include "trellis.h"
+#include "trellis_pixal_flow.h"
 
 typedef enum trellis_pipeline_cache_entry_kind {
     TRELLIS_PIPELINE_CACHE_ENTRY_DINO = 0,
@@ -21,7 +22,7 @@ typedef struct trellis_pipeline_cache_entry {
     trellis_tensor_store store;
     union {
         trellis_dino_vit_weights dino;
-        trellis_dit_flow_weights flow;
+        trellis_dit_flow_model flow_model;
         trellis_ss_decoder_weights ss_decoder;
         trellis_sparse_unet_vae_decoder_weights sparse_unet_decoder;
     } weights;
@@ -66,6 +67,11 @@ trellis_status trellis_pipeline_model_cache_get_sparse_structure_flow(
     const char * model_dir,
     const trellis_dit_flow_weights ** weights_out);
 
+trellis_status trellis_pipeline_model_cache_get_sparse_structure_flow_model(
+    trellis_pipeline_model_cache * cache,
+    const char * model_dir,
+    const trellis_dit_flow_model ** model_out);
+
 trellis_status trellis_pipeline_model_cache_get_sparse_structure_decoder(
     trellis_pipeline_model_cache * cache,
     const char * model_dir,
@@ -79,6 +85,15 @@ trellis_status trellis_pipeline_model_cache_get_slat_flow(
     int resolution,
     const char * label,
     const trellis_dit_flow_weights ** weights_out);
+
+trellis_status trellis_pipeline_model_cache_get_slat_flow_model(
+    trellis_pipeline_model_cache * cache,
+    const char * model_dir,
+    const char * override_path,
+    trellis_model_component component,
+    int resolution,
+    const char * label,
+    const trellis_dit_flow_model ** model_out);
 
 trellis_status trellis_pipeline_model_cache_get_shape_decoder(
     trellis_pipeline_model_cache * cache,
@@ -97,6 +112,7 @@ typedef struct trellis_sparse_structure_result {
     int resolution;
     float * cond;          /* [cond_tokens, 1024] */
     int cond_tokens;
+    int projected_conditioning;
 } trellis_sparse_structure_result;
 
 typedef struct trellis_sparse_structure_options {
@@ -113,6 +129,9 @@ typedef struct trellis_sparse_structure_options {
     int flow_no_rope;
     int use_ggml_flash_attn;
     float voxel_threshold;
+    float camera_angle_x;
+    float camera_distance;
+    float mesh_scale;
     const trellis_backend_context * backend;
     const trellis_cuda_context * cuda;
     trellis_pipeline_model_cache * cache;
@@ -124,18 +143,35 @@ trellis_status trellis_pipeline_run_sparse_structure(
     const trellis_sparse_structure_options * options,
     trellis_sparse_structure_result * result);
 
+int trellis_pipeline_sparse_structure_checkpoint_uses_pixal_projection(
+    const char * model_dir);
+
 typedef struct trellis_image_condition_result {
     float * cond; /* [cond_tokens, 1024] */
     int cond_tokens;
     int resolution;
+    float * projected; /* optional [projected_tokens, projected_channels] */
+    int64_t projected_tokens;
+    int projected_channels;
 } trellis_image_condition_result;
 
 typedef struct trellis_image_condition_options {
+    const char * model_dir;
     const char * dino_dir;
     const char * image_path;
+    const char * naf_path;
     int cond_resolution;
+    int projection_grid_resolution;
+    int projection_channels;
+    int naf_target_resolution;
+    const int32_t * projection_coords_bxyz;
+    int64_t projection_n_coords;
+    float camera_angle_x;
+    float camera_distance;
+    float mesh_scale;
     const trellis_backend_context * backend;
     const trellis_cuda_context * cuda;
+    void * sparse_backend; /* optional backend-native fused Pixal3D NAF executor */
     trellis_pipeline_model_cache * cache;
 } trellis_image_condition_options;
 
@@ -169,6 +205,10 @@ typedef struct trellis_structured_latent_options {
     const float * cond;
     int cond_tokens;
     const float * neg_cond;
+    const float * projected_cond;
+    const float * neg_projected_cond;
+    int64_t projected_tokens;
+    int projected_channels;
     const float * noise;
     const float * concat_cond;
     int concat_channels;
@@ -195,6 +235,20 @@ typedef struct trellis_structured_latent_options {
 trellis_status trellis_pipeline_run_structured_latent(
     const trellis_structured_latent_options * options,
     trellis_structured_latent * latent_out);
+
+typedef enum trellis_cascade_coord_quantization {
+    TRELLIS_CASCADE_COORD_QUANTIZE_TRELLIS = 0,
+    TRELLIS_CASCADE_COORD_QUANTIZE_PIXAL = 1,
+} trellis_cascade_coord_quantization;
+
+trellis_status trellis_pipeline_quantize_cascade_coords(
+    const int32_t * decoder_coords,
+    int64_t decoder_n,
+    int lr_resolution,
+    int hr_resolution,
+    trellis_cascade_coord_quantization quantization,
+    int32_t ** coords_out,
+    int64_t * n_out);
 
 typedef struct trellis_pipeline_mesh_options {
     const char * model_dir;

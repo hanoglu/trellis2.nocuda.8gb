@@ -120,6 +120,24 @@ struct ggml_tensor * trellis_ggml_cross_attention(
     struct ggml_tensor * out_w,
     struct ggml_tensor * out_b);
 
+/* Pixal3D ProjectAttention: global cross-attention plus a token-aligned projection. */
+struct ggml_tensor * trellis_ggml_project_attention(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,
+    struct ggml_tensor * global_context,
+    struct ggml_tensor * projected_context,
+    int n_heads,
+    struct ggml_tensor * q_w,
+    struct ggml_tensor * q_b,
+    struct ggml_tensor * kv_w,
+    struct ggml_tensor * kv_b,
+    struct ggml_tensor * q_rms_gamma,
+    struct ggml_tensor * k_rms_gamma,
+    struct ggml_tensor * out_w,
+    struct ggml_tensor * out_b,
+    struct ggml_tensor * proj_w,
+    struct ggml_tensor * proj_b);
+
 typedef struct trellis_ggml_modulated_cross_block_params {
     struct ggml_tensor * block_modulation; /* [6 * channels] */
     struct ggml_tensor * norm2_gamma;      /* [channels] */
@@ -166,6 +184,32 @@ struct ggml_tensor * trellis_ggml_modulated_cross_block_rope(
     struct ggml_tensor * context,
     int n_heads,
     const trellis_ggml_modulated_cross_block_params * params,
+    struct ggml_tensor * cos_phase,
+    struct ggml_tensor * sin_phase);
+
+/* ProjectAttention variant of the modulated DiT block. */
+struct ggml_tensor * trellis_ggml_modulated_cross_block_projected(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,
+    struct ggml_tensor * mod6,
+    struct ggml_tensor * global_context,
+    struct ggml_tensor * projected_context,
+    int n_heads,
+    const trellis_ggml_modulated_cross_block_params * params,
+    struct ggml_tensor * proj_w,
+    struct ggml_tensor * proj_b);
+
+/* RoPE-enabled ProjectAttention variant of the modulated DiT block. */
+struct ggml_tensor * trellis_ggml_modulated_cross_block_projected_rope(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,
+    struct ggml_tensor * mod6,
+    struct ggml_tensor * global_context,
+    struct ggml_tensor * projected_context,
+    int n_heads,
+    const trellis_ggml_modulated_cross_block_params * params,
+    struct ggml_tensor * proj_w,
+    struct ggml_tensor * proj_b,
     struct ggml_tensor * cos_phase,
     struct ggml_tensor * sin_phase);
 

@@ -103,6 +103,7 @@ set(TRELLIS2_C_SOURCES
     src/model/trellis_sparse_guides.c
     src/model/trellis_sparse_structure_decoder.c
     src/model/trellis_dino.c
+    src/model/trellis_pixal_naf.c
     src/model/trellis_birefnet.c
     src/mesh/trellis_flex_dual_grid.c
     src/model/trellis_slat_flow_model.c
@@ -111,6 +112,8 @@ set(TRELLIS2_C_SOURCES
     src/pipeline/trellis_pipeline_model_cache.c
     src/pipeline/trellis_dit_flow_executor.c
     src/pipeline/trellis_flow_sampler.c
+    src/pipeline/trellis_pixal_condition.c
+    src/pipeline/trellis_pixal_naf_attention.c
     src/pipeline/trellis_sparse_structure_pipeline.c
     src/pipeline/trellis_structured_latent_pipeline.c
     tools/vkmesh/trellis_gltf_export.c
@@ -118,6 +121,7 @@ set(TRELLIS2_C_SOURCES
     src/model/trellis_sparse_unet_vae_decoder.c
     src/model/trellis_sparse_unet_vae_decoder_exec.c
     src/model/sparse/trellis_sparse_cpu.c
+    src/model/sparse/trellis_pixal_naf_backend.c
     src/io/trellis_weights.c
 )
 
@@ -132,11 +136,13 @@ if (TRELLIS2_C_BACKEND STREQUAL "cuda")
         src/model/sparse/trellis_sparse_vulkan_stubs.c
         src/model/trellis_cuda_kernels.cu
         src/model/trellis_cuda_forward.cu
+        src/pipeline/trellis_pixal_naf_attention_cuda.cu
     )
 else()
     list(APPEND TRELLIS2_C_SOURCES
         src/model/sparse/trellis_sparse_vulkan.c
         src/model/trellis_cuda_stubs.c
+        src/pipeline/trellis_pixal_naf_attention_cuda_stubs.c
     )
 endif()
 
@@ -207,6 +213,7 @@ if (GGML_VULKAN)
     add_trellis_sparse_vk_shader(trellis_sparse_vk_linear_coop src/model/sparse/shaders/linear_coop.comp trellis_sparse_vk_linear_coop_spv vulkan1.3)
     add_trellis_sparse_vk_shader(trellis_sparse_vk_linear_silu_coop src/model/sparse/shaders/linear_silu_coop.comp trellis_sparse_vk_linear_silu_coop_spv vulkan1.3)
     add_trellis_sparse_vk_shader(trellis_sparse_vk_sparse_conv_offset_coop src/model/sparse/shaders/sparse_conv_offset_coop.comp trellis_sparse_vk_sparse_conv_offset_coop_spv vulkan1.3)
+    add_trellis_sparse_vk_shader(trellis_sparse_vk_pixal_naf_attention_project src/model/sparse/shaders/pixal_naf_attention_project.comp trellis_sparse_vk_pixal_naf_attention_project_spv vulkan1.2)
 
     set(TRELLIS_GLTF_BAKE_VERT_SPV "${CMAKE_CURRENT_BINARY_DIR}/trellis_gltf_bake_vert.spv")
     set(TRELLIS_GLTF_BAKE_VERT_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/trellis_gltf_bake_vert_spv.h")
@@ -444,6 +451,7 @@ if (TRELLIS2_C_BUILD_TESTS)
         target_compile_definitions(trellis2_c_tests PRIVATE _POSIX_C_SOURCE=200809L)
         target_include_directories(trellis2_c_tests PRIVATE
             "${CMAKE_CURRENT_LIST_DIR}/src/model"
+            "${CMAKE_CURRENT_LIST_DIR}/src/pipeline"
             "${CMAKE_CURRENT_LIST_DIR}/tools/debug")
         target_link_libraries(trellis2_c_tests PRIVATE trellis2_c ggml)
         add_test(NAME trellis2_c_tests COMMAND trellis2_c_tests)
@@ -458,6 +466,58 @@ if (TRELLIS2_C_BUILD_TESTS)
         NAME trellis2_c_backend_ops_${TRELLIS2_C_BACKEND}_tests
         COMMAND trellis2_c_backend_ops_tests ${TRELLIS2_C_BACKEND})
     set_tests_properties(trellis2_c_backend_ops_${TRELLIS2_C_BACKEND}_tests PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(trellis2_c_pixal_condition_tests
+        tests/test_pixal_condition.c
+    )
+    target_include_directories(trellis2_c_pixal_condition_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/pipeline")
+    target_link_libraries(trellis2_c_pixal_condition_tests PRIVATE trellis2_c)
+    add_test(NAME trellis2_c_pixal_condition_tests COMMAND trellis2_c_pixal_condition_tests)
+
+    add_executable(trellis2_c_pixal_naf_attention_tests
+        tests/test_pixal_naf_attention.c
+    )
+    target_include_directories(trellis2_c_pixal_naf_attention_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/pipeline")
+    target_link_libraries(trellis2_c_pixal_naf_attention_tests PRIVATE trellis2_c)
+    add_test(NAME trellis2_c_pixal_naf_attention_tests COMMAND trellis2_c_pixal_naf_attention_tests)
+
+    add_executable(trellis2_c_pixal_naf_encoder_tests
+        tests/test_pixal_naf_encoder.c
+    )
+    target_include_directories(trellis2_c_pixal_naf_encoder_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/model")
+    target_link_libraries(trellis2_c_pixal_naf_encoder_tests PRIVATE trellis2_c ggml)
+    add_test(
+        NAME trellis2_c_pixal_naf_encoder_${TRELLIS2_C_BACKEND}_tests
+        COMMAND trellis2_c_pixal_naf_encoder_tests ${TRELLIS2_C_BACKEND})
+    set_tests_properties(
+        trellis2_c_pixal_naf_encoder_${TRELLIS2_C_BACKEND}_tests
+        PROPERTIES SKIP_RETURN_CODE 77)
+
+    if (TRELLIS2_C_BACKEND STREQUAL "vulkan")
+        add_executable(trellis2_c_pixal_naf_vulkan_tests
+            tests/test_pixal_naf_vulkan.c
+        )
+        target_include_directories(trellis2_c_pixal_naf_vulkan_tests PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/src/model"
+            "${CMAKE_CURRENT_LIST_DIR}/src/pipeline")
+        target_link_libraries(trellis2_c_pixal_naf_vulkan_tests PRIVATE trellis2_c)
+        add_test(NAME trellis2_c_pixal_naf_vulkan_tests COMMAND trellis2_c_pixal_naf_vulkan_tests)
+        set_tests_properties(trellis2_c_pixal_naf_vulkan_tests PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
+    if (TRELLIS2_C_BACKEND STREQUAL "cuda")
+        add_executable(trellis2_c_pixal_naf_cuda_tests
+            tests/test_pixal_naf_cuda.c
+        )
+        target_include_directories(trellis2_c_pixal_naf_cuda_tests PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/src/pipeline")
+        target_link_libraries(trellis2_c_pixal_naf_cuda_tests PRIVATE trellis2_c)
+        add_test(NAME trellis2_c_pixal_naf_cuda_tests COMMAND trellis2_c_pixal_naf_cuda_tests)
+        set_tests_properties(trellis2_c_pixal_naf_cuda_tests PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 
     add_executable(trellis2_c_sparse_decoder_backend_tests
         tests/test_sparse_decoder_backend.c
@@ -517,6 +577,8 @@ if (TRELLIS2_C_BUILD_TOOLS)
     add_executable(trellis-rebake-gltf
         tools/vkmesh/trellis_rebake_gltf.c
     )
+    target_include_directories(trellis-rebake-gltf PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/model")
     target_link_libraries(trellis-rebake-gltf PRIVATE trellis2_c ggml)
     if (UNIX)
         target_link_libraries(trellis-rebake-gltf PRIVATE m)
@@ -627,6 +689,7 @@ if (TRELLIS2_C_BUILD_TOOLS)
             find_package(Threads REQUIRED)
             add_executable(trellis2_c_vkmesh_tests tests/test_vkmesh.c)
             target_include_directories(trellis2_c_vkmesh_tests PRIVATE
+                "${CMAKE_CURRENT_LIST_DIR}/src/model"
                 "${CMAKE_CURRENT_LIST_DIR}/src/pipeline")
             target_link_libraries(trellis2_c_vkmesh_tests PRIVATE
                 trellis2_c ggml Vulkan::Vulkan Threads::Threads)
@@ -650,6 +713,7 @@ if (TRELLIS2_C_BUILD_TOOLS)
         endif()
         add_executable(trellis-gui ${TRELLIS_GUI_SOURCES})
         target_include_directories(trellis-gui PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/src/model"
             "${CMAKE_CURRENT_LIST_DIR}/src/pipeline"
             "${CMAKE_CURRENT_LIST_DIR}/src/model/sparse")
         target_link_libraries(trellis-gui PRIVATE trellis2_c ggml raylib)

@@ -45,8 +45,37 @@ no output path is passed, it writes `output.glb`. WebP inputs are converted to a
 temporary PNG because the current
 stb_image loader does not decode WebP directly.
 
+Pixal3D checkpoints are auto-detected and use the same command. Convert the NAF
+release checkpoint once, then pass it with the Pixal3D model directory:
+
+```sh
+python3 tools/convert_naf_weights.py \
+  /path/to/naf_release.pth \
+  ../Pixal3D/Pixal3D/ckpts/naf_release.safetensors
+
+../build/trellis-image-to-gltf \
+  --model ../Pixal3D/Pixal3D \
+  --dino ../TRELLIS.2/dinov3-vitl16-pretrain-lvd1689m \
+  --naf ../Pixal3D/Pixal3D/ckpts/naf_release.safetensors \
+  --image ../assets/example_image/T.png \
+  --gltf benchmark_outputs/pixal3d.glb \
+  --pipeline 1024_cascade
+```
+
+Pixal3D also supports `1536_cascade`. `--naf` falls back to
+`TRELLIS_NAF_PATH` and then `ckpts/naf_release.safetensors`. Use
+`--no-model-cache` or `--model-cache-budget-mib N` on memory-constrained GPUs.
+The `--fov`, `--camera-distance`, and `--mesh-scale` flags control the explicit
+Pixal3D projection; this path does not estimate the camera automatically. Use a
+transparent RGBA input or pass `--birefnet FILE` for foreground removal and the
+required subject crop.
+Opaque Pixal3D inputs require `--birefnet`; a foreground-isolated RGBA image
+with transparency can be passed without it.
+
 `trellis_image_to_gltf.c` is intentionally thin: it parses arguments and calls
-`trellis_pipeline_image_to_gltf()` from `src/pipeline/trellis_pipeline.c`.
+`trellis_pipeline_image_to_gltf_ex()` from `src/pipeline/trellis_pipeline.c`.
+The legacy `trellis_pipeline_image_to_gltf()` entry point remains available and
+uses default Pixal3D camera values plus automatic NAF path discovery.
 
 `vkmesh` runs the Vulkan compute mesh postprocess path. The TRELLIS preset
 fills small holes, remeshes with narrow-band dual contouring by default, and
@@ -82,6 +111,14 @@ individual flags such as `--fill-holes`, `--repair-non-manifold-edges`, and
 When `trellis-image-to-gltf` is run from a Vulkan build tree it first looks for a
 sibling `vkmesh` executable, then falls back to `PATH`; pass `--vkmesh FILE`
 only when using a custom binary.
+vkmesh keeps its Vulkan buffer workspace bounded. By default it derives a
+conservative budget from `VK_EXT_memory_budget` (with a 2048 MiB ceiling), keeps
+source geometry/BVH resident once, and streams distance-query points through a
+reusable batch buffer. Override the cap with
+`--vkmesh-gpu-workspace-budget-mib N` in `trellis-image-to-gltf`,
+`--gpu-workspace-budget-mib N` in standalone `vkmesh`, or
+`TRELLIS_VKMESH_GPU_WORKSPACE_BUDGET_MIB`. The limit covers vkmesh
+`VkDeviceMemory` workspace, not model weights owned by the rest of the process.
 UV parameterization and packing use CPU xatlas. For large meshes, the glTF
 exporter first builds manifold face adjacency on the CPU, grows connected local
 chunks, and adds each chunk to xatlas as its own mesh. Vulkan acceleration starts

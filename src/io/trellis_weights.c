@@ -288,13 +288,38 @@ trellis_status trellis_tensor_store_load_safetensors(
         NULL);
 }
 
-static uint64_t safetensors_total_data_bytes(const trellis_safetensors * st) {
+static int safetensor_meta_is_skippable_rope_phases(const trellis_safetensor_meta * meta) {
+    /* Pixal3D's dense stage-1 RoPE cache is derived from integer coordinates
+     * and reconstructed by the runtime. No other complex tensor is optional. */
+    return meta != NULL && meta->name != NULL && meta->dtype == TRELLIS_DTYPE_C64 &&
+        strcmp(meta->name, "rope_phases") == 0;
+}
+
+static int safetensor_meta_is_store_loadable(const trellis_safetensor_meta * meta) {
+    return meta != NULL && !safetensor_meta_is_skippable_rope_phases(meta);
+}
+
+static size_t safetensors_loadable_tensor_count(const trellis_safetensors * st) {
+    if (st == NULL) {
+        return 0;
+    }
+    size_t count = 0;
+    for (size_t i = 0; i < st->n_tensors; ++i) {
+        if (safetensor_meta_is_store_loadable(&st->tensors[i])) {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+static uint64_t safetensors_loadable_data_bytes(const trellis_safetensors * st) {
     if (st == NULL) {
         return 0;
     }
     uint64_t total = 0;
     for (size_t i = 0; i < st->n_tensors; ++i) {
-        if (st->tensors[i].data_end >= st->tensors[i].data_begin) {
+        if (safetensor_meta_is_store_loadable(&st->tensors[i]) &&
+            st->tensors[i].data_end >= st->tensors[i].data_begin) {
             total += st->tensors[i].data_end - st->tensors[i].data_begin;
         }
     }
@@ -305,6 +330,7 @@ static void emit_load_progress(
     const trellis_safetensors * st,
     const char * tensor_name,
     size_t tensor_index,
+    size_t tensor_count,
     uint64_t bytes_loaded,
     uint64_t total_bytes,
     trellis_tensor_store_load_progress_callback progress_callback,
@@ -316,7 +342,7 @@ static void emit_load_progress(
     progress.path = st == NULL ? NULL : st->path;
     progress.tensor_name = tensor_name;
     progress.tensor_index = tensor_index;
-    progress.tensor_count = st == NULL ? 0 : st->n_tensors;
+    progress.tensor_count = tensor_count;
     progress.bytes_loaded = bytes_loaded;
     progress.total_bytes = total_bytes;
     progress_callback(&progress, progress_user_data);
@@ -337,16 +363,37 @@ static trellis_status trellis_tensor_store_load_safetensors_impl(
     if (store->n_entries != 0 || store->buffer != NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
+    if (loaded_tensors != NULL) {
+        *loaded_tensors = 0;
+    }
 
     trellis_safetensors st;
     trellis_status status = trellis_safetensors_open(safetensors_path, &st);
     if (status != TRELLIS_STATUS_OK) {
         return status;
     }
-    const uint64_t total_bytes = safetensors_total_data_bytes(&st);
-    emit_load_progress(&st, NULL, 0, 0, total_bytes, progress_callback, progress_user_data);
+    for (size_t i = 0; i < st.n_tensors; ++i) {
+        if (st.tensors[i].dtype == TRELLIS_DTYPE_C64 &&
+            !safetensor_meta_is_skippable_rope_phases(&st.tensors[i])) {
+            TRELLIS_ERROR(
+                "tensor store: unsupported complex tensor '%s'; only derived rope_phases may be skipped",
+                st.tensors[i].name);
+            trellis_safetensors_close(&st);
+            return TRELLIS_STATUS_NOT_IMPLEMENTED;
+        }
+    }
+    const size_t loadable_tensors = safetensors_loadable_tensor_count(&st);
+    const uint64_t total_bytes = safetensors_loadable_data_bytes(&st);
+    emit_load_progress(&st, NULL, 0, loadable_tensors, 0, total_bytes, progress_callback, progress_user_data);
 
     for (size_t i = 0; i < st.n_tensors; ++i) {
+        if (!safetensor_meta_is_store_loadable(&st.tensors[i])) {
+            TRELLIS_INFO(
+                "tensor store: skipping unsupported tensor '%s' with dtype %s",
+                st.tensors[i].name,
+                trellis_dtype_name(st.tensors[i].dtype));
+            continue;
+        }
         struct ggml_tensor * tensor = NULL;
         status = make_tensor_for_meta(store, &st.tensors[i], transpose_linear_weights, preserve_16bit_weights, &tensor);
         if (status != TRELLIS_STATUS_OK) {
@@ -360,15 +407,21 @@ static trellis_status trellis_tensor_store_load_safetensors_impl(
         }
     }
 
-    store->buffer = ggml_backend_alloc_ctx_tensors(store->ctx, backend->backend);
-    if (store->buffer == NULL) {
-        trellis_safetensors_close(&st);
-        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    if (loadable_tensors != 0) {
+        store->buffer = ggml_backend_alloc_ctx_tensors(store->ctx, backend->backend);
+        if (store->buffer == NULL) {
+            trellis_safetensors_close(&st);
+            return TRELLIS_STATUS_OUT_OF_MEMORY;
+        }
     }
 
     uint64_t bytes_loaded = 0;
+    size_t tensor_index = 0;
     for (size_t i = 0; i < st.n_tensors; ++i) {
-        struct ggml_tensor * tensor = store->entries[i].tensor;
+        if (!safetensor_meta_is_store_loadable(&st.tensors[i])) {
+            continue;
+        }
+        struct ggml_tensor * tensor = store->entries[tensor_index].tensor;
         status = set_tensor_data_from_meta(&st, &st.tensors[i], tensor, transpose_linear_weights);
         if (status != TRELLIS_STATUS_OK) {
             trellis_safetensors_close(&st);
@@ -377,10 +430,12 @@ static trellis_status trellis_tensor_store_load_safetensors_impl(
         if (st.tensors[i].data_end >= st.tensors[i].data_begin) {
             bytes_loaded += st.tensors[i].data_end - st.tensors[i].data_begin;
         }
+        tensor_index += 1;
         emit_load_progress(
             &st,
             st.tensors[i].name,
-            i + 1,
+            tensor_index,
+            loadable_tensors,
             bytes_loaded,
             total_bytes,
             progress_callback,
@@ -388,7 +443,7 @@ static trellis_status trellis_tensor_store_load_safetensors_impl(
     }
 
     if (loaded_tensors != NULL) {
-        *loaded_tensors = st.n_tensors;
+        *loaded_tensors = loadable_tensors;
     }
     trellis_safetensors_close(&st);
     return TRELLIS_STATUS_OK;

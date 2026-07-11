@@ -10,6 +10,7 @@
 #include "trellis_sparse_vk_linear_mat_spv.h"
 #include "trellis_sparse_vk_linear_silu_coop_spv.h"
 #include "trellis_sparse_vk_linear_silu_mat_spv.h"
+#include "trellis_sparse_vk_pixal_naf_attention_project_spv.h"
 #include "trellis_sparse_vk_row_norm_silu_spv.h"
 #include "trellis_sparse_vk_row_norm_spv.h"
 #include "trellis_sparse_vk_rulebook_dispatch_spv.h"
@@ -66,6 +67,7 @@ typedef enum sparse_vk_pipeline_id {
     SPARSE_VK_PIPE_LINEAR_COOP,
     SPARSE_VK_PIPE_LINEAR_SILU_COOP,
     SPARSE_VK_PIPE_SPARSE_CONV_OFFSET_COOP,
+    SPARSE_VK_PIPE_PIXAL_NAF_ATTENTION_PROJECT,
     SPARSE_VK_PIPE_COUNT,
 } sparse_vk_pipeline_id;
 
@@ -356,7 +358,14 @@ static int32_t vk_find_coord_host(
 }
 
 static trellis_status vk_status(VkResult result) {
-    return result == VK_SUCCESS ? TRELLIS_STATUS_OK : TRELLIS_STATUS_ERROR;
+    if (result == VK_SUCCESS) {
+        return TRELLIS_STATUS_OK;
+    }
+    if (result == VK_ERROR_OUT_OF_HOST_MEMORY ||
+        result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        return TRELLIS_STATUS_OUT_OF_MEMORY;
+    }
+    return TRELLIS_STATUS_ERROR;
 }
 
 static uint32_t find_memory_type(
@@ -447,6 +456,97 @@ static void vk_destroy_buffer_raw(trellis_sparse_vk_backend * vk, trellis_sparse
     free(buffer);
 }
 
+static void vk_add_released_bytes(size_t * total, size_t bytes) {
+    if (total == NULL) {
+        return;
+    }
+    *total = bytes > SIZE_MAX - *total ? SIZE_MAX : *total + bytes;
+}
+
+static trellis_status vk_trim(
+    trellis_sparse_backend * backend,
+    unsigned flags,
+    size_t * released_bytes) {
+    if (released_bytes != NULL) {
+        *released_bytes = 0;
+    }
+    if (backend == NULL || (flags & ~(unsigned) TRELLIS_SPARSE_TRIM_ALL) != 0) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (flags == 0) {
+        return TRELLIS_STATUS_OK;
+    }
+
+    trellis_sparse_vk_backend * vk = (trellis_sparse_vk_backend *) backend;
+    if (vk->device != VK_NULL_HANDLE) {
+        VkResult result = vkDeviceWaitIdle(vk->device);
+        trellis_status status = vk_status(result);
+        if (status != TRELLIS_STATUS_OK) {
+            return status;
+        }
+        vk_reclaim_pending(vk);
+    }
+
+    size_t released = 0;
+    if ((flags & TRELLIS_SPARSE_TRIM_WEIGHTS) != 0) {
+        sparse_vk_weight * weight = vk->weights;
+        vk->weights = NULL;
+        while (weight != NULL) {
+            sparse_vk_weight * next = weight->next;
+            if (weight->buffer != NULL) {
+                vk_add_released_bytes(&released, weight->buffer->bytes);
+                vk_destroy_buffer_raw(vk, weight->buffer);
+            }
+            free(weight);
+            weight = next;
+        }
+    }
+    if ((flags & TRELLIS_SPARSE_TRIM_FREE_BUFFERS) != 0) {
+        trellis_sparse_buffer * buffer = vk->free_buffers;
+        vk->free_buffers = NULL;
+        while (buffer != NULL) {
+            trellis_sparse_buffer * next = buffer->next_free;
+            vk_add_released_bytes(&released, buffer->bytes);
+            vk_destroy_buffer_raw(vk, buffer);
+            buffer = next;
+        }
+    }
+    if (released_bytes != NULL) {
+        *released_bytes = released;
+    }
+    return TRELLIS_STATUS_OK;
+}
+
+static trellis_status vk_alloc_buffer_with_trim_retry(
+    trellis_sparse_vk_backend * vk,
+    size_t bytes,
+    VkBufferUsageFlags usage,
+    VkMemoryPropertyFlags memory_flags,
+    int map_memory,
+    trellis_sparse_buffer ** out) {
+    trellis_status status = vk_alloc_buffer(
+        vk,
+        bytes,
+        usage,
+        memory_flags,
+        map_memory,
+        out);
+    if (status != TRELLIS_STATUS_OUT_OF_MEMORY || vk->free_buffers == NULL) {
+        return status;
+    }
+    status = vk_trim(&vk->base, TRELLIS_SPARSE_TRIM_FREE_BUFFERS, NULL);
+    if (status != TRELLIS_STATUS_OK) {
+        return status;
+    }
+    return vk_alloc_buffer(
+        vk,
+        bytes,
+        usage,
+        memory_flags,
+        map_memory,
+        out);
+}
+
 static int vk_buffer_is_pooled(const trellis_sparse_vk_backend * vk, const trellis_sparse_buffer * buffer) {
     if (vk == NULL || buffer == NULL) {
         return 0;
@@ -474,21 +574,41 @@ static int vk_remove_pooled_buffer(trellis_sparse_vk_backend * vk, const trellis
     return 0;
 }
 
+static int vk_pooled_buffer_is_reasonable_fit(size_t available, size_t requested) {
+    if (available < requested) {
+        return 0;
+    }
+    const size_t max_absolute_waste = 16u * 1024u * 1024u;
+    if (available - requested <= max_absolute_waste) {
+        return 1;
+    }
+    return requested > SIZE_MAX / 2u || available <= requested * 2u;
+}
+
 static trellis_sparse_buffer * vk_take_pooled_buffer(trellis_sparse_vk_backend * vk, size_t bytes) {
     if (vk == NULL) {
         return NULL;
     }
-    trellis_sparse_buffer ** link = &vk->free_buffers;
-    while (*link != NULL) {
-        trellis_sparse_buffer * b = *link;
-        if (b->bytes >= bytes) {
-            *link = b->next_free;
-            b->next_free = NULL;
-            return b;
+    trellis_sparse_buffer ** best_link = NULL;
+    for (trellis_sparse_buffer ** link = &vk->free_buffers;
+         *link != NULL;
+         link = &(*link)->next_free) {
+        trellis_sparse_buffer * candidate = *link;
+        if (vk_pooled_buffer_is_reasonable_fit(candidate->bytes, bytes) &&
+            (best_link == NULL || candidate->bytes < (*best_link)->bytes)) {
+            best_link = link;
+            if (candidate->bytes == bytes) {
+                break;
+            }
         }
-        link = &b->next_free;
     }
-    return NULL;
+    if (best_link == NULL) {
+        return NULL;
+    }
+    trellis_sparse_buffer * best = *best_link;
+    *best_link = best->next_free;
+    best->next_free = NULL;
+    return best;
 }
 
 static trellis_status vk_alloc_bytes(
@@ -504,7 +624,7 @@ static trellis_status vk_alloc_bytes(
         *out = pooled;
         return TRELLIS_STATUS_OK;
     }
-    return vk_alloc_buffer(
+    return vk_alloc_buffer_with_trim_retry(
         vk,
         bytes,
         VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -521,7 +641,7 @@ static trellis_status vk_alloc_staging(
     size_t bytes,
     VkBufferUsageFlags usage,
     trellis_sparse_buffer ** out) {
-    return vk_alloc_buffer(
+    return vk_alloc_buffer_with_trim_retry(
         vk,
         bytes,
         usage,
@@ -3608,6 +3728,8 @@ static void vk_destroy(trellis_sparse_backend * backend) {
     free(vk);
 }
 
+#include "trellis_pixal_naf_vulkan.inc"
+
 static const trellis_sparse_backend_ops g_vk_ops = {
     vk_destroy,
     vk_alloc_f32,
@@ -3634,6 +3756,8 @@ static const trellis_sparse_backend_ops g_vk_ops = {
     vk_skip_repeat_device,
     vk_download_c2s_coords,
     vk_download_c2s_map,
+    vk_trim,
+    vk_pixal_naf_attention_project_sparse,
 };
 
 static trellis_status vk_create_pipeline_from_spv(
@@ -3764,6 +3888,12 @@ static const sparse_vk_pipeline_spec g_sparse_vk_pipeline_specs[] = {
         trellis_sparse_vk_sparse_conv_offset_coop_spv,
         sizeof(trellis_sparse_vk_sparse_conv_offset_coop_spv),
         1,
+    },
+    {
+        SPARSE_VK_PIPE_PIXAL_NAF_ATTENTION_PROJECT,
+        trellis_sparse_vk_pixal_naf_attention_project_spv,
+        sizeof(trellis_sparse_vk_pixal_naf_attention_project_spv),
+        0,
     },
 };
 

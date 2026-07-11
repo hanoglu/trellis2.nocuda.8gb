@@ -614,6 +614,48 @@ static trellis_status shape_c2s_block_device(
         status = shape_debug_dump_device_f32(debug, dump_name, out, m, co);
     }
 
+    if (status != TRELLIS_STATUS_OK && m == 0 && subdiv_dev != NULL) {
+        float * logits = (float *) malloc((size_t) n * 8u * sizeof(float));
+        if (logits != NULL && cudaMemcpy(
+                logits,
+                subdiv_dev,
+                (size_t) n * 8u * sizeof(float),
+                cudaMemcpyDeviceToHost) == cudaSuccess) {
+            float minimum = INFINITY;
+            float maximum = -INFINITY;
+            size_t finite_count = 0;
+            size_t nan_count = 0;
+            size_t inf_count = 0;
+            size_t positive_count = 0;
+            double sum = 0.0;
+            for (size_t i = 0; i < (size_t) n * 8u; ++i) {
+                const float value = logits[i];
+                if (isnan(value)) {
+                    ++nan_count;
+                } else if (!isfinite(value)) {
+                    ++inf_count;
+                } else {
+                    if (value < minimum) minimum = value;
+                    if (value > maximum) maximum = value;
+                    if (value > 0.0f) ++positive_count;
+                    sum += value;
+                    ++finite_count;
+                }
+            }
+            TRELLIS_ERROR(
+                "SparseUnetVaeDecoder: C2S level %d subdivision logits[min=%.6g mean=%.6g max=%.6g positive=%zu finite=%zu/%zu nan=%zu inf=%zu]",
+                level,
+                finite_count > 0 ? minimum : NAN,
+                finite_count > 0 ? sum / (double) finite_count : NAN,
+                finite_count > 0 ? maximum : NAN,
+                positive_count,
+                finite_count,
+                (size_t) n * 8u,
+                nan_count,
+                inf_count);
+        }
+        free(logits);
+    }
     cudaFree(subdiv_dev);
     cudaFree(norm1);
     cudaFree(conv1);
