@@ -102,6 +102,9 @@ set(TRELLIS2_C_SOURCES
     src/runtime/trellis_runtime.c
     src/runtime/trellis_model_package.c
     src/runtime/trellis_registry.c
+    src/tasks/image_to_3d/adapter.c
+    src/tasks/image_to_3d/adapters/trellis2.c
+    src/tasks/image_to_3d/adapters/pixal3d.c
     src/model/trellis_sparse_guides.c
     src/model/trellis_sparse_structure_decoder.c
     src/model/trellis_dino.c
@@ -395,6 +398,7 @@ target_include_directories(trellis2_c
     PRIVATE
         "${CMAKE_CURRENT_LIST_DIR}/src/runtime"
         "${CMAKE_CURRENT_LIST_DIR}/src/model"
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d"
         "${CMAKE_CURRENT_BINARY_DIR}/generated"
         "${CMAKE_CURRENT_LIST_DIR}/3rd/cgltf"
         "${CMAKE_CURRENT_LIST_DIR}/3rd/stb"
@@ -469,6 +473,17 @@ if (TRELLIS2_C_BUILD_TESTS)
     )
     target_link_libraries(trellis2_c_attention_policy_tests PRIVATE trellis2_c ggml)
     add_test(NAME trellis2_c_attention_policy_tests COMMAND trellis2_c_attention_policy_tests)
+
+    add_executable(trellis2_c_image_to_3d_adapter_tests
+        tests/test_image_to_3d_adapter.c
+    )
+    target_compile_definitions(trellis2_c_image_to_3d_adapter_tests PRIVATE
+        TRELLIS_TEST_SOURCE_DIR="${CMAKE_CURRENT_LIST_DIR}")
+    target_include_directories(trellis2_c_image_to_3d_adapter_tests PRIVATE
+        "${CMAKE_CURRENT_LIST_DIR}/src/runtime"
+        "${CMAKE_CURRENT_LIST_DIR}/src/tasks/image_to_3d")
+    target_link_libraries(trellis2_c_image_to_3d_adapter_tests PRIVATE trellis2_c ggml)
+    add_test(NAME trellis2_c_image_to_3d_adapter_tests COMMAND trellis2_c_image_to_3d_adapter_tests)
 
     if (TRELLIS2_C_BACKEND STREQUAL "cuda")
         add_executable(trellis2_c_tests

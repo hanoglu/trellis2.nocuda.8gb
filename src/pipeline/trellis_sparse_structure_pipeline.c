@@ -211,10 +211,14 @@ static void token_channels_to_ncdhw(
 static int load_sparse_structure_flow(
     const trellis_backend_context * backend,
     const char * model_dir,
+    const char * override_path,
     trellis_tensor_store * store,
     trellis_dit_flow_model * model) {
     char path[4096];
-    if (!choose_path(model_dir, "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors", path, sizeof(path))) {
+    if (override_path != NULL && override_path[0] != '\0') {
+        const int length = snprintf(path, sizeof(path), "%s", override_path);
+        if (length < 0 || (size_t) length >= sizeof(path)) return 0;
+    } else if (!choose_path(model_dir, "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors", path, sizeof(path))) {
         return 0;
     }
     if (!trellis_load_tensor_store(
@@ -248,10 +252,14 @@ static int load_sparse_structure_flow(
 static int load_sparse_structure_decoder(
     const trellis_backend_context * backend,
     const char * model_dir,
+    const char * override_path,
     trellis_tensor_store * store,
     trellis_ss_decoder_weights * weights) {
     char path[4096];
-    if (!choose_path(model_dir, "ckpts/ss_dec_conv3d_16l8_fp16.safetensors", path, sizeof(path))) {
+    if (override_path != NULL && override_path[0] != '\0') {
+        const int length = snprintf(path, sizeof(path), "%s", override_path);
+        if (length < 0 || (size_t) length >= sizeof(path)) return 0;
+    } else if (!choose_path(model_dir, "ckpts/ss_dec_conv3d_16l8_fp16.safetensors", path, sizeof(path))) {
         return 0;
     }
     if (!trellis_load_tensor_store(
@@ -605,31 +613,11 @@ cleanup:
     return rc;
 }
 
-int trellis_pipeline_sparse_structure_checkpoint_uses_pixal_projection(
-    const char * model_dir) {
-    char path[4096];
-    if (!choose_path(
-            model_dir,
-            "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
-            path,
-            sizeof(path))) {
-        return 0;
-    }
-    trellis_safetensors st;
-    memset(&st, 0, sizeof(st));
-    if (trellis_safetensors_open(path, &st) != TRELLIS_STATUS_OK) {
-        return 0;
-    }
-    const int projected = trellis_safetensors_find(
-        &st,
-        "blocks.0.cross_attn.proj_linear.weight") != NULL;
-    trellis_safetensors_close(&st);
-    return projected;
-}
-
 static int run_sparse_structure_image(
     const trellis_backend_context * backend,
     const char * model_dir,
+    const char * flow_path,
+    const char * decoder_path,
     const char * dino_dir,
     const char * image_path,
     int latent_size,
@@ -640,6 +628,8 @@ static int run_sparse_structure_image(
     int flow_blocks_override,
     int flow_block_parts_override,
     int flow_no_rope,
+    int projected_conditioning,
+    int emulate_bf16_blocks,
     int use_ggml_flash_attn,
     float threshold,
     float camera_angle_x,
@@ -668,15 +658,13 @@ static int run_sparse_structure_image(
     float * projected_context = NULL;
     int cond_tokens = 0;
     const int64_t dino_start_us = ggml_time_us();
-    const int pixal_checkpoint =
-        trellis_pipeline_sparse_structure_checkpoint_uses_pixal_projection(model_dir);
     if (!run_dino_condition(
             backend,
             cache,
             dino_dir,
             image_path,
             cond_resolution,
-            pixal_checkpoint,
+            projected_conditioning,
             NULL,
             NULL,
             &context,
@@ -728,12 +716,14 @@ static int run_sparse_structure_image(
     if (cache != NULL) {
         const trellis_dit_flow_model * cached_flow = NULL;
         const trellis_ss_decoder_weights * cached_decoder = NULL;
-        status = trellis_pipeline_model_cache_get_sparse_structure_flow_model(cache, model_dir, &cached_flow);
+        status = trellis_pipeline_model_cache_get_sparse_structure_flow_model(
+            cache, model_dir, flow_path, &cached_flow);
         if (status != TRELLIS_STATUS_OK) {
             TRELLIS_ERROR("sparse-structure flow: cache load failed: %s", trellis_status_string(status));
             goto cleanup;
         }
-        status = trellis_pipeline_model_cache_get_sparse_structure_decoder(cache, model_dir, &cached_decoder);
+        status = trellis_pipeline_model_cache_get_sparse_structure_decoder(
+            cache, model_dir, decoder_path, &cached_decoder);
         if (status != TRELLIS_STATUS_OK) {
             TRELLIS_ERROR("sparse-structure decoder: cache load failed: %s", trellis_status_string(status));
             goto cleanup;
@@ -742,12 +732,12 @@ static int run_sparse_structure_image(
         flow = flow_model.base;
         decoder = *cached_decoder;
     } else {
-        if (!load_sparse_structure_flow(backend, model_dir, &flow_store, &flow_model)) {
+        if (!load_sparse_structure_flow(backend, model_dir, flow_path, &flow_store, &flow_model)) {
             goto cleanup;
         }
         flow = flow_model.base;
         owns_flow_store = 1;
-        if (!load_sparse_structure_decoder(backend, model_dir, &decoder_store, &decoder)) {
+        if (!load_sparse_structure_decoder(backend, model_dir, decoder_path, &decoder_store, &decoder)) {
             goto cleanup;
         }
         owns_decoder_store = 1;
@@ -773,6 +763,17 @@ static int run_sparse_structure_image(
     if (flow_no_rope) {
         flow.debug_disable_rope = 1;
         TRELLIS_INFO("sparse structure: debug flow RoPE disabled");
+    }
+    if (emulate_bf16_blocks) {
+        flow.emulate_bf16_blocks = 1;
+        TRELLIS_INFO("sparse structure: bf16 block activation round-trip enabled");
+    }
+    if (flow_model.projection.enabled != (projected_conditioning ? 1 : 0)) {
+        TRELLIS_ERROR(
+            "sparse structure: package conditioning mode does not match sparse flow architecture (package=%s checkpoint=%s)",
+            projected_conditioning ? "projected" : "global",
+            flow_model.projection.enabled ? "projected" : "global");
+        goto cleanup;
     }
     if (flow.cond_channels != 1024) {
         fprintf(stderr, "sparse structure: unexpected flow cond channels %d\n", flow.cond_channels);
@@ -840,7 +841,10 @@ static int run_sparse_structure_image(
             flow_model.projection.proj_channels);
     }
     flow_model.base = flow;
-    trellis_ggml_set_flash_attn_enabled(use_ggml_flash_attn);
+    trellis_ggml_attention_policy attention_policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    if (use_ggml_flash_attn) {
+        attention_policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH;
+    }
 
     const size_t latent_count = (size_t) flow.in_channels * (size_t) tokens;
     const size_t context_count = (size_t) flow.cond_channels * (size_t) cond_tokens;
@@ -879,7 +883,7 @@ static int run_sparse_structure_image(
         goto cleanup;
     }
     if (flow_model.projection.enabled) {
-        status = trellis_dit_flow_executor_init_cfg_batch_projected(
+        status = trellis_dit_flow_executor_init_cfg_batch_projected_with_policy(
             &flow_executor_cfg,
             backend,
             &flow_model,
@@ -890,9 +894,10 @@ static int run_sparse_structure_image(
             projected_context,
             neg_projected_context,
             cos_phase,
-            sin_phase);
+            sin_phase,
+            &attention_policy);
     } else {
-        status = trellis_dit_flow_executor_init_cfg_batch(
+        status = trellis_dit_flow_executor_init_cfg_batch_with_policy(
             &flow_executor_cfg,
             backend,
             &flow,
@@ -901,7 +906,8 @@ static int run_sparse_structure_image(
             context,
             neg_context,
             cos_phase,
-            sin_phase);
+            sin_phase,
+            &attention_policy);
     }
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_WARN(
@@ -909,7 +915,7 @@ static int run_sparse_structure_image(
             trellis_status_string(status));
         trellis_dit_flow_executor_free(&flow_executor_cfg);
         if (flow_model.projection.enabled) {
-            status = trellis_dit_flow_executor_init_single_projected(
+            status = trellis_dit_flow_executor_init_single_projected_with_policy(
                 &flow_executor_cond,
                 backend,
                 &flow_model,
@@ -918,9 +924,10 @@ static int run_sparse_structure_image(
                 context,
                 projected_context,
                 cos_phase,
-                sin_phase);
+                sin_phase,
+                &attention_policy);
         } else {
-            status = trellis_dit_flow_executor_init_single(
+            status = trellis_dit_flow_executor_init_single_with_policy(
                 &flow_executor_cond,
                 backend,
                 &flow,
@@ -928,11 +935,12 @@ static int run_sparse_structure_image(
                 cond_tokens,
                 context,
                 cos_phase,
-                sin_phase);
+                sin_phase,
+                &attention_policy);
         }
         if (status == TRELLIS_STATUS_OK) {
             if (flow_model.projection.enabled) {
-                status = trellis_dit_flow_executor_init_single_projected(
+                status = trellis_dit_flow_executor_init_single_projected_with_policy(
                     &flow_executor_uncond,
                     backend,
                     &flow_model,
@@ -941,9 +949,10 @@ static int run_sparse_structure_image(
                     neg_context,
                     neg_projected_context,
                     cos_phase,
-                    sin_phase);
+                    sin_phase,
+                    &attention_policy);
             } else {
-                status = trellis_dit_flow_executor_init_single(
+                status = trellis_dit_flow_executor_init_single_with_policy(
                     &flow_executor_uncond,
                     backend,
                     &flow,
@@ -951,7 +960,8 @@ static int run_sparse_structure_image(
                     cond_tokens,
                     neg_context,
                     cos_phase,
-                    sin_phase);
+                    sin_phase,
+                    &attention_policy);
             }
         }
         if (status != TRELLIS_STATUS_OK) {
@@ -1112,7 +1122,6 @@ static int run_sparse_structure_image(
     rc = 0;
 
 cleanup:
-    trellis_ggml_set_flash_attn_enabled(0);
     if (rc != 0 && result != NULL) {
         trellis_sparse_structure_result_free(result);
     }
@@ -1155,6 +1164,8 @@ trellis_status trellis_pipeline_run_sparse_structure(
     int rc = run_sparse_structure_image(
         backend,
         options->model_dir,
+        options->flow_path,
+        options->decoder_path,
         options->dino_dir,
         options->image_path,
         options->latent_size,
@@ -1165,6 +1176,8 @@ trellis_status trellis_pipeline_run_sparse_structure(
         options->flow_blocks_override,
         options->flow_block_parts_override,
         options->flow_no_rope,
+        options->projected_conditioning,
+        options->emulate_bf16_blocks,
         options->use_ggml_flash_attn,
         options->voxel_threshold,
         options->camera_angle_x,

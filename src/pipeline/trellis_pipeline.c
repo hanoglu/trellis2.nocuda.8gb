@@ -3,8 +3,10 @@
 #endif
 
 #include "trellis.h"
+#include "adapter.h"
 #include "trellis_platform.h"
 #include "sparse/trellis_sparse_backend.h"
+#include "trellis_model_package.h"
 #include "trellis_pipeline_internal.h"
 
 #include <ctype.h>
@@ -44,6 +46,38 @@ static size_t model_cache_budget_bytes_from_options(const trellis_image_to_gltf_
         mib = max_mib;
     }
     return (size_t) mib * 1024u * 1024u;
+}
+
+static int pipeline_component_path(
+    const trellis_model_package * package,
+    const char * role,
+    char path[4096]) {
+    const trellis_status status = trellis_model_package_resolve_component_path(
+        package, role, path, 4096);
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR(
+            "model package '%s': required component role '%s' is unavailable: %s",
+            package != NULL && package->id != NULL ? package->id : "unknown",
+            role != NULL ? role : "unknown",
+            trellis_status_string(status));
+        return 0;
+    }
+    return 1;
+}
+
+static int pipeline_component_flash_enabled(
+    const trellis_image_to_gltf_options * options,
+    const trellis_model_component_instance * component) {
+    if (options->no_ggml_flash_attn) return 0;
+    if (options->use_ggml_flash_attn) return 1;
+    return component != NULL && component->execution.attention == TRELLIS_ATTENTION_FLASH;
+}
+
+static int pipeline_component_emulates_bf16(
+    const trellis_image_to_gltf_options * options,
+    const trellis_model_component_instance * component) {
+    return options->emulate_bf16_blocks ||
+        (component != NULL && component->execution.emulate_bf16_blocks);
 }
 
 extern unsigned char * stbi_load(char const * filename, int * x, int * y, int * comp, int req_comp);
@@ -298,8 +332,13 @@ static int make_shape_decoder_path(
 
 static int make_texture_decoder_path(
     const char * model_dir,
+    const char * override_path,
     char * out,
     size_t out_size) {
+    if (override_path != NULL && override_path[0] != '\0') {
+        int n = snprintf(out, out_size, "%s", override_path);
+        return n >= 0 && (size_t) n < out_size;
+    }
     return trellis_make_model_path(
         model_dir,
         "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors",
@@ -703,13 +742,18 @@ trellis_status trellis_pipeline_decode_texture_latent_voxels(
         status = trellis_pipeline_model_cache_get_texture_decoder(
             options->cache,
             options->model_dir,
+            options->decoder_override_path,
             &decoder_ptr);
         if (status != TRELLIS_STATUS_OK) {
             TRELLIS_ERROR("texture decode: cache texture decoder load failed: %s", trellis_status_string(status));
             goto cleanup;
         }
     } else {
-        if (!make_texture_decoder_path(options->model_dir, decoder_path, sizeof(decoder_path))) {
+        if (!make_texture_decoder_path(
+                options->model_dir,
+                options->decoder_override_path,
+                decoder_path,
+                sizeof(decoder_path))) {
             TRELLIS_ERROR("texture decode: failed to build texture decoder path");
             goto cleanup;
         }
@@ -1272,31 +1316,23 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         options->vkmesh_gpu_workspace_budget_mib < 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
-    const char * pixal_naf_path = pixal_options->naf_path;
-    const float pixal_camera_angle_x = pixal_options->camera_angle_x > 0.0f ?
-        pixal_options->camera_angle_x : 0.8575560450553894f;
-    const float pixal_camera_distance = pixal_options->camera_distance > 0.0f ?
-        pixal_options->camera_distance : 2.0f;
-    const float pixal_mesh_scale = pixal_options->mesh_scale > 0.0f ?
-        pixal_options->mesh_scale : 1.0f;
+    const char * pixal_naf_override = pixal_options->naf_path;
+    float pixal_camera_angle_x = pixal_options->camera_angle_x;
+    float pixal_camera_distance = pixal_options->camera_distance;
+    float pixal_mesh_scale = pixal_options->mesh_scale;
     const char * output_gltf_path =
         options->gltf_path != NULL && options->gltf_path[0] != '\0' ?
             options->gltf_path :
             "output.glb";
-
-    const int pixal_checkpoint =
-        trellis_pipeline_sparse_structure_checkpoint_uses_pixal_projection(options->model_dir);
-    if (pixal_checkpoint && options->model_cache &&
-        model_cache_budget_bytes_from_options(options) == 0) {
-        TRELLIS_WARN(
-            "pipeline: Pixal3D with an unlimited model cache can have a large NAF/1024 workspace peak; use --no-model-cache or --model-cache-budget-mib N on memory-constrained devices");
-    }
 
     char temp_image[4096];
     char temp_birefnet_image[4096];
     temp_image[0] = '\0';
     temp_birefnet_image[0] = '\0';
     trellis_status status = TRELLIS_STATUS_OK;
+    trellis_model_package model_package = TRELLIS_MODEL_PACKAGE_INIT;
+    const trellis_image_to_3d_adapter_descriptor * task_adapter = NULL;
+    int projected_conditioning = 0;
     const char * backend_name =
         options->backend != NULL && options->backend[0] != '\0' ?
             options->backend :
@@ -1315,6 +1351,49 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
 
+    status = trellis_model_package_load(options->model_dir, &model_package);
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR(
+            "model package: failed to load '%s': %s",
+            options->model_dir,
+            trellis_status_string(status));
+        return status;
+    }
+    status = trellis_image_to_3d_adapter_resolve_package(
+        &model_package, &task_adapter);
+    if (status != TRELLIS_STATUS_OK) {
+        TRELLIS_ERROR(
+            "model package '%s': no compatible image_to_3d adapter for family '%s': %s",
+            model_package.id != NULL ? model_package.id : "unknown",
+            model_package.family != NULL ? model_package.family : "unknown",
+            trellis_status_string(status));
+        trellis_model_package_free(&model_package);
+        return status;
+    }
+    projected_conditioning = task_adapter->uses_projected_conditioning;
+    if (pixal_camera_angle_x <= 0.0f) {
+        pixal_camera_angle_x = task_adapter->default_camera_angle_x;
+    }
+    if (pixal_camera_distance <= 0.0f) {
+        pixal_camera_distance = task_adapter->default_camera_distance;
+    }
+    if (pixal_mesh_scale <= 0.0f) {
+        pixal_mesh_scale = task_adapter->default_mesh_scale;
+    }
+    TRELLIS_INFO(
+        "model package: id=%s family=%s task=%s profile=%s adapter=%s source=%s",
+        model_package.id,
+        model_package.family,
+        model_package.task,
+        model_package.profile,
+        task_adapter->id,
+        model_package.source == TRELLIS_MODEL_PACKAGE_SOURCE_MANIFEST ? "manifest" : "legacy");
+    if (projected_conditioning && options->model_cache &&
+        model_cache_budget_bytes_from_options(options) == 0) {
+        TRELLIS_WARN(
+            "pipeline: Pixal3D with an unlimited model cache can have a large NAF/1024 workspace peak; use --no-model-cache or --model-cache-budget-mib N on memory-constrained devices");
+    }
+
     const char * sparse_structure_image_path = options->image_path;
     if (path_has_ext(options->image_path, "webp")) {
         if (!trellis_make_temp_path(
@@ -1322,17 +1401,19 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
             sizeof(temp_image),
             "trellis2_image_to_gltf",
             ".png")) {
+            trellis_model_package_free(&model_package);
             return TRELLIS_STATUS_INVALID_ARGUMENT;
         }
         TRELLIS_INFO("image prep: converting WebP -> PNG via ffmpeg: %s", temp_image);
         if (!convert_webp_to_png_ffmpeg(options->image_path, temp_image)) {
             TRELLIS_ERROR("image prep: WebP conversion failed; install ffmpeg or convert the image to PNG/JPEG first");
             unlink_if_set(temp_image);
+            trellis_model_package_free(&model_package);
             return TRELLIS_STATUS_IO_ERROR;
         }
         sparse_structure_image_path = temp_image;
     }
-    if (pixal_checkpoint &&
+    if (task_adapter->requires_transparent_foreground &&
         (options->birefnet_path == NULL || options->birefnet_path[0] == '\0')) {
         int has_transparent_alpha = 0;
         status = image_has_transparent_alpha(
@@ -1340,12 +1421,14 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
             &has_transparent_alpha);
         if (status != TRELLIS_STATUS_OK) {
             unlink_if_set(temp_image);
+            trellis_model_package_free(&model_package);
             return status;
         }
         if (!has_transparent_alpha) {
             TRELLIS_ERROR(
                 "pipeline: Pixal3D requires foreground-isolated input; provide --birefnet FILE or a transparent RGBA image");
             unlink_if_set(temp_image);
+            trellis_model_package_free(&model_package);
             return TRELLIS_STATUS_INVALID_ARGUMENT;
         }
     }
@@ -1356,6 +1439,7 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
             "trellis2_birefnet",
             ".png")) {
             unlink_if_set(temp_image);
+            trellis_model_package_free(&model_package);
             return TRELLIS_STATUS_INVALID_ARGUMENT;
         }
         TRELLIS_INFO("image prep: running BiRefNet background removal -> %s", temp_birefnet_image);
@@ -1368,6 +1452,7 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         if (status != TRELLIS_STATUS_OK) {
             unlink_if_set(temp_birefnet_image);
             unlink_if_set(temp_image);
+            trellis_model_package_free(&model_package);
             return status;
         }
         sparse_structure_image_path = temp_birefnet_image;
@@ -1384,6 +1469,7 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         TRELLIS_ERROR("backend: '%s' is not a full pipeline backend; use cuda or vulkan", backend_name);
         unlink_if_set(temp_birefnet_image);
         unlink_if_set(temp_image);
+        trellis_model_package_free(&model_package);
         return status;
     }
     const int graph_device = options->device;
@@ -1396,6 +1482,7 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
             trellis_status_string(status));
         unlink_if_set(temp_birefnet_image);
         unlink_if_set(temp_image);
+        trellis_model_package_free(&model_package);
         return status;
     }
     TRELLIS_INFO(
@@ -1411,6 +1498,7 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
             trellis_backend_free(&graph_backend);
             unlink_if_set(temp_birefnet_image);
             unlink_if_set(temp_image);
+            trellis_model_package_free(&model_package);
             return status;
         }
     } else if (sparse_backend_kind == TRELLIS_SPARSE_BACKEND_VULKAN) {
@@ -1423,6 +1511,7 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
             trellis_backend_free(&graph_backend);
             unlink_if_set(temp_birefnet_image);
             unlink_if_set(temp_image);
+            trellis_model_package_free(&model_package);
             return status;
         }
     }
@@ -1457,20 +1546,25 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     int64_t cascade_decoder_n = 0;
     int32_t * cascade_coords = NULL;
     int64_t cascade_n = 0;
-    int use_ggml_flash_attn = options->no_ggml_flash_attn ? 0 : 1;
-    if (pixal_checkpoint && !options->use_ggml_flash_attn) {
-        /* Pixal3D checkpoints use BF16 transformer activations. The current
-           ggml flash path narrows F32 K/V to FP16 and can overflow to NaN on
-           the long 1024 sparse sequence. Keep TRELLIS.2 defaults unchanged. */
-        use_ggml_flash_attn = 0;
-    }
-    if (options->use_ggml_flash_attn) {
-        use_ggml_flash_attn = 1;
-    }
-    TRELLIS_INFO(
-        "ggml flash attention: %s%s",
-        use_ggml_flash_attn ? "enabled" : "disabled",
-        pixal_checkpoint && !options->use_ggml_flash_attn ? " (Pixal3D safe default)" : "");
+    char sparse_flow_path[4096];
+    char sparse_decoder_path[4096];
+    char shape_flow_lr_path[4096];
+    char shape_flow_hr_path[4096];
+    char texture_flow_path[4096];
+    char shape_decoder_path[4096];
+    char texture_decoder_path[4096];
+    char naf_component_path[4096];
+    shape_flow_hr_path[0] = '\0';
+    naf_component_path[0] = '\0';
+    const char * pixal_naf_path = pixal_naf_override;
+    const trellis_model_component_instance * sparse_flow_component = NULL;
+    const trellis_model_component_instance * shape_flow_lr_component = NULL;
+    const trellis_model_component_instance * shape_flow_hr_component = NULL;
+    const trellis_model_component_instance * texture_flow_component = NULL;
+    int sparse_flow_flash = 0;
+    int shape_flow_lr_flash = 0;
+    int shape_flow_hr_flash = 0;
+    int texture_flow_flash = 0;
 
     const char * pipeline_type =
         options->pipeline_type != NULL && options->pipeline_type[0] != '\0' ?
@@ -1513,6 +1607,69 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         final_resolution,
         sparse_cond_resolution,
         sparse_output_resolution);
+    if (projected_conditioning && !use_1024_cascade) {
+        TRELLIS_ERROR(
+            "pipeline: Pixal3D requires a cascade profile (use --pipeline 1024_cascade or 1536_cascade)");
+        status = TRELLIS_STATUS_INVALID_ARGUMENT;
+        goto cleanup;
+    }
+
+    const char * shape_flow_lr_role =
+        use_1024_cascade || final_resolution < 1024 ?
+            "shape_flow_512" : "shape_flow_1024";
+    const char * texture_flow_role =
+        final_resolution >= 1024 ? "texture_flow_1024" : "texture_flow_512";
+    sparse_flow_component = trellis_model_package_find_component(
+        &model_package, "sparse_structure_flow");
+    shape_flow_lr_component = trellis_model_package_find_component(
+        &model_package, shape_flow_lr_role);
+    texture_flow_component = trellis_model_package_find_component(
+        &model_package, texture_flow_role);
+    if (use_1024_cascade) {
+        shape_flow_hr_component = trellis_model_package_find_component(
+            &model_package, "shape_flow_1024");
+    }
+    if (sparse_flow_component == NULL || shape_flow_lr_component == NULL ||
+        texture_flow_component == NULL ||
+        (use_1024_cascade && shape_flow_hr_component == NULL) ||
+        !pipeline_component_path(&model_package, "sparse_structure_flow", sparse_flow_path) ||
+        !pipeline_component_path(&model_package, "sparse_structure_decoder", sparse_decoder_path) ||
+        !pipeline_component_path(&model_package, shape_flow_lr_role, shape_flow_lr_path) ||
+        (use_1024_cascade &&
+         !pipeline_component_path(&model_package, "shape_flow_1024", shape_flow_hr_path)) ||
+        !pipeline_component_path(&model_package, texture_flow_role, texture_flow_path) ||
+        !pipeline_component_path(&model_package, "shape_decoder", shape_decoder_path) ||
+        !pipeline_component_path(&model_package, "texture_decoder", texture_decoder_path)) {
+        status = TRELLIS_STATUS_PARSE_ERROR;
+        goto cleanup;
+    }
+    if (projected_conditioning &&
+        (pixal_naf_path == NULL || pixal_naf_path[0] == '\0')) {
+        if (!pipeline_component_path(
+                &model_package, "naf_encoder", naf_component_path)) {
+            status = TRELLIS_STATUS_PARSE_ERROR;
+            goto cleanup;
+        }
+        pixal_naf_path = naf_component_path;
+    }
+
+    sparse_flow_flash = pipeline_component_flash_enabled(
+        options, sparse_flow_component);
+    shape_flow_lr_flash = pipeline_component_flash_enabled(
+        options, shape_flow_lr_component);
+    shape_flow_hr_flash = use_1024_cascade ?
+        pipeline_component_flash_enabled(options, shape_flow_hr_component) :
+        shape_flow_lr_flash;
+    texture_flow_flash = pipeline_component_flash_enabled(
+        options, texture_flow_component);
+    TRELLIS_INFO(
+        "attention policy: sparse=%s shape_lr=%s shape_hr=%s texture=%s%s",
+        sparse_flow_flash ? "flash" : "explicit",
+        shape_flow_lr_flash ? "flash" : "explicit",
+        shape_flow_hr_flash ? "flash" : "explicit",
+        texture_flow_flash ? "flash" : "explicit",
+        projected_conditioning && !options->use_ggml_flash_attn ?
+            " (Pixal3D safe package defaults)" : "");
 
     if (options->model_cache) {
         const size_t model_cache_budget_bytes = model_cache_budget_bytes_from_options(options);
@@ -1532,6 +1689,8 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     trellis_sparse_structure_options sparse_structure;
     memset(&sparse_structure, 0, sizeof(sparse_structure));
     sparse_structure.model_dir = options->model_dir;
+    sparse_structure.flow_path = sparse_flow_path;
+    sparse_structure.decoder_path = sparse_decoder_path;
     sparse_structure.dino_dir = options->dino_dir;
     sparse_structure.image_path = sparse_structure_image_path;
     sparse_structure.latent_size = options->latent_size > 0 ? options->latent_size : 16;
@@ -1542,7 +1701,10 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     sparse_structure.flow_blocks_override = options->flow_blocks_override;
     sparse_structure.flow_block_parts_override = options->flow_block_parts_override;
     sparse_structure.flow_no_rope = options->flow_no_rope;
-    sparse_structure.use_ggml_flash_attn = use_ggml_flash_attn;
+    sparse_structure.projected_conditioning = projected_conditioning;
+    sparse_structure.emulate_bf16_blocks = pipeline_component_emulates_bf16(
+        options, sparse_flow_component);
+    sparse_structure.use_ggml_flash_attn = sparse_flow_flash;
     sparse_structure.voxel_threshold = 0.0f;
     sparse_structure.camera_angle_x = pixal_camera_angle_x;
     sparse_structure.camera_distance = pixal_camera_distance;
@@ -1565,13 +1727,6 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         status = TRELLIS_STATUS_ERROR;
         goto cleanup;
     }
-    if (sparse_structure_result.projected_conditioning && !use_1024_cascade) {
-        TRELLIS_ERROR(
-            "pipeline: Pixal3D checkpoints require a cascade pipeline (use --pipeline 1024_cascade or 1536_cascade)");
-        status = TRELLIS_STATUS_INVALID_ARGUMENT;
-        goto cleanup;
-    }
-
     const float * shape_lr_cond = sparse_structure_result.cond;
     int shape_lr_cond_tokens = sparse_structure_result.cond_tokens;
     if (sparse_structure_result.projected_conditioning) {
@@ -1614,7 +1769,9 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     trellis_structured_latent_options structured_latent;
     memset(&structured_latent, 0, sizeof(structured_latent));
     structured_latent.model_dir = options->model_dir;
-    structured_latent.flow_override_path = options->flow_override_path;
+    structured_latent.flow_override_path =
+        options->flow_override_path != NULL && options->flow_override_path[0] != '\0' ?
+            options->flow_override_path : shape_flow_lr_path;
     structured_latent.flow_component = TRELLIS_COMPONENT_SHAPE_SLAT_FLOW;
     structured_latent.label = "shape";
     structured_latent.normalization_key = "shape_slat_normalization";
@@ -1645,8 +1802,9 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     structured_latent.flow_blocks_override = options->flow_blocks_override;
     structured_latent.flow_block_parts_override = options->flow_block_parts_override;
     structured_latent.flow_no_rope = options->flow_no_rope;
-    structured_latent.emulate_bf16_blocks = options->emulate_bf16_blocks || pixal_checkpoint;
-    structured_latent.use_ggml_flash_attn = use_ggml_flash_attn;
+    structured_latent.emulate_bf16_blocks = pipeline_component_emulates_bf16(
+        options, shape_flow_lr_component);
+    structured_latent.use_ggml_flash_attn = shape_flow_lr_flash;
     structured_latent.backend = &graph_backend;
     structured_latent.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
     structured_latent.cache = model_cache_ptr;
@@ -1670,7 +1828,9 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         trellis_pipeline_mesh_options cascade_upsample_options;
         memset(&cascade_upsample_options, 0, sizeof(cascade_upsample_options));
         cascade_upsample_options.model_dir = options->model_dir;
-        cascade_upsample_options.decoder_override_path = options->decoder_override_path;
+        cascade_upsample_options.decoder_override_path =
+            options->decoder_override_path != NULL && options->decoder_override_path[0] != '\0' ?
+                options->decoder_override_path : shape_decoder_path;
         cascade_upsample_options.latent = &shape_latent_lr;
         cascade_upsample_options.resolution = 512;
         cascade_upsample_options.decode_max_levels = 0;
@@ -1701,7 +1861,8 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
                 cascade_decoder_n,
                 512,
                 actual_hr_resolution,
-                sparse_structure_result.projected_conditioning ?
+                task_adapter->cascade_quantization ==
+                        TRELLIS_IMAGE_TO_3D_CASCADE_QUANTIZATION_ROUND ?
                     TRELLIS_CASCADE_COORD_QUANTIZE_PIXAL :
                     TRELLIS_CASCADE_COORD_QUANTIZE_TRELLIS,
                 &cascade_coords,
@@ -1777,6 +1938,7 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
             actual_hr_resolution);
         trellis_structured_latent_options hr_shape_options = structured_latent;
         hr_shape_options.label = actual_hr_resolution == 1024 ? "shape1024" : "shape_hr";
+        hr_shape_options.flow_override_path = shape_flow_hr_path;
         hr_shape_options.coords_bxyz = cascade_coords;
         hr_shape_options.n_coords = cascade_n;
         hr_shape_options.cond = cond_1024.cond;
@@ -1786,6 +1948,9 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
         hr_shape_options.projected_channels = cond_1024.projected_channels;
         hr_shape_options.noise_seed = options->noise_seed == 0 ? 19u : options->noise_seed + 1u;
         hr_shape_options.resolution = actual_hr_resolution;
+        hr_shape_options.emulate_bf16_blocks = pipeline_component_emulates_bf16(
+            options, shape_flow_hr_component);
+        hr_shape_options.use_ggml_flash_attn = shape_flow_hr_flash;
         perf_start_us = ggml_time_us();
         status = trellis_pipeline_run_structured_latent(&hr_shape_options, &shape_latent);
         if (status != TRELLIS_STATUS_OK) {
@@ -1802,7 +1967,9 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     trellis_pipeline_mesh_options mesh_options;
     memset(&mesh_options, 0, sizeof(mesh_options));
     mesh_options.model_dir = options->model_dir;
-    mesh_options.decoder_override_path = options->decoder_override_path;
+    mesh_options.decoder_override_path =
+        options->decoder_override_path != NULL && options->decoder_override_path[0] != '\0' ?
+            options->decoder_override_path : shape_decoder_path;
     mesh_options.latent = &shape_latent;
     mesh_options.resolution = shape_latent.resolution;
     mesh_options.decode_max_levels = options->decode_max_levels;
@@ -1911,6 +2078,7 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     trellis_structured_latent_options texture_options;
     memset(&texture_options, 0, sizeof(texture_options));
     texture_options.model_dir = options->model_dir;
+    texture_options.flow_override_path = texture_flow_path;
     texture_options.flow_component = TRELLIS_COMPONENT_TEX_SLAT_FLOW;
     texture_options.label = "texture";
     texture_options.normalization_key = "tex_slat_normalization";
@@ -1934,8 +2102,9 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     texture_options.flow_blocks_override = options->flow_blocks_override;
     texture_options.flow_block_parts_override = options->flow_block_parts_override;
     texture_options.flow_no_rope = options->flow_no_rope;
-    texture_options.emulate_bf16_blocks = options->emulate_bf16_blocks || pixal_checkpoint;
-    texture_options.use_ggml_flash_attn = use_ggml_flash_attn;
+    texture_options.emulate_bf16_blocks = pipeline_component_emulates_bf16(
+        options, texture_flow_component);
+    texture_options.use_ggml_flash_attn = texture_flow_flash;
     texture_options.backend = &graph_backend;
     texture_options.cuda = sparse_backend_kind == TRELLIS_SPARSE_BACKEND_CUDA ? &cuda : NULL;
     texture_options.cache = model_cache_ptr;
@@ -1953,6 +2122,7 @@ trellis_status trellis_pipeline_image_to_gltf_ex(
     trellis_pipeline_texture_options tex_decode;
     memset(&tex_decode, 0, sizeof(tex_decode));
     tex_decode.model_dir = options->model_dir;
+    tex_decode.decoder_override_path = texture_decoder_path;
     tex_decode.latent = &texture_latent;
     tex_decode.guide_subs = &shape_subs;
     tex_decode.decode_max_levels = options->decode_max_levels;
@@ -2031,5 +2201,6 @@ cleanup:
     trellis_backend_free(&graph_backend);
     unlink_if_set(temp_birefnet_image);
     unlink_if_set(temp_image);
+    trellis_model_package_free(&model_package);
     return status;
 }

@@ -562,7 +562,10 @@ trellis_status trellis_pipeline_run_structured_latent(
         TRELLIS_INFO("structured latent %s: bf16 block activation round-trip enabled", label);
     }
     flow_model.base = flow;
-    trellis_ggml_set_flash_attn_enabled(options->use_ggml_flash_attn);
+    trellis_ggml_attention_policy attention_policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    if (options->use_ggml_flash_attn) {
+        attention_policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH;
+    }
 
     const size_t state_count = (size_t) options->n_coords * (size_t) state_channels;
     const size_t input_count = (size_t) options->n_coords * (size_t) flow.in_channels;
@@ -644,7 +647,7 @@ trellis_status trellis_pipeline_run_structured_latent(
     const float * neg_projected_context = options->neg_projected_cond != NULL ?
         options->neg_projected_cond : neg_projected_cond;
     if (flow_model.projection.enabled) {
-        status = trellis_dit_flow_executor_init_cfg_batch_projected(
+        status = trellis_dit_flow_executor_init_cfg_batch_projected_with_policy(
             &flow_executor_cfg,
             backend,
             &flow_model,
@@ -655,9 +658,10 @@ trellis_status trellis_pipeline_run_structured_latent(
             options->projected_cond,
             neg_projected_context,
             cos_phase,
-            sin_phase);
+            sin_phase,
+            &attention_policy);
     } else {
-        status = trellis_dit_flow_executor_init_cfg_batch(
+        status = trellis_dit_flow_executor_init_cfg_batch_with_policy(
             &flow_executor_cfg,
             backend,
             &flow,
@@ -666,7 +670,8 @@ trellis_status trellis_pipeline_run_structured_latent(
             options->cond,
             neg_context,
             cos_phase,
-            sin_phase);
+            sin_phase,
+            &attention_policy);
     }
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_WARN(
@@ -675,7 +680,7 @@ trellis_status trellis_pipeline_run_structured_latent(
             trellis_status_string(status));
         trellis_dit_flow_executor_free(&flow_executor_cfg);
         if (flow_model.projection.enabled) {
-            status = trellis_dit_flow_executor_init_single_projected(
+            status = trellis_dit_flow_executor_init_single_projected_with_policy(
                 &flow_executor_cond,
                 backend,
                 &flow_model,
@@ -684,9 +689,10 @@ trellis_status trellis_pipeline_run_structured_latent(
                 options->cond,
                 options->projected_cond,
                 cos_phase,
-                sin_phase);
+                sin_phase,
+                &attention_policy);
         } else {
-            status = trellis_dit_flow_executor_init_single(
+            status = trellis_dit_flow_executor_init_single_with_policy(
                 &flow_executor_cond,
                 backend,
                 &flow,
@@ -694,11 +700,12 @@ trellis_status trellis_pipeline_run_structured_latent(
                 options->cond_tokens,
                 options->cond,
                 cos_phase,
-                sin_phase);
+                sin_phase,
+                &attention_policy);
         }
         if (status == TRELLIS_STATUS_OK) {
             if (flow_model.projection.enabled) {
-                status = trellis_dit_flow_executor_init_single_projected(
+                status = trellis_dit_flow_executor_init_single_projected_with_policy(
                     &flow_executor_uncond,
                     backend,
                     &flow_model,
@@ -707,9 +714,10 @@ trellis_status trellis_pipeline_run_structured_latent(
                     neg_context,
                     neg_projected_context,
                     cos_phase,
-                    sin_phase);
+                    sin_phase,
+                    &attention_policy);
             } else {
-                status = trellis_dit_flow_executor_init_single(
+                status = trellis_dit_flow_executor_init_single_with_policy(
                     &flow_executor_uncond,
                     backend,
                     &flow,
@@ -717,7 +725,8 @@ trellis_status trellis_pipeline_run_structured_latent(
                     options->cond_tokens,
                     neg_context,
                     cos_phase,
-                    sin_phase);
+                    sin_phase,
+                    &attention_policy);
             }
         }
         if (status != TRELLIS_STATUS_OK) {
@@ -813,7 +822,6 @@ trellis_status trellis_pipeline_run_structured_latent(
     status = TRELLIS_STATUS_OK;
 
 cleanup:
-    trellis_ggml_set_flash_attn_enabled(0);
     if (status != TRELLIS_STATUS_OK) {
         trellis_structured_latent_free(latent_out);
     }

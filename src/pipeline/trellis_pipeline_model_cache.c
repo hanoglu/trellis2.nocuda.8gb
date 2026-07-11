@@ -323,17 +323,20 @@ trellis_status trellis_pipeline_model_cache_get_dino(
 trellis_status trellis_pipeline_model_cache_get_sparse_structure_flow_model(
     trellis_pipeline_model_cache * cache,
     const char * model_dir,
+    const char * override_path,
     const trellis_dit_flow_model ** model_out) {
     if (model_out == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     *model_out = NULL;
     char path[4096];
-    trellis_status status = trellis_make_model_path(
-        model_dir,
-        "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
-        path,
-        sizeof(path));
+    trellis_status status = override_path != NULL && override_path[0] != '\0' ?
+        copy_path(path, sizeof(path), override_path) :
+        trellis_make_model_path(
+            model_dir,
+            "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
+            path,
+            sizeof(path));
     if (status != TRELLIS_STATUS_OK) {
         return status;
     }
@@ -383,7 +386,7 @@ trellis_status trellis_pipeline_model_cache_get_sparse_structure_flow(
     *weights_out = NULL;
     const trellis_dit_flow_model * model = NULL;
     trellis_status status = trellis_pipeline_model_cache_get_sparse_structure_flow_model(
-        cache, model_dir, &model);
+        cache, model_dir, NULL, &model);
     if (status == TRELLIS_STATUS_OK) {
         *weights_out = &model->base;
     }
@@ -393,17 +396,20 @@ trellis_status trellis_pipeline_model_cache_get_sparse_structure_flow(
 trellis_status trellis_pipeline_model_cache_get_sparse_structure_decoder(
     trellis_pipeline_model_cache * cache,
     const char * model_dir,
+    const char * override_path,
     const trellis_ss_decoder_weights ** weights_out) {
     if (weights_out == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     *weights_out = NULL;
     char path[4096];
-    trellis_status status = trellis_make_model_path(
-        model_dir,
-        "ckpts/ss_dec_conv3d_16l8_fp16.safetensors",
-        path,
-        sizeof(path));
+    trellis_status status = override_path != NULL && override_path[0] != '\0' ?
+        copy_path(path, sizeof(path), override_path) :
+        trellis_make_model_path(
+            model_dir,
+            "ckpts/ss_dec_conv3d_16l8_fp16.safetensors",
+            path,
+            sizeof(path));
     if (status != TRELLIS_STATUS_OK) {
         return status;
     }
@@ -572,17 +578,20 @@ trellis_status trellis_pipeline_model_cache_get_shape_decoder(
 trellis_status trellis_pipeline_model_cache_get_texture_decoder(
     trellis_pipeline_model_cache * cache,
     const char * model_dir,
+    const char * override_path,
     const trellis_sparse_unet_vae_decoder_weights ** weights_out) {
     if (weights_out == NULL) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     *weights_out = NULL;
     char path[4096];
-    trellis_status status = trellis_make_model_path(
-        model_dir,
-        "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors",
-        path,
-        sizeof(path));
+    trellis_status status = override_path != NULL && override_path[0] != '\0' ?
+        copy_path(path, sizeof(path), override_path) :
+        trellis_make_model_path(
+            model_dir,
+            "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors",
+            path,
+            sizeof(path));
     if (status != TRELLIS_STATUS_OK) {
         return status;
     }

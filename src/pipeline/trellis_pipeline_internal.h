@@ -70,11 +70,13 @@ trellis_status trellis_pipeline_model_cache_get_sparse_structure_flow(
 trellis_status trellis_pipeline_model_cache_get_sparse_structure_flow_model(
     trellis_pipeline_model_cache * cache,
     const char * model_dir,
+    const char * override_path,
     const trellis_dit_flow_model ** model_out);
 
 trellis_status trellis_pipeline_model_cache_get_sparse_structure_decoder(
     trellis_pipeline_model_cache * cache,
     const char * model_dir,
+    const char * override_path,
     const trellis_ss_decoder_weights ** weights_out);
 
 trellis_status trellis_pipeline_model_cache_get_slat_flow(
@@ -104,6 +106,7 @@ trellis_status trellis_pipeline_model_cache_get_shape_decoder(
 trellis_status trellis_pipeline_model_cache_get_texture_decoder(
     trellis_pipeline_model_cache * cache,
     const char * model_dir,
+    const char * override_path,
     const trellis_sparse_unet_vae_decoder_weights ** weights_out);
 
 typedef struct trellis_sparse_structure_result {
@@ -117,6 +120,8 @@ typedef struct trellis_sparse_structure_result {
 
 typedef struct trellis_sparse_structure_options {
     const char * model_dir;
+    const char * flow_path;
+    const char * decoder_path;
     const char * dino_dir;
     const char * image_path;
     int latent_size;
@@ -127,6 +132,8 @@ typedef struct trellis_sparse_structure_options {
     int flow_blocks_override;
     int flow_block_parts_override;
     int flow_no_rope;
+    int projected_conditioning;
+    int emulate_bf16_blocks;
     int use_ggml_flash_attn;
     float voxel_threshold;
     float camera_angle_x;
@@ -142,9 +149,6 @@ void trellis_sparse_structure_result_free(trellis_sparse_structure_result * resu
 trellis_status trellis_pipeline_run_sparse_structure(
     const trellis_sparse_structure_options * options,
     trellis_sparse_structure_result * result);
-
-int trellis_pipeline_sparse_structure_checkpoint_uses_pixal_projection(
-    const char * model_dir);
 
 typedef struct trellis_image_condition_result {
     float * cond; /* [cond_tokens, 1024] */
@@ -281,6 +285,7 @@ void trellis_pbr_voxels_free(trellis_pbr_voxels * voxels);
 
 typedef struct trellis_pipeline_texture_options {
     const char * model_dir;
+    const char * decoder_override_path;
     const trellis_structured_latent * latent;
     const trellis_sparse_c2s_guides * guide_subs;
     int decode_max_levels;
