@@ -1,4 +1,4 @@
-#include "trellis_pixal_naf_attention.h"
+#include "projected_attention.h"
 
 #include <cuda_runtime_api.h>
 

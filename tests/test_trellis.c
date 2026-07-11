@@ -1,8 +1,8 @@
 #include "trellis.h"
 #include "trellis_platform.h"
 #include "trellis_checkpoint_validate.h"
-#include "trellis_cuda_kernels.h"
-#include "trellis_pipeline_internal.h"
+#include "kernels.h"
+#include "image_to_3d_internal.h"
 #include "trellis_sparse_reference.h"
 
 #include <errno.h>

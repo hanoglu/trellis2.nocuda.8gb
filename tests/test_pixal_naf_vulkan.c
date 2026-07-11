@@ -1,5 +1,5 @@
 #include "sparse/trellis_sparse_backend.h"
-#include "trellis_pixal_naf_attention.h"
+#include "projected_attention.h"
 
 #include <math.h>
 #include <stdint.h>

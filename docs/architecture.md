@@ -8,9 +8,8 @@ models/<package>/model.json     runtime data and component wiring
 src/runtime/                    package loading and static registries
 src/tasks/<task>/               typed request/result orchestration
 src/architectures/<name>/       graph construction and weight contracts
-src/weights/                    tensor storage, loading, and model cache
+src/weights/                    model-neutral tensor storage and loading
 src/ops/                        reusable CPU/CUDA/Vulkan operators
-src/backends/                   backend selection and device lifetime
 apps/ and tools/                user-facing entry points
 ```
 
@@ -23,7 +22,7 @@ multi-gigabyte weights.
 ## Dependency direction
 
 ```text
-apps/tools -> tasks -> architectures -> ops -> backends
+apps/tools -> tasks -> architectures -> ops
                   \-> weights ------/
        runtime registry and package metadata are shared by tasks/architectures
 ```

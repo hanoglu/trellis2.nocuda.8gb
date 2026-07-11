@@ -2,7 +2,7 @@
 
 #include "trellis.h"
 #include "trellis_platform.h"
-#include "trellis_pipeline_internal.h"
+#include "image_to_3d_internal.h"
 #include "trellis_sparse_backend.h"
 #include "raylib.h"
 #include "raymath.h"

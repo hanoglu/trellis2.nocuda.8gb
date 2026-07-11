@@ -1,4 +1,4 @@
-#include "trellis_pixal_naf.h"
+#include "pixal_naf.h"
 
 #include <math.h>
 #include <stdio.h>

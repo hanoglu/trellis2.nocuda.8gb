@@ -1,5 +1,5 @@
-#include "trellis_pixal_condition.h"
-#include "trellis_pixal_naf_attention.h"
+#include "pixal_projection.h"
+#include "projected_attention.h"
 
 #include <math.h>
 #include <stdint.h>

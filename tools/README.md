@@ -73,7 +73,7 @@ Opaque Pixal3D inputs require `--birefnet`; a foreground-isolated RGBA image
 with transparency can be passed without it.
 
 `trellis_image_to_gltf.c` is intentionally thin: it parses arguments and calls
-`trellis_pipeline_image_to_gltf_ex()` from `src/pipeline/trellis_pipeline.c`.
+`trellis_pipeline_image_to_gltf_ex()` from `src/tasks/image_to_3d/image_to_3d.c`.
 The legacy `trellis_pipeline_image_to_gltf()` entry point remains available and
 uses default Pixal3D camera values plus automatic NAF path discovery.
 
@@ -81,8 +81,9 @@ uses default Pixal3D camera values plus automatic NAF path discovery.
 fills small holes, remeshes with narrow-band dual contouring by default, and
 unwraps UVs by default. Pass an explicit simplify target when you want face
 decimation.
-The implementation lives under `tools/vkmesh/`; compute shaders, including the
-glTF texture bake/dilate/fill shaders, live under `tools/vkmesh/shaders/`.
+The standalone remesher lives under `tools/vkmesh/` and its compute shaders
+live under `tools/vkmesh/shaders/`. The image-to-3D glTF exporter and its
+texture bake shaders live under `src/tasks/image_to_3d/export/`.
 
 ```sh
 ../build/trellis-image-to-gltf \
@@ -144,15 +145,15 @@ a specific graph backend.
 Pipeline code lives under `src/`:
 
 - `src/runtime/trellis_runtime.c`: CUDA backend setup, logging/progress, model path/load helpers.
-- `src/model/trellis_dino.c`: DINOv3 image encoder weight binding and graph definition.
-- `src/model/trellis_cuda_forward.cu`: CUDA forward paths for sparse 3D decoder networks.
-- `src/model/trellis_slat_flow_model.c`: reusable pure-ggml DiT/SLatFlowModel binding and graph definition.
-- `src/model/trellis_sparse_structure_decoder.c`: sparse-structure VAE decoder weight binding.
-- `src/model/trellis_sparse_unet_vae_decoder.c`: reusable SparseUnetVaeDecoder binding for shape and texture decoders.
-- `src/model/trellis_cuda_kernels.cu`: internal CUDA kernels for sparse shape decoding.
-- `src/pipeline/trellis_sparse_structure_pipeline.c`: image -> sparse coords + DINO condition.
-- `src/pipeline/trellis_structured_latent_pipeline.c`: sparse coords + condition -> shape/texture SLat.
-- `src/pipeline/trellis_pipeline.c`: image -> textured GLB/glTF orchestration.
+- `src/architectures/dinov3/dinov3.c`: DINOv3 image encoder weight binding and graph definition.
+- `src/ops/sparse/cuda/forward.cu`: CUDA forward paths for sparse 3D decoder networks.
+- `src/architectures/dit_flow/dit_flow.c`: reusable pure-ggml DiT/SLatFlowModel binding and graph definition.
+- `src/architectures/sparse_structure_decoder/decoder.c`: sparse-structure VAE decoder weight binding.
+- `src/architectures/sparse_unet_decoder/decoder.c`: reusable SparseUnetVaeDecoder binding for shape and texture decoders.
+- `src/ops/sparse/cuda/kernels.cu`: internal CUDA kernels for sparse shape decoding.
+- `src/tasks/image_to_3d/stages/sparse_structure.c`: image -> sparse coords + DINO condition.
+- `src/tasks/image_to_3d/stages/structured_latent.c`: sparse coords + condition -> shape/texture SLat.
+- `src/tasks/image_to_3d/image_to_3d.c`: image -> textured GLB/glTF orchestration.
 - `tools/debug/trellis_checkpoint_validate.c`: checkpoint contract validation for debug tools/tests.
 - `tools/debug/trellis_sparse_reference.c`: CPU sparse reference ops for tests/debug.
 
