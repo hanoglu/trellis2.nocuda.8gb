@@ -460,6 +460,15 @@ endif()
 if (TRELLIS2_C_BUILD_TESTS)
     enable_testing()
 
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if (Python3_Interpreter_FOUND)
+        add_test(
+            NAME trellis2_c_glb_verifier_tests
+            COMMAND "${Python3_EXECUTABLE}" -m unittest -v tests/test_verify_glb.py)
+        set_tests_properties(trellis2_c_glb_verifier_tests PROPERTIES
+            WORKING_DIRECTORY "${CMAKE_CURRENT_LIST_DIR}")
+    endif()
+
     add_executable(trellis2_c_model_package_tests
         tests/test_model_package.c
     )
