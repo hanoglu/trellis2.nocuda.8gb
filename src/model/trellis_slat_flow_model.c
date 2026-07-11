@@ -589,8 +589,12 @@ static struct ggml_tensor * trellis_dit_flow_forward_impl(
     struct ggml_tensor * cos_phase,
     struct ggml_tensor * sin_phase,
     const trellis_dit_flow_weights * weights,
-    const trellis_dit_flow_projection_sidecar * projection) {
+    const trellis_dit_flow_projection_sidecar * projection,
+    const trellis_ggml_attention_policy * attention_policy) {
     if (ctx == NULL || x == NULL || timesteps == NULL || global_context == NULL || weights == NULL) {
+        return NULL;
+    }
+    if (!trellis_ggml_attention_policy_is_valid(attention_policy)) {
         return NULL;
     }
     if (x->ne[0] != weights->in_channels || global_context->ne[0] != weights->cond_channels) {
@@ -637,14 +641,17 @@ static struct ggml_tensor * trellis_dit_flow_forward_impl(
 
     for (int i = 0; i < weights->n_blocks; ++i) {
         trellis_ggml_modulated_cross_block_params params =
-            make_block_params(&weights->blocks[i], weights->debug_block_parts, weights->emulate_bf16_blocks);
+            make_block_params(
+                &weights->blocks[i],
+                weights->debug_block_parts,
+                weights->emulate_bf16_blocks);
         if (projected_mode) {
             const trellis_dit_flow_projection_block_weights * projected_block =
                 &projection->blocks[i];
             if (projected_block->proj_w == NULL || projected_block->proj_b == NULL) {
                 return NULL;
             }
-            h = trellis_ggml_modulated_cross_block_projected_rope(
+            h = trellis_ggml_modulated_cross_block_projected_rope_with_policy(
                 ctx,
                 h,
                 mod6,
@@ -655,9 +662,10 @@ static struct ggml_tensor * trellis_dit_flow_forward_impl(
                 projected_block->proj_w,
                 projected_block->proj_b,
                 weights->debug_disable_rope ? NULL : cos_phase,
-                weights->debug_disable_rope ? NULL : sin_phase);
+                weights->debug_disable_rope ? NULL : sin_phase,
+                attention_policy);
         } else {
-            h = trellis_ggml_modulated_cross_block_rope(
+            h = trellis_ggml_modulated_cross_block_rope_with_policy(
                 ctx,
                 h,
                 mod6,
@@ -665,7 +673,8 @@ static struct ggml_tensor * trellis_dit_flow_forward_impl(
                 weights->heads,
                 &params,
                 weights->debug_disable_rope ? NULL : cos_phase,
-                weights->debug_disable_rope ? NULL : sin_phase);
+                weights->debug_disable_rope ? NULL : sin_phase,
+                attention_policy);
         }
         if (h == NULL) {
             return NULL;
@@ -681,14 +690,15 @@ static struct ggml_tensor * trellis_dit_flow_forward_impl(
     return trellis_ggml_linear(ctx, h, weights->out_w, weights->out_b);
 }
 
-struct ggml_tensor * trellis_dit_flow_forward(
+struct ggml_tensor * trellis_dit_flow_forward_with_policy(
     struct ggml_context * ctx,
     struct ggml_tensor * x,
     struct ggml_tensor * timesteps,
     struct ggml_tensor * context,
     struct ggml_tensor * cos_phase,
     struct ggml_tensor * sin_phase,
-    const trellis_dit_flow_weights * weights) {
+    const trellis_dit_flow_weights * weights,
+    const struct trellis_ggml_attention_policy * attention_policy) {
     return trellis_dit_flow_forward_impl(
         ctx,
         x,
@@ -698,10 +708,34 @@ struct ggml_tensor * trellis_dit_flow_forward(
         cos_phase,
         sin_phase,
         weights,
-        NULL);
+        NULL,
+        attention_policy);
 }
 
-struct ggml_tensor * trellis_dit_flow_forward_projected(
+struct ggml_tensor * trellis_dit_flow_forward(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,
+    struct ggml_tensor * timesteps,
+    struct ggml_tensor * context,
+    struct ggml_tensor * cos_phase,
+    struct ggml_tensor * sin_phase,
+    const trellis_dit_flow_weights * weights) {
+    trellis_ggml_attention_policy attention_policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    if (trellis_ggml_flash_attn_enabled()) {
+        attention_policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH;
+    }
+    return trellis_dit_flow_forward_with_policy(
+        ctx,
+        x,
+        timesteps,
+        context,
+        cos_phase,
+        sin_phase,
+        weights,
+        &attention_policy);
+}
+
+struct ggml_tensor * trellis_dit_flow_forward_projected_with_policy(
     struct ggml_context * ctx,
     struct ggml_tensor * x,
     struct ggml_tensor * timesteps,
@@ -709,7 +743,8 @@ struct ggml_tensor * trellis_dit_flow_forward_projected(
     struct ggml_tensor * projected_context,
     struct ggml_tensor * cos_phase,
     struct ggml_tensor * sin_phase,
-    const trellis_dit_flow_model * model) {
+    const trellis_dit_flow_model * model,
+    const trellis_ggml_attention_policy * attention_policy) {
     if (model == NULL) {
         return NULL;
     }
@@ -722,5 +757,31 @@ struct ggml_tensor * trellis_dit_flow_forward_projected(
         cos_phase,
         sin_phase,
         &model->base,
-        &model->projection);
+        &model->projection,
+        attention_policy);
+}
+
+struct ggml_tensor * trellis_dit_flow_forward_projected(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,
+    struct ggml_tensor * timesteps,
+    struct ggml_tensor * global_context,
+    struct ggml_tensor * projected_context,
+    struct ggml_tensor * cos_phase,
+    struct ggml_tensor * sin_phase,
+    const trellis_dit_flow_model * model) {
+    trellis_ggml_attention_policy attention_policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    if (trellis_ggml_flash_attn_enabled()) {
+        attention_policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH;
+    }
+    return trellis_dit_flow_forward_projected_with_policy(
+        ctx,
+        x,
+        timesteps,
+        global_context,
+        projected_context,
+        cos_phase,
+        sin_phase,
+        model,
+        &attention_policy);
 }

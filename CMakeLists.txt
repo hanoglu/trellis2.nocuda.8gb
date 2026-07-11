@@ -464,6 +464,12 @@ if (TRELLIS2_C_BUILD_TESTS)
     target_link_libraries(trellis2_c_model_registry_tests PRIVATE trellis2_c)
     add_test(NAME trellis2_c_model_registry_tests COMMAND trellis2_c_model_registry_tests)
 
+    add_executable(trellis2_c_attention_policy_tests
+        tests/test_attention_policy.c
+    )
+    target_link_libraries(trellis2_c_attention_policy_tests PRIVATE trellis2_c ggml)
+    add_test(NAME trellis2_c_attention_policy_tests COMMAND trellis2_c_attention_policy_tests)
+
     if (TRELLIS2_C_BACKEND STREQUAL "cuda")
         add_executable(trellis2_c_tests
             tests/test_trellis.c

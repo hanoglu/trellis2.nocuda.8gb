@@ -70,6 +70,17 @@ struct ggml_tensor * trellis_dit_flow_forward_projected(
     struct ggml_tensor * sin_phase,
     const trellis_dit_flow_model * model);
 
+struct ggml_tensor * trellis_dit_flow_forward_projected_with_policy(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,
+    struct ggml_tensor * timesteps,
+    struct ggml_tensor * global_context,
+    struct ggml_tensor * projected_context,
+    struct ggml_tensor * cos_phase,
+    struct ggml_tensor * sin_phase,
+    const trellis_dit_flow_model * model,
+    const trellis_ggml_attention_policy * attention_policy);
+
 #ifdef __cplusplus
 }
 #endif

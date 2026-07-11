@@ -267,6 +267,8 @@ int trellis_load_tensor_store(
 
 #define TRELLIS_DIT_FLOW_BLOCKS 30
 
+struct trellis_ggml_attention_policy;
+
 typedef struct trellis_dit_flow_block_weights {
     struct ggml_tensor * modulation;
     struct ggml_tensor * norm2_gamma;
@@ -358,6 +360,16 @@ struct ggml_tensor * trellis_dit_flow_forward(
     struct ggml_tensor * cos_phase,
     struct ggml_tensor * sin_phase,
     const trellis_dit_flow_weights * weights);
+
+struct ggml_tensor * trellis_dit_flow_forward_with_policy(
+    struct ggml_context * ctx,
+    struct ggml_tensor * x,
+    struct ggml_tensor * timesteps,
+    struct ggml_tensor * context,
+    struct ggml_tensor * cos_phase,
+    struct ggml_tensor * sin_phase,
+    const trellis_dit_flow_weights * weights,
+    const struct trellis_ggml_attention_policy * attention_policy);
 
 typedef struct trellis_ss_decoder_resblock_weights {
     struct ggml_tensor * norm1_gamma;

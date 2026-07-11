@@ -7,6 +7,14 @@
 
 #define TRELLIS_CFG_BATCH_DEFAULT_MAX_ATTENTION_MIB 8192ull
 
+static trellis_ggml_attention_policy legacy_attention_policy_snapshot(void) {
+    trellis_ggml_attention_policy policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    if (trellis_ggml_flash_attn_enabled()) {
+        policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH;
+    }
+    return policy;
+}
+
 static int checked_mul_size(size_t a, size_t b, size_t * out) {
     if (out == NULL) {
         return 0;
@@ -70,15 +78,17 @@ static int cfg_batch_attention_is_reasonable(
     const trellis_dit_flow_weights * weights,
     int64_t tokens,
     int cond_tokens,
-    int batch) {
-    if (weights == NULL) {
+    int batch,
+    const trellis_ggml_attention_policy * attention_policy) {
+    if (weights == NULL ||
+        !trellis_ggml_attention_policy_is_valid(attention_policy)) {
         return 0;
     }
     const int debug_parts = weights->debug_block_parts < 0 ? 3 : weights->debug_block_parts;
     if (weights->n_blocks <= 0 || debug_parts <= 0) {
         return 1;
     }
-    if (trellis_ggml_flash_attn_enabled()) {
+    if (attention_policy->mode == TRELLIS_GGML_ATTENTION_MODE_FLASH) {
         return 1;
     }
     size_t estimate = 0;
@@ -206,13 +216,15 @@ static trellis_status init_executor(
     const float * projected_context,
     const float * neg_projected_context,
     const float * cos_phase_data,
-    const float * sin_phase_data) {
+    const float * sin_phase_data,
+    const trellis_ggml_attention_policy * attention_policy) {
     if (model != NULL) {
         weights = &model->base;
     }
     if (executor == NULL || backend == NULL || backend->backend == NULL || weights == NULL ||
         tokens <= 0 || cond_tokens <= 0 || weights->in_channels <= 0 ||
-        weights->cond_channels <= 0 || weights->head_dim <= 0 || batch <= 0) {
+        weights->cond_channels <= 0 || weights->head_dim <= 0 || batch <= 0 ||
+        !trellis_ggml_attention_policy_is_valid(attention_policy)) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     const int projected_mode = model != NULL && model->projection.enabled;
@@ -229,6 +241,8 @@ static trellis_status init_executor(
     executor->tokens = tokens;
     executor->cond_tokens = cond_tokens;
     executor->batch = batch;
+    executor->attention_policy.struct_size = sizeof(executor->attention_policy);
+    executor->attention_policy.mode = attention_policy->mode;
 
     if (!checked_mul_size((size_t) tokens, (size_t) weights->in_channels, &executor->single_input_count) ||
         !checked_mul_size((size_t) tokens, (size_t) weights->out_channels, &executor->single_output_count) ||
@@ -330,7 +344,7 @@ static trellis_status init_executor(
     ggml_set_output(executor->sin_phase);
 
     if (projected_mode) {
-        executor->y = trellis_dit_flow_forward_projected(
+        executor->y = trellis_dit_flow_forward_projected_with_policy(
             executor->ctx,
             executor->x,
             executor->t,
@@ -338,16 +352,18 @@ static trellis_status init_executor(
             executor->p,
             executor->cos_phase,
             executor->sin_phase,
-            model);
+            model,
+            &executor->attention_policy);
     } else {
-        executor->y = trellis_dit_flow_forward(
+        executor->y = trellis_dit_flow_forward_with_policy(
             executor->ctx,
             executor->x,
             executor->t,
             executor->c,
             executor->cos_phase,
             executor->sin_phase,
-            weights);
+            weights,
+            &executor->attention_policy);
     }
     if (executor->y == NULL) {
         trellis_dit_flow_executor_free(executor);
@@ -392,6 +408,30 @@ trellis_status trellis_dit_flow_executor_init_single(
     const float * context,
     const float * cos_phase_data,
     const float * sin_phase_data) {
+    const trellis_ggml_attention_policy attention_policy =
+        legacy_attention_policy_snapshot();
+    return trellis_dit_flow_executor_init_single_with_policy(
+        executor,
+        backend,
+        weights,
+        tokens,
+        cond_tokens,
+        context,
+        cos_phase_data,
+        sin_phase_data,
+        &attention_policy);
+}
+
+trellis_status trellis_dit_flow_executor_init_single_with_policy(
+    trellis_dit_flow_executor * executor,
+    const trellis_backend_context * backend,
+    const trellis_dit_flow_weights * weights,
+    int64_t tokens,
+    int cond_tokens,
+    const float * context,
+    const float * cos_phase_data,
+    const float * sin_phase_data,
+    const trellis_ggml_attention_policy * attention_policy) {
     return init_executor(
         executor,
         backend,
@@ -405,7 +445,8 @@ trellis_status trellis_dit_flow_executor_init_single(
         NULL,
         NULL,
         cos_phase_data,
-        sin_phase_data);
+        sin_phase_data,
+        attention_policy);
 }
 
 trellis_status trellis_dit_flow_executor_init_single_projected(
@@ -418,6 +459,32 @@ trellis_status trellis_dit_flow_executor_init_single_projected(
     const float * projected_context,
     const float * cos_phase_data,
     const float * sin_phase_data) {
+    const trellis_ggml_attention_policy attention_policy =
+        legacy_attention_policy_snapshot();
+    return trellis_dit_flow_executor_init_single_projected_with_policy(
+        executor,
+        backend,
+        model,
+        tokens,
+        global_tokens,
+        global_context,
+        projected_context,
+        cos_phase_data,
+        sin_phase_data,
+        &attention_policy);
+}
+
+trellis_status trellis_dit_flow_executor_init_single_projected_with_policy(
+    trellis_dit_flow_executor * executor,
+    const trellis_backend_context * backend,
+    const trellis_dit_flow_model * model,
+    int64_t tokens,
+    int global_tokens,
+    const float * global_context,
+    const float * projected_context,
+    const float * cos_phase_data,
+    const float * sin_phase_data,
+    const trellis_ggml_attention_policy * attention_policy) {
     if (model == NULL || !model->projection.enabled) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
@@ -434,7 +501,8 @@ trellis_status trellis_dit_flow_executor_init_single_projected(
         projected_context,
         NULL,
         cos_phase_data,
-        sin_phase_data);
+        sin_phase_data,
+        attention_policy);
 }
 
 trellis_status trellis_dit_flow_executor_run_single(
@@ -477,7 +545,41 @@ trellis_status trellis_dit_flow_executor_init_cfg_batch(
     const float * neg_context,
     const float * cos_phase_data,
     const float * sin_phase_data) {
-    if (!cfg_batch_attention_is_reasonable(weights, tokens, cond_tokens, 2)) {
+    const trellis_ggml_attention_policy attention_policy =
+        legacy_attention_policy_snapshot();
+    return trellis_dit_flow_executor_init_cfg_batch_with_policy(
+        executor,
+        backend,
+        weights,
+        tokens,
+        cond_tokens,
+        context,
+        neg_context,
+        cos_phase_data,
+        sin_phase_data,
+        &attention_policy);
+}
+
+trellis_status trellis_dit_flow_executor_init_cfg_batch_with_policy(
+    trellis_dit_flow_executor * executor,
+    const trellis_backend_context * backend,
+    const trellis_dit_flow_weights * weights,
+    int64_t tokens,
+    int cond_tokens,
+    const float * context,
+    const float * neg_context,
+    const float * cos_phase_data,
+    const float * sin_phase_data,
+    const trellis_ggml_attention_policy * attention_policy) {
+    if (!trellis_ggml_attention_policy_is_valid(attention_policy)) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (!cfg_batch_attention_is_reasonable(
+            weights,
+            tokens,
+            cond_tokens,
+            2,
+            attention_policy)) {
         return TRELLIS_STATUS_OUT_OF_MEMORY;
     }
     return init_executor(
@@ -493,7 +595,8 @@ trellis_status trellis_dit_flow_executor_init_cfg_batch(
         NULL,
         NULL,
         cos_phase_data,
-        sin_phase_data);
+        sin_phase_data,
+        attention_policy);
 }
 
 trellis_status trellis_dit_flow_executor_init_cfg_batch_projected(
@@ -508,8 +611,44 @@ trellis_status trellis_dit_flow_executor_init_cfg_batch_projected(
     const float * neg_projected_context,
     const float * cos_phase_data,
     const float * sin_phase_data) {
+    const trellis_ggml_attention_policy attention_policy =
+        legacy_attention_policy_snapshot();
+    return trellis_dit_flow_executor_init_cfg_batch_projected_with_policy(
+        executor,
+        backend,
+        model,
+        tokens,
+        global_tokens,
+        global_context,
+        neg_global_context,
+        projected_context,
+        neg_projected_context,
+        cos_phase_data,
+        sin_phase_data,
+        &attention_policy);
+}
+
+trellis_status trellis_dit_flow_executor_init_cfg_batch_projected_with_policy(
+    trellis_dit_flow_executor * executor,
+    const trellis_backend_context * backend,
+    const trellis_dit_flow_model * model,
+    int64_t tokens,
+    int global_tokens,
+    const float * global_context,
+    const float * neg_global_context,
+    const float * projected_context,
+    const float * neg_projected_context,
+    const float * cos_phase_data,
+    const float * sin_phase_data,
+    const trellis_ggml_attention_policy * attention_policy) {
     if (model == NULL || !model->projection.enabled ||
-        !cfg_batch_attention_is_reasonable(&model->base, tokens, global_tokens, 2)) {
+        !trellis_ggml_attention_policy_is_valid(attention_policy) ||
+        !cfg_batch_attention_is_reasonable(
+            &model->base,
+            tokens,
+            global_tokens,
+            2,
+            attention_policy)) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     return init_executor(
@@ -525,7 +664,8 @@ trellis_status trellis_dit_flow_executor_init_cfg_batch_projected(
         projected_context,
         neg_projected_context,
         cos_phase_data,
-        sin_phase_data);
+        sin_phase_data,
+        attention_policy);
 }
 
 trellis_status trellis_dit_flow_executor_run_cfg_batch(

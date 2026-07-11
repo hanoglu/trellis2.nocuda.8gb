@@ -33,6 +33,7 @@ typedef struct trellis_dit_flow_executor {
     size_t output_count;
     size_t context_count;
     size_t projected_count;
+    trellis_ggml_attention_policy attention_policy;
 } trellis_dit_flow_executor;
 
 trellis_status trellis_dit_flow_executor_init_single(
@@ -44,6 +45,17 @@ trellis_status trellis_dit_flow_executor_init_single(
     const float * context,
     const float * cos_phase,
     const float * sin_phase);
+
+trellis_status trellis_dit_flow_executor_init_single_with_policy(
+    trellis_dit_flow_executor * executor,
+    const trellis_backend_context * backend,
+    const trellis_dit_flow_weights * weights,
+    int64_t tokens,
+    int cond_tokens,
+    const float * context,
+    const float * cos_phase,
+    const float * sin_phase,
+    const trellis_ggml_attention_policy * attention_policy);
 
 trellis_status trellis_dit_flow_executor_run_single(
     trellis_dit_flow_executor * executor,
@@ -62,6 +74,18 @@ trellis_status trellis_dit_flow_executor_init_single_projected(
     const float * cos_phase,
     const float * sin_phase);
 
+trellis_status trellis_dit_flow_executor_init_single_projected_with_policy(
+    trellis_dit_flow_executor * executor,
+    const trellis_backend_context * backend,
+    const trellis_dit_flow_model * model,
+    int64_t tokens,
+    int global_tokens,
+    const float * global_context,
+    const float * projected_context,
+    const float * cos_phase,
+    const float * sin_phase,
+    const trellis_ggml_attention_policy * attention_policy);
+
 trellis_status trellis_dit_flow_executor_init_cfg_batch(
     trellis_dit_flow_executor * executor,
     const trellis_backend_context * backend,
@@ -72,6 +96,18 @@ trellis_status trellis_dit_flow_executor_init_cfg_batch(
     const float * neg_context,
     const float * cos_phase,
     const float * sin_phase);
+
+trellis_status trellis_dit_flow_executor_init_cfg_batch_with_policy(
+    trellis_dit_flow_executor * executor,
+    const trellis_backend_context * backend,
+    const trellis_dit_flow_weights * weights,
+    int64_t tokens,
+    int cond_tokens,
+    const float * context,
+    const float * neg_context,
+    const float * cos_phase,
+    const float * sin_phase,
+    const trellis_ggml_attention_policy * attention_policy);
 
 trellis_status trellis_dit_flow_executor_run_cfg_batch(
     trellis_dit_flow_executor * executor,
@@ -92,6 +128,20 @@ trellis_status trellis_dit_flow_executor_init_cfg_batch_projected(
     const float * neg_projected_context,
     const float * cos_phase,
     const float * sin_phase);
+
+trellis_status trellis_dit_flow_executor_init_cfg_batch_projected_with_policy(
+    trellis_dit_flow_executor * executor,
+    const trellis_backend_context * backend,
+    const trellis_dit_flow_model * model,
+    int64_t tokens,
+    int global_tokens,
+    const float * global_context,
+    const float * neg_global_context,
+    const float * projected_context,
+    const float * neg_projected_context,
+    const float * cos_phase,
+    const float * sin_phase,
+    const trellis_ggml_attention_policy * attention_policy);
 
 void trellis_dit_flow_executor_free(trellis_dit_flow_executor * executor);
 
