@@ -164,10 +164,16 @@ struct ggml_tensor * trellis_ggml_sdpa_with_policy(
         return NULL;
     }
     if (use_flash) {
-        const enum ggml_type flash_kv_type =
+        const int use_bf16 =
             policy != NULL &&
-            policy->mode == TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16 ?
-                GGML_TYPE_BF16 : GGML_TYPE_F16;
+            policy->mode == TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16;
+        const enum ggml_type flash_kv_type = use_bf16 ? GGML_TYPE_BF16 : GGML_TYPE_F16;
+        /* ggml Flash accepts Q as F32.  Preserve that storage contract while
+         * matching a BF16 model's Q input semantics with a BF16 round-trip;
+         * K/V can be passed to the backend in their native BF16 storage. */
+        if (use_bf16 && q->type == GGML_TYPE_F32) {
+            q = trellis_ggml_bf16_roundtrip(ctx, q);
+        }
         if (k->type == GGML_TYPE_F32) {
             k = ggml_cast(ctx, k, flash_kv_type);
         }

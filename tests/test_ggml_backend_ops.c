@@ -568,6 +568,90 @@ static int test_sdpa_flash_attention(trellis_backend_context * backend, int toke
     return ok;
 }
 
+static int test_bf16_flash_constant_attention(
+    trellis_backend_context * backend,
+    int query_tokens,
+    int kv_tokens,
+    int batches,
+    float value) {
+    enum { HEAD_DIM = 128, HEADS = 1 };
+    const int64_t q_nels = (int64_t) HEAD_DIM * query_tokens * HEADS * batches;
+    const int64_t kv_nels = (int64_t) HEAD_DIM * kv_tokens * HEADS * batches;
+    float * q_data = (float *) calloc((size_t) q_nels, sizeof(float));
+    float * k_data = (float *) calloc((size_t) kv_nels, sizeof(float));
+    float * v_data = (float *) malloc((size_t) kv_nels * sizeof(float));
+    float * output = (float *) malloc((size_t) q_nels * sizeof(float));
+    CHECK_TRUE(q_data != NULL && k_data != NULL && v_data != NULL && output != NULL);
+    for (int64_t i = 0; i < kv_nels; ++i) {
+        v_data[i] = value;
+    }
+
+    struct ggml_context * ctx = make_graph_ctx();
+    CHECK_TRUE(ctx != NULL);
+    struct ggml_tensor * q = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, query_tokens, HEADS, batches);
+    struct ggml_tensor * k = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, kv_tokens, HEADS, batches);
+    struct ggml_tensor * v = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, kv_tokens, HEADS, batches);
+    CHECK_TRUE(q != NULL && k != NULL && v != NULL);
+
+    trellis_ggml_attention_policy policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    policy.mode = TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16;
+    struct ggml_tensor * y = trellis_ggml_sdpa_with_policy(
+        ctx, q, k, v, 1.0f / sqrtf((float) HEAD_DIM), &policy);
+    CHECK_TRUE(y != NULL);
+
+    struct ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, y);
+    ggml_gallocr_t alloc = trellis_backend_new_graph_allocator(backend);
+    CHECK_TRUE(alloc != NULL);
+    CHECK_TRUE(ggml_gallocr_alloc_graph(alloc, graph));
+    ggml_backend_tensor_set(q, q_data, 0, ggml_nbytes(q));
+    ggml_backend_tensor_set(k, k_data, 0, ggml_nbytes(k));
+    ggml_backend_tensor_set(v, v_data, 0, ggml_nbytes(v));
+    CHECK_TRUE(trellis_backend_compute_graph(backend, graph) == TRELLIS_STATUS_OK);
+    ggml_backend_tensor_get(y, output, 0, ggml_nbytes(y));
+
+    const float expected = ggml_bf16_to_fp32(ggml_fp32_to_bf16(value));
+    const float tolerance = 2e-3f * fmaxf(1.0f, fabsf(expected));
+    int ok = 1;
+    for (int64_t i = 0; i < q_nels; ++i) {
+        if (!isfinite(output[i]) || fabsf(output[i] - expected) > tolerance) {
+            fprintf(
+                stderr,
+                "bf16 flash constant q=%d kv=%d batch=%d value=%g output[%lld]=%g expected=%g tolerance=%g\n",
+                query_tokens,
+                kv_tokens,
+                batches,
+                value,
+                (long long) i,
+                output[i],
+                expected,
+                tolerance);
+            ok = 0;
+            break;
+        }
+    }
+    if (ok) {
+        printf(
+            "bf16 flash constant q=%d kv=%d batch=%d value=%g output=%g\n",
+            query_tokens,
+            kv_tokens,
+            batches,
+            value,
+            output[0]);
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    free(q_data);
+    free(k_data);
+    free(v_data);
+    free(output);
+    return ok;
+}
+
 int main(int argc, char ** argv) {
     const char * backend_name = argc > 1 ? argv[1] : TRELLIS_DEFAULT_GGML_BACKEND;
     trellis_backend_kind kind;
@@ -590,6 +674,16 @@ int main(int argc, char ** argv) {
     ok = ok && test_sdpa_flash_attention(&backend, 512, 1);
     ok = ok && test_sdpa_flash_attention(&backend, 1024, 1);
     ok = ok && test_sdpa_flash_attention(&backend, 512, 2);
+    if (kind == TRELLIS_BACKEND_CUDA) {
+        /* Q=K=0 makes every attention row uniform, so the exact result for a
+         * constant V is that constant.  These sizes/values exercise the
+         * historical F16 VKQ overflow and both aligned and short KV tails. */
+        ok = ok && test_bf16_flash_constant_attention(&backend, 4730, 4730, 1, 384.0f);
+        ok = ok && test_bf16_flash_constant_attention(&backend, 8192, 8192, 1, 128.0f);
+        ok = ok && test_bf16_flash_constant_attention(&backend, 16384, 16384, 1, 64.0f);
+        ok = ok && test_bf16_flash_constant_attention(&backend, 257, 257, 2, 70000.0f);
+        ok = ok && test_bf16_flash_constant_attention(&backend, 513, 5, 1, 70000.0f);
+    }
     trellis_backend_free(&backend);
     if (!ok) {
         return 1;

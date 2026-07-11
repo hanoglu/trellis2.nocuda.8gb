@@ -47,7 +47,7 @@ typedef enum trellis_ggml_attention_mode {
     /* Legacy Flash Attention mode. K/V produced as F32 are narrowed to F16. */
     TRELLIS_GGML_ATTENTION_MODE_FLASH = 2,
     TRELLIS_GGML_ATTENTION_MODE_FLASH_F16 = TRELLIS_GGML_ATTENTION_MODE_FLASH,
-    /* K/V produced as F32 are narrowed to BF16 before the backend Flash op. */
+    /* Q uses BF16 values in F32 storage; K/V use native BF16 storage. */
     TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16 = 3,
 } trellis_ggml_attention_mode;
 
