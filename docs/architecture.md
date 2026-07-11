@@ -46,6 +46,17 @@ proved that F16 accumulation can overflow there. Backend selection is driven
 by each component contract and must never silently narrow a strict BF16 request
 to F16.
 
+That rule also applies to backend-specific acceleration experiments. On a
+Vulkan implementation without native BF16 cooperative-matrix operands, strict
+BF16 Flash remains on the scalar-F32 streaming lowering unless the process
+explicitly opts into `GGML_VK_BF16_F16_MMA=1`. The opt-in lowering is
+capability-gated and isolated from package policy: it may stage BF16 K/V through
+scaled F16 cooperative-matrix operands with F32 QK/P×V accumulators, but it
+must not silently become the default or alter another model instance's F16
+attention path. New model families must validate their Q/K range, softmax-tail
+sensitivity, and the within-panel V exponent span before opting into that
+lowering; native BF16 cooperative-matrix operands remain the preferred path.
+
 ## Adding another task
 
 A task has its own typed input/output contract and registry descriptor.  It may

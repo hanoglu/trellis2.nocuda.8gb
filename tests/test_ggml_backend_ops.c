@@ -1,6 +1,8 @@
 #include "trellis.h"
 #include "trellis_ggml_layers.h"
+#include "trellis_platform.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +23,10 @@ static int check_close(float got, float exp, float tol, const char * name, int i
     }
     fprintf(stderr, "%s[%d] mismatch: got=%g expected=%g diff=%g tol=%g\n", name, idx, got, exp, diff, tol);
     return 0;
+}
+
+static double wall_clock_ms(void) {
+    return (double) trellis_now_us() / 1000.0;
 }
 
 static int conv_out_size_ref(int input, int kernel, int stride, int pad, int dilation) {
@@ -568,15 +574,18 @@ static int test_sdpa_flash_attention(trellis_backend_context * backend, int toke
     return ok;
 }
 
-static int test_bf16_flash_constant_attention(
+static int test_flash_constant_attention(
     trellis_backend_context * backend,
     int query_tokens,
     int kv_tokens,
     int batches,
-    float value) {
-    enum { HEAD_DIM = 128, HEADS = 1 };
-    const int64_t q_nels = (int64_t) HEAD_DIM * query_tokens * HEADS * batches;
-    const int64_t kv_nels = (int64_t) HEAD_DIM * kv_tokens * HEADS * batches;
+    float value,
+    int use_bf16,
+    int heads,
+    int repeats) {
+    enum { HEAD_DIM = 128 };
+    const int64_t q_nels = (int64_t) HEAD_DIM * query_tokens * heads * batches;
+    const int64_t kv_nels = (int64_t) HEAD_DIM * kv_tokens * heads * batches;
     float * q_data = (float *) calloc((size_t) q_nels, sizeof(float));
     float * k_data = (float *) calloc((size_t) kv_nels, sizeof(float));
     float * v_data = (float *) malloc((size_t) kv_nels * sizeof(float));
@@ -589,11 +598,114 @@ static int test_bf16_flash_constant_attention(
     struct ggml_context * ctx = make_graph_ctx();
     CHECK_TRUE(ctx != NULL);
     struct ggml_tensor * q = ggml_new_tensor_4d(
-        ctx, GGML_TYPE_F32, HEAD_DIM, query_tokens, HEADS, batches);
+        ctx, GGML_TYPE_F32, HEAD_DIM, query_tokens, heads, batches);
     struct ggml_tensor * k = ggml_new_tensor_4d(
-        ctx, GGML_TYPE_F32, HEAD_DIM, kv_tokens, HEADS, batches);
+        ctx, GGML_TYPE_F32, HEAD_DIM, kv_tokens, heads, batches);
     struct ggml_tensor * v = ggml_new_tensor_4d(
-        ctx, GGML_TYPE_F32, HEAD_DIM, kv_tokens, HEADS, batches);
+        ctx, GGML_TYPE_F32, HEAD_DIM, kv_tokens, heads, batches);
+    CHECK_TRUE(q != NULL && k != NULL && v != NULL);
+
+    trellis_ggml_attention_policy policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
+    policy.mode = use_bf16 ?
+        TRELLIS_GGML_ATTENTION_MODE_FLASH_BF16 :
+        TRELLIS_GGML_ATTENTION_MODE_FLASH_F16;
+    struct ggml_tensor * y = trellis_ggml_sdpa_with_policy(
+        ctx, q, k, v, 1.0f / sqrtf((float) HEAD_DIM), &policy);
+    CHECK_TRUE(y != NULL);
+
+    struct ggml_cgraph * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, y);
+    ggml_gallocr_t alloc = trellis_backend_new_graph_allocator(backend);
+    CHECK_TRUE(alloc != NULL);
+    CHECK_TRUE(ggml_gallocr_alloc_graph(alloc, graph));
+    ggml_backend_tensor_set(q, q_data, 0, ggml_nbytes(q));
+    ggml_backend_tensor_set(k, k_data, 0, ggml_nbytes(k));
+    ggml_backend_tensor_set(v, v_data, 0, ggml_nbytes(v));
+    double best_ms = DBL_MAX;
+    double total_ms = 0.0;
+    for (int repeat = 0; repeat < repeats; ++repeat) {
+        const double started_ms = wall_clock_ms();
+        CHECK_TRUE(trellis_backend_compute_graph(backend, graph) == TRELLIS_STATUS_OK);
+        const double elapsed_ms = wall_clock_ms() - started_ms;
+        best_ms = fmin(best_ms, elapsed_ms);
+        total_ms += elapsed_ms;
+    }
+    ggml_backend_tensor_get(y, output, 0, ggml_nbytes(y));
+
+    const float expected = use_bf16 ?
+        ggml_bf16_to_fp32(ggml_fp32_to_bf16(value)) :
+        ggml_fp16_to_fp32(ggml_fp32_to_fp16(value));
+    const float tolerance = 2e-3f * fmaxf(1.0f, fabsf(expected));
+    int ok = 1;
+    for (int64_t i = 0; i < q_nels; ++i) {
+        if (!isfinite(output[i]) || fabsf(output[i] - expected) > tolerance) {
+            fprintf(
+                stderr,
+                "%s flash constant q=%d kv=%d heads=%d batch=%d value=%g output[%lld]=%g expected=%g tolerance=%g\n",
+                use_bf16 ? "bf16" : "f16",
+                query_tokens,
+                kv_tokens,
+                heads,
+                batches,
+                value,
+                (long long) i,
+                output[i],
+                expected,
+                tolerance);
+            ok = 0;
+            break;
+        }
+    }
+    if (ok) {
+        printf(
+            "%s flash constant q=%d kv=%d heads=%d batch=%d value=%g output=%g best_ms=%.3f avg_ms=%.3f repeats=%d\n",
+            use_bf16 ? "bf16" : "f16",
+            query_tokens,
+            kv_tokens,
+            heads,
+            batches,
+            value,
+            output[0],
+            best_ms,
+            total_ms / repeats,
+            repeats);
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx);
+    free(q_data);
+    free(k_data);
+    free(v_data);
+    free(output);
+    return ok;
+}
+
+static int test_flash_bf16_mixed_v_panels(trellis_backend_context * backend) {
+    enum { HEAD_DIM = 128, QUERY_TOKENS = 257, KV_TOKENS = 5 };
+    static const float panel_values[HEAD_DIM / 16] = {
+        70000.0f, 3.0f, -5.0f, 0.25f, 1024.0f, -2048.0f, 17.0f, -31.0f,
+    };
+    const int64_t q_nels = (int64_t) HEAD_DIM * QUERY_TOKENS;
+    const int64_t kv_nels = (int64_t) HEAD_DIM * KV_TOKENS;
+    float * q_data = (float *) calloc((size_t) q_nels, sizeof(float));
+    float * k_data = (float *) calloc((size_t) kv_nels, sizeof(float));
+    float * v_data = (float *) malloc((size_t) kv_nels * sizeof(float));
+    float * output = (float *) malloc((size_t) q_nels * sizeof(float));
+    CHECK_TRUE(q_data != NULL && k_data != NULL && v_data != NULL && output != NULL);
+
+    for (int64_t i = 0; i < kv_nels; ++i) {
+        const int channel = (int) (i % HEAD_DIM);
+        v_data[i] = panel_values[channel / 16];
+    }
+
+    struct ggml_context * ctx = make_graph_ctx();
+    CHECK_TRUE(ctx != NULL);
+    struct ggml_tensor * q = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, QUERY_TOKENS, 1, 1);
+    struct ggml_tensor * k = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, KV_TOKENS, 1, 1);
+    struct ggml_tensor * v = ggml_new_tensor_4d(
+        ctx, GGML_TYPE_F32, HEAD_DIM, KV_TOKENS, 1, 1);
     CHECK_TRUE(q != NULL && k != NULL && v != NULL);
 
     trellis_ggml_attention_policy policy = TRELLIS_GGML_ATTENTION_POLICY_INIT;
@@ -613,18 +725,16 @@ static int test_bf16_flash_constant_attention(
     CHECK_TRUE(trellis_backend_compute_graph(backend, graph) == TRELLIS_STATUS_OK);
     ggml_backend_tensor_get(y, output, 0, ggml_nbytes(y));
 
-    const float expected = ggml_bf16_to_fp32(ggml_fp32_to_bf16(value));
-    const float tolerance = 2e-3f * fmaxf(1.0f, fabsf(expected));
     int ok = 1;
     for (int64_t i = 0; i < q_nels; ++i) {
+        const int channel = (int) (i % HEAD_DIM);
+        const float expected = ggml_bf16_to_fp32(
+            ggml_fp32_to_bf16(panel_values[channel / 16]));
+        const float tolerance = 2e-3f * fmaxf(1.0f, fabsf(expected));
         if (!isfinite(output[i]) || fabsf(output[i] - expected) > tolerance) {
             fprintf(
                 stderr,
-                "bf16 flash constant q=%d kv=%d batch=%d value=%g output[%lld]=%g expected=%g tolerance=%g\n",
-                query_tokens,
-                kv_tokens,
-                batches,
-                value,
+                "bf16 flash mixed V panel output[%lld]=%g expected=%g tolerance=%g\n",
                 (long long) i,
                 output[i],
                 expected,
@@ -634,13 +744,11 @@ static int test_bf16_flash_constant_attention(
         }
     }
     if (ok) {
-        printf(
-            "bf16 flash constant q=%d kv=%d batch=%d value=%g output=%g\n",
-            query_tokens,
-            kv_tokens,
-            batches,
-            value,
-            output[0]);
+        printf("bf16 flash mixed V panels");
+        for (int panel = 0; panel < HEAD_DIM / 16; ++panel) {
+            printf(" p%d=%g", panel, output[panel * 16]);
+        }
+        printf("\n");
     }
 
     ggml_gallocr_free(alloc);
@@ -674,15 +782,19 @@ int main(int argc, char ** argv) {
     ok = ok && test_sdpa_flash_attention(&backend, 512, 1);
     ok = ok && test_sdpa_flash_attention(&backend, 1024, 1);
     ok = ok && test_sdpa_flash_attention(&backend, 512, 2);
-    if (kind == TRELLIS_BACKEND_CUDA) {
+    if (kind == TRELLIS_BACKEND_CUDA || kind == TRELLIS_BACKEND_VULKAN) {
         /* Q=K=0 makes every attention row uniform, so the exact result for a
          * constant V is that constant.  These sizes/values exercise the
          * historical F16 VKQ overflow and both aligned and short KV tails. */
-        ok = ok && test_bf16_flash_constant_attention(&backend, 4730, 4730, 1, 384.0f);
-        ok = ok && test_bf16_flash_constant_attention(&backend, 8192, 8192, 1, 128.0f);
-        ok = ok && test_bf16_flash_constant_attention(&backend, 16384, 16384, 1, 64.0f);
-        ok = ok && test_bf16_flash_constant_attention(&backend, 257, 257, 2, 70000.0f);
-        ok = ok && test_bf16_flash_constant_attention(&backend, 513, 5, 1, 70000.0f);
+        ok = ok && test_flash_constant_attention(&backend, 4730, 4730, 1, 384.0f, 1, 1, 1);
+        ok = ok && test_flash_constant_attention(&backend, 8192, 8192, 1, 128.0f, 1, 1, 1);
+        ok = ok && test_flash_constant_attention(&backend, 16384, 16384, 1, 64.0f, 1, 1, 1);
+        ok = ok && test_flash_constant_attention(&backend, 257, 257, 2, 70000.0f, 1, 1, 1);
+        ok = ok && test_flash_constant_attention(&backend, 513, 5, 1, 70000.0f, 1, 1, 1);
+        ok = ok && test_flash_bf16_mixed_v_panels(&backend);
+        if (getenv("TRELLIS_LONG_ATTN_PERF") != NULL) {
+            ok = ok && test_flash_constant_attention(&backend, 21775, 21775, 1, 1.0f, 1, 12, 5);
+        }
     }
     trellis_backend_free(&backend);
     if (!ok) {

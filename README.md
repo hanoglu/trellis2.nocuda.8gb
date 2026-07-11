@@ -144,7 +144,7 @@ C callers that need explicit Pixal3D overrides can initialize
 camera and automatic NAF lookup.
 
 Pixal3D defaults to BF16-style block rounding and BF16 Flash Attention.
-On NVIDIA Ampere or newer GPUs, BF16 K/V select ggml's streaming vector kernel:
+On CUDA with NVIDIA Ampere or newer GPUs, BF16 K/V select ggml's streaming vector kernel:
 Q/K dot products, online softmax state, and V accumulation stay in F32, and KV
 tail rows are bounds checked. This avoids the BF16-to-F16 narrowing and F16
 accumulator overflow of ggml's current MMA kernel. TRELLIS.2 keeps the faster
@@ -155,6 +155,20 @@ explicitly selects SDPA; that path can require
 quadratic score memory for long sparse sequences. The package-level policies
 are instance scoped, so loading Trellis2 and Pixal3D in one process does not
 change either model's attention mode.
+
+On Vulkan devices that expose F16 KHR cooperative matrices with F32
+accumulators but do not expose native BF16 cooperative-matrix operands, the
+strict BF16 mode continues to use the range-safe scalar-F32 streaming kernel by
+default. `GGML_VK_BF16_F16_MMA=1` enables an NVIDIA-only D128 experiment that
+stages BF16 K/V as F16, uses F32 accumulation for both QK and P×V, and applies
+a power-of-two V scale independently to each 16-channel panel of every KV tile
+before restoring its F32 contribution. This avoids F16 V-staging overflow and
+does not change the ordinary Trellis2 F16 path. It is intentionally opt-in:
+Q/K still have F16 operand range, softmax probabilities are staged as F16, and
+very wide value ranges inside one V panel can underflow its smaller values.
+Consequently, this is not equivalent to native BF16 Tensor Core operands for
+arbitrary inputs and should be revalidated before enabling it for another model
+family.
 
 Windows:
 
