@@ -623,6 +623,18 @@ if (TRELLIS2_C_BUILD_TOOLS)
         if (UNIX)
             target_link_libraries(vkmesh PRIVATE m)
         endif()
+        if (TRELLIS2_C_BUILD_TESTS AND TRELLIS2_C_HAS_VKMESH_C_API)
+            find_package(Threads REQUIRED)
+            add_executable(trellis2_c_vkmesh_tests tests/test_vkmesh.c)
+            target_include_directories(trellis2_c_vkmesh_tests PRIVATE
+                "${CMAKE_CURRENT_LIST_DIR}/src/pipeline")
+            target_link_libraries(trellis2_c_vkmesh_tests PRIVATE
+                trellis2_c ggml Vulkan::Vulkan Threads::Threads)
+            add_dependencies(trellis2_c_vkmesh_tests vkmesh)
+            add_test(NAME trellis2_c_vkmesh_tests
+                COMMAND trellis2_c_vkmesh_tests $<TARGET_FILE:vkmesh>)
+            set_tests_properties(trellis2_c_vkmesh_tests PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
         if (TARGET trellis-image-to-gltf)
             add_dependencies(trellis-image-to-gltf vkmesh)
         endif()

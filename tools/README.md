@@ -82,14 +82,13 @@ individual flags such as `--fill-holes`, `--repair-non-manifold-edges`, and
 When `trellis-image-to-gltf` is run from a Vulkan build tree it first looks for a
 sibling `vkmesh` executable, then falls back to `PATH`; pass `--vkmesh FILE`
 only when using a custom binary.
-CuMesh-style UV unwrap is hybrid rather than fully GPU-resident: chart
-clustering is the GPU-accelerated part, then each chart is copied to CPU xatlas
-for parameterization and packing. The Vulkan glTF exporter follows that shape
-with a connected xatlas prepass: manifold face adjacency builds local chunks,
-and each chunk is added to xatlas as its own mesh. `TRELLIS_GLTF_UV_CHART_FACES`
-controls the target faces per xatlas input mesh, and
-`TRELLIS_GLTF_UV_CONE_DEGREES` controls connected chunk growth from the default
-90 degree cone threshold.
+UV parameterization and packing use CPU xatlas. For large meshes, the glTF
+exporter first builds manifold face adjacency on the CPU, grows connected local
+chunks, and adds each chunk to xatlas as its own mesh. Vulkan acceleration starts
+at UV-space PBR rasterization and continues through texture dilation and empty
+texel fill. `TRELLIS_GLTF_UV_CHART_FACES` controls the target faces per xatlas
+input mesh, and `TRELLIS_GLTF_UV_CONE_DEGREES` controls connected chunk growth
+from the default 90 degree cone threshold.
 
 `trellis-birefnet-rgba` runs only the BiRefNet background-removal model and
 writes an RGBA PNG:

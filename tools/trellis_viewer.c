@@ -2072,7 +2072,8 @@ static int run_vkmesh_external(
     int target,
     int no_simplify,
     int remesh,
-    int remesh_resolution) {
+    int remesh_resolution,
+    int device) {
     char exe[VIEWER_MAX_PATH];
     if (!find_vkmesh_executable(exe, sizeof(exe))) {
         return -1;
@@ -2090,9 +2091,11 @@ static int run_vkmesh_external(
     }
     char target_text[64];
     char remesh_resolution_text[64];
+    char device_text[64];
     snprintf(target_text, sizeof(target_text), "%d", target > 0 ? target : 1000000);
     snprintf(remesh_resolution_text, sizeof(remesh_resolution_text), "%d", remesh_resolution > 0 ? remesh_resolution : 512);
-    char * argv[28];
+    snprintf(device_text, sizeof(device_text), "%d", device >= 0 ? device : 0);
+    char * argv[30];
     int argc = 0;
     argv[argc++] = exe;
     argv[argc++] = (char *) "--input";
@@ -2102,6 +2105,8 @@ static int run_vkmesh_external(
     argv[argc++] = (char *) "--projection-mesh-output";
     argv[argc++] = projection_mesh;
     argv[argc++] = (char *) "--postprocess";
+    argv[argc++] = (char *) "--device";
+    argv[argc++] = device_text;
     if (remesh) {
         argv[argc++] = (char *) "--remesh";
         argv[argc++] = (char *) "--remesh-resolution";
@@ -2156,6 +2161,7 @@ static trellis_status run_mesh_postprocess(
     pp.remesh_resolution = options->resolution > 0 ? options->resolution : 512;
     pp.remesh_band = 1.0f;
     pp.remesh_project = 0.0f;
+    pp.device = options->device;
     trellis_status status = trellis_vkmesh_postprocess(mesh, &processed, &projection, &pp);
     if (status != TRELLIS_STATUS_OK) {
         trellis_mesh_free(&processed);
@@ -2170,7 +2176,8 @@ static trellis_status run_mesh_postprocess(
             options->mesh_postprocess_decimation_target,
             options->mesh_postprocess_no_simplify,
             options->mesh_postprocess_remesh,
-            options->resolution);
+            options->resolution,
+            options->device);
     if (external_status < 0) {
         return TRELLIS_STATUS_NOT_FOUND;
     }
@@ -2531,7 +2538,8 @@ static trellis_status run_texture_job(viewer_worker_args * args) {
         artifacts->projection_mesh.vertices != NULL && artifacts->projection_mesh.faces != NULL ?
             &artifacts->projection_mesh :
             NULL;
-    status = trellis_pipeline_write_gltf(gltf_path, &artifacts->mesh, sample_mesh, &pbr_voxels, options->texture_size);
+    status = trellis_pipeline_write_gltf(
+        gltf_path, &artifacts->mesh, sample_mesh, &pbr_voxels, options->texture_size, options->device);
     if (status != TRELLIS_STATUS_OK) {
         goto done;
     }
@@ -2610,7 +2618,8 @@ static trellis_status run_postprocess_job(viewer_worker_args * args) {
             &artifacts->mesh,
             sample_mesh,
             &artifacts->pbr_voxels,
-            options->texture_size);
+            options->texture_size,
+            options->device);
         if (status != TRELLIS_STATUS_OK) {
             goto rebake_failed;
         }

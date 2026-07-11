@@ -146,6 +146,55 @@ typedef struct vkmesh_vk_buffer {
     size_t bytes;
 } vkmesh_vk_buffer;
 
+typedef enum vkmesh_pipeline_kind {
+    VKMESH_PIPE_EXPAND_EDGES = 0,
+    VKMESH_PIPE_DEGENERATE_FACES,
+    VKMESH_PIPE_FACE_KEYS,
+    VKMESH_PIPE_SORT_EDGES,
+    VKMESH_PIPE_SORT_FACE_KEYS,
+    VKMESH_PIPE_MARK_DUPLICATE_FACES,
+    VKMESH_PIPE_MARK_BOUNDARY_EDGES,
+    VKMESH_PIPE_BOUNDARY_DEGREE_OWNER,
+    VKMESH_PIPE_COMPACT_BOUNDARY_EDGES,
+    VKMESH_PIPE_COMPACT_FACE_PAIRS,
+    VKMESH_PIPE_COMPACT_FACES,
+    VKMESH_PIPE_COMPACT_UNIQUE_SIMPLIFY_EDGES,
+    VKMESH_PIPE_COPY_U32,
+    VKMESH_PIPE_FILL_U32,
+    VKMESH_PIPE_ACCUMULATE_HOLE_COMPONENTS,
+    VKMESH_PIPE_APPLY_ORIENTATION_FLIPS,
+    VKMESH_PIPE_ASSIGN_VERTEX_MAP,
+    VKMESH_PIPE_REMAP_FACES,
+    VKMESH_PIPE_COMPACT_VERTICES,
+    VKMESH_PIPE_INIT_U32_SEQUENCE,
+    VKMESH_PIPE_INIT_ORIENTATION_STATE,
+    VKMESH_PIPE_SEED_VERTEX_OFFSETS,
+    VKMESH_PIPE_SCAN_U32_STRIDE,
+    VKMESH_PIPE_UNION_FACE_EDGES,
+    VKMESH_PIPE_UNION_BOUNDARY_EDGES,
+    VKMESH_PIPE_UNION_CORNER_EDGES,
+    VKMESH_PIPE_UNION_ORIENTATION_EDGES,
+    VKMESH_PIPE_COMPRESS_PARENTS,
+    VKMESH_PIPE_COMPRESS_ORIENTATION_STATE,
+    VKMESH_PIPE_VERTEX_FACE_DEGREE,
+    VKMESH_PIPE_VERTEX_FACE_ADJACENCY,
+    VKMESH_PIPE_VERTEX_QEM,
+    VKMESH_PIPE_SIMPLIFY_EDGE_COST,
+    VKMESH_PIPE_SIMPLIFY_PROPAGATE_COST,
+    VKMESH_PIPE_SIMPLIFY_BEST_EDGE,
+    VKMESH_PIPE_SIMPLIFY_COLLAPSE_EDGES,
+    VKMESH_PIPE_ASSIGN_CORNER_VERTICES,
+    VKMESH_PIPE_WRITE_REPAIRED_MESH,
+    VKMESH_PIPE_COMPONENT_AREA,
+    VKMESH_PIPE_MARK_COMPONENT_KEEP,
+    VKMESH_PIPE_MARK_HOLE_ROOTS,
+    VKMESH_PIPE_MARK_HOLE_FACES,
+    VKMESH_PIPE_WRITE_HOLE_VERTICES,
+    VKMESH_PIPE_WRITE_HOLE_FACES,
+    VKMESH_PIPE_UNSIGNED_DISTANCE,
+    VKMESH_PIPE_COUNT,
+} vkmesh_pipeline_kind;
+
 typedef struct vkmesh_vk {
     VkInstance instance;
     VkPhysicalDevice physical_device;
@@ -155,10 +204,11 @@ typedef struct vkmesh_vk {
     VkCommandPool command_pool;
     VkDescriptorSetLayout descriptor_set_layout;
     VkPipelineLayout pipeline_layout;
-    VkPipeline pipelines[45];
+    VkPipeline pipelines[VKMESH_PIPE_COUNT];
     VkDescriptorPool descriptor_pool;
     VkDescriptorSet descriptor_set;
     VkCommandBuffer command_buffer;
+    VkFence completion_fence;
 } vkmesh_vk;
 
 typedef struct vkmesh_device_mesh {
@@ -177,55 +227,6 @@ typedef struct vkmesh_push {
     float eps;
     float rel_eps;
 } vkmesh_push;
-
-typedef enum vkmesh_pipeline_kind {
-    VKMESH_PIPE_EXPAND_EDGES = 0,
-    VKMESH_PIPE_DEGENERATE_FACES = 1,
-    VKMESH_PIPE_FACE_KEYS = 2,
-    VKMESH_PIPE_SORT_EDGES = 3,
-    VKMESH_PIPE_SORT_FACE_KEYS = 4,
-    VKMESH_PIPE_MARK_DUPLICATE_FACES = 5,
-    VKMESH_PIPE_MARK_BOUNDARY_EDGES = 6,
-    VKMESH_PIPE_BOUNDARY_DEGREE_OWNER = 7,
-    VKMESH_PIPE_COMPACT_BOUNDARY_EDGES = 8,
-    VKMESH_PIPE_COMPACT_FACE_PAIRS = 9,
-    VKMESH_PIPE_COMPACT_FACES = 10,
-    VKMESH_PIPE_COMPACT_UNIQUE_SIMPLIFY_EDGES = 11,
-    VKMESH_PIPE_COPY_U32 = 12,
-    VKMESH_PIPE_FILL_U32 = 13,
-    VKMESH_PIPE_ACCUMULATE_HOLE_COMPONENTS = 14,
-    VKMESH_PIPE_APPLY_ORIENTATION_FLIPS = 15,
-    VKMESH_PIPE_ASSIGN_VERTEX_MAP = 16,
-    VKMESH_PIPE_REMAP_FACES = 17,
-    VKMESH_PIPE_COMPACT_VERTICES = 18,
-    VKMESH_PIPE_INIT_U32_SEQUENCE = 19,
-    VKMESH_PIPE_INIT_ORIENTATION_STATE = 20,
-    VKMESH_PIPE_SEED_VERTEX_OFFSETS = 21,
-    VKMESH_PIPE_SCAN_U32_STRIDE = 22,
-    VKMESH_PIPE_UNION_FACE_EDGES = 23,
-    VKMESH_PIPE_UNION_BOUNDARY_EDGES = 24,
-    VKMESH_PIPE_UNION_CORNER_EDGES = 25,
-    VKMESH_PIPE_UNION_ORIENTATION_EDGES = 26,
-    VKMESH_PIPE_COMPRESS_PARENTS = 27,
-    VKMESH_PIPE_COMPRESS_ORIENTATION_STATE = 28,
-    VKMESH_PIPE_VERTEX_FACE_DEGREE = 29,
-    VKMESH_PIPE_VERTEX_FACE_ADJACENCY = 30,
-    VKMESH_PIPE_VERTEX_QEM = 31,
-    VKMESH_PIPE_SIMPLIFY_EDGE_COST = 32,
-    VKMESH_PIPE_SIMPLIFY_PROPAGATE_COST = 33,
-    VKMESH_PIPE_SIMPLIFY_BEST_EDGE = 34,
-    VKMESH_PIPE_SIMPLIFY_COLLAPSE_EDGES = 35,
-    VKMESH_PIPE_ASSIGN_CORNER_VERTICES = 36,
-    VKMESH_PIPE_WRITE_REPAIRED_MESH = 37,
-    VKMESH_PIPE_COMPONENT_AREA = 38,
-    VKMESH_PIPE_MARK_COMPONENT_KEEP = 39,
-    VKMESH_PIPE_MARK_HOLE_ROOTS = 40,
-    VKMESH_PIPE_MARK_HOLE_FACES = 41,
-    VKMESH_PIPE_WRITE_HOLE_VERTICES = 42,
-    VKMESH_PIPE_WRITE_HOLE_FACES = 43,
-    VKMESH_PIPE_UNSIGNED_DISTANCE = 44,
-    VKMESH_PIPE_COUNT = 45,
-} vkmesh_pipeline_kind;
 
 typedef struct vkmesh_shader_blob {
     const unsigned char * data;
@@ -281,7 +282,40 @@ static const vkmesh_shader_blob vkmesh_shaders[VKMESH_PIPE_COUNT] = {
     { vkmesh_unsigned_distance_spv, sizeof(vkmesh_unsigned_distance_spv), "unsigned_distance" },
 };
 
-static vkmesh_vk * g_active_vkmesh_vk = NULL;
+#if defined(_MSC_VER)
+#define VKMESH_THREAD_LOCAL __declspec(thread)
+#else
+#define VKMESH_THREAD_LOCAL _Thread_local
+#endif
+
+/* Nested helpers reuse one context per call without sharing Vulkan objects across threads. */
+static VKMESH_THREAD_LOCAL vkmesh_vk * g_active_vkmesh_vk = NULL;
+static VKMESH_THREAD_LOCAL int g_vkmesh_device_index = 0;
+
+typedef enum vkmesh_error_kind {
+    VKMESH_ERROR_NONE = 0,
+    VKMESH_ERROR_INVALID_ARGUMENT,
+    VKMESH_ERROR_OUT_OF_MEMORY,
+    VKMESH_ERROR_VULKAN_UNAVAILABLE,
+    VKMESH_ERROR_VULKAN,
+} vkmesh_error_kind;
+
+static VKMESH_THREAD_LOCAL vkmesh_error_kind g_vkmesh_last_error = VKMESH_ERROR_NONE;
+
+static void vkmesh_set_error(vkmesh_error_kind error) {
+    g_vkmesh_last_error = error;
+}
+
+static int vkmesh_check_vk_result(const char * operation, VkResult result) {
+    if (result == VK_SUCCESS) return 1;
+    if (result == VK_ERROR_OUT_OF_HOST_MEMORY || result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+    } else {
+        vkmesh_set_error(VKMESH_ERROR_VULKAN);
+    }
+    fprintf(stderr, "vkmesh: %s failed: VkResult=%d\n", operation, (int) result);
+    return 0;
+}
 
 static void mesh_free(vkmesh_mesh * mesh) {
     if (mesh == NULL) return;
@@ -397,6 +431,26 @@ static int meshbin_checked_count(uint64_t n, uint64_t channels, size_t * out) {
         return 0;
     }
     *out = (size_t) n * (size_t) channels;
+    return 1;
+}
+
+static int parse_int_arg(const char * text, int * out) {
+    if (text == NULL || text[0] == '\0' || out == NULL) return 0;
+    errno = 0;
+    char * end = NULL;
+    long value = strtol(text, &end, 10);
+    if (errno == ERANGE || end == text || *end != '\0' || value < INT_MIN || value > INT_MAX) return 0;
+    *out = (int) value;
+    return 1;
+}
+
+static int parse_float_arg(const char * text, float * out) {
+    if (text == NULL || text[0] == '\0' || out == NULL) return 0;
+    errno = 0;
+    char * end = NULL;
+    float value = strtof(text, &end);
+    if (errno == ERANGE || end == text || *end != '\0' || !isfinite(value)) return 0;
+    *out = value;
     return 1;
 }
 
@@ -548,7 +602,7 @@ static int vk_buffer_create(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out
     buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     VkResult result = vkCreateBuffer(vk->device, &buffer_info, NULL, &out->buffer);
-    if (result != VK_SUCCESS) return 0;
+    if (!vkmesh_check_vk_result("vkCreateBuffer", result)) return 0;
 
     VkMemoryRequirements req;
     vkGetBufferMemoryRequirements(vk->device, out->buffer, &req);
@@ -557,6 +611,8 @@ static int vk_buffer_create(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out
         req.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     if (memory_type == UINT32_MAX) {
+        vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
+        fprintf(stderr, "vkmesh: selected device has no host-visible coherent storage-buffer memory type\n");
         vkDestroyBuffer(vk->device, out->buffer, NULL);
         memset(out, 0, sizeof(*out));
         return 0;
@@ -571,6 +627,7 @@ static int vk_buffer_create(vkmesh_vk * vk, size_t bytes, vkmesh_vk_buffer * out
     if (result == VK_SUCCESS) result = vkBindBufferMemory(vk->device, out->buffer, out->memory, 0);
     if (result == VK_SUCCESS) result = vkMapMemory(vk->device, out->memory, 0, req.size, 0, &out->mapped);
     if (result != VK_SUCCESS) {
+        (void) vkmesh_check_vk_result("Vulkan buffer allocation/map", result);
         vk_buffer_destroy(vk, out);
         return 0;
     }
@@ -589,6 +646,7 @@ static void vk_buffer_destroy(vkmesh_vk * vk, vkmesh_vk_buffer * b) {
 static void vkmesh_vk_destroy(vkmesh_vk * vk) {
     if (vk == NULL) return;
     if (vk->device != VK_NULL_HANDLE) vkDeviceWaitIdle(vk->device);
+    if (vk->completion_fence != VK_NULL_HANDLE) vkDestroyFence(vk->device, vk->completion_fence, NULL);
     if (vk->descriptor_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(vk->device, vk->descriptor_pool, NULL);
     for (uint32_t i = 0; i < VKMESH_PIPE_COUNT; ++i) {
         if (vk->pipelines[i] != VK_NULL_HANDLE) vkDestroyPipeline(vk->device, vk->pipelines[i], NULL);
@@ -627,7 +685,8 @@ static int vkmesh_create_compute_pipeline(
     shader_info.codeSize = blob->len;
     shader_info.pCode = (const uint32_t *) blob->data;
     VkShaderModule shader = VK_NULL_HANDLE;
-    if (vkCreateShaderModule(vk->device, &shader_info, NULL, &shader) != VK_SUCCESS) {
+    VkResult result = vkCreateShaderModule(vk->device, &shader_info, NULL, &shader);
+    if (!vkmesh_check_vk_result("vkCreateShaderModule", result)) {
         fprintf(stderr, "vkmesh: failed to create shader module for %s\n", blob->name);
         return 0;
     }
@@ -644,9 +703,9 @@ static int vkmesh_create_compute_pipeline(
     pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipeline_info.stage = stage;
     pipeline_info.layout = vk->pipeline_layout;
-    VkResult result = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, pipeline);
+    result = vkCreateComputePipelines(vk->device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, pipeline);
     vkDestroyShaderModule(vk->device, shader, NULL);
-    if (result != VK_SUCCESS) {
+    if (!vkmesh_check_vk_result("vkCreateComputePipelines", result)) {
         fprintf(stderr, "vkmesh: failed to create compute pipeline for %s\n", blob->name);
         return 0;
     }
@@ -665,45 +724,74 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
     memset(&instance_info, 0, sizeof(instance_info));
     instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     instance_info.pApplicationInfo = &app;
-    if (vkCreateInstance(&instance_info, NULL, &vk->instance) != VK_SUCCESS) {
-        fprintf(stderr, "vkmesh: failed to create Vulkan instance\n");
+    VkResult result = vkCreateInstance(&instance_info, NULL, &vk->instance);
+    if (!vkmesh_check_vk_result("vkCreateInstance", result)) {
+        vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
         return 0;
     }
 
     uint32_t physical_count = 0;
-    if (vkEnumeratePhysicalDevices(vk->instance, &physical_count, NULL) != VK_SUCCESS || physical_count == 0) {
-        fprintf(stderr, "vkmesh: no Vulkan physical devices\n");
+    result = vkEnumeratePhysicalDevices(vk->instance, &physical_count, NULL);
+    if (result != VK_SUCCESS || physical_count == 0) {
+        vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
+        if (result != VK_SUCCESS) {
+            (void) vkmesh_check_vk_result("vkEnumeratePhysicalDevices(count)", result);
+            vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
+        } else {
+            fprintf(stderr, "vkmesh: no Vulkan physical devices\n");
+        }
         return 0;
     }
     VkPhysicalDevice * physical = (VkPhysicalDevice *) malloc((size_t) physical_count * sizeof(*physical));
-    if (physical == NULL) return 0;
-    if (vkEnumeratePhysicalDevices(vk->instance, &physical_count, physical) != VK_SUCCESS) {
+    if (physical == NULL) {
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        return 0;
+    }
+    result = vkEnumeratePhysicalDevices(vk->instance, &physical_count, physical);
+    if (!vkmesh_check_vk_result("vkEnumeratePhysicalDevices(list)", result)) {
         free(physical);
         return 0;
     }
     int found = 0;
-    for (uint32_t i = 0; i < physical_count && !found; ++i) {
-        uint32_t family_count = 0;
-        vkGetPhysicalDeviceQueueFamilyProperties(physical[i], &family_count, NULL);
-        VkQueueFamilyProperties * families =
-            (VkQueueFamilyProperties *) malloc((size_t) family_count * sizeof(*families));
-        if (families == NULL) continue;
-        vkGetPhysicalDeviceQueueFamilyProperties(physical[i], &family_count, families);
-        for (uint32_t q = 0; q < family_count; ++q) {
-            if ((families[q].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
-                vk->physical_device = physical[i];
-                vk->queue_family = q;
-                found = 1;
-                break;
-            }
-        }
-        free(families);
-    }
-    free(physical);
-    if (!found) {
-        fprintf(stderr, "vkmesh: no Vulkan compute queue\n");
+    if (g_vkmesh_device_index < 0 || (uint32_t) g_vkmesh_device_index >= physical_count) {
+        vkmesh_set_error(VKMESH_ERROR_INVALID_ARGUMENT);
+        fprintf(stderr,
+            "vkmesh: Vulkan device index %d is out of range (available devices: %u)\n",
+            g_vkmesh_device_index,
+            physical_count);
+        free(physical);
         return 0;
     }
+    VkPhysicalDevice selected = physical[(uint32_t) g_vkmesh_device_index];
+    uint32_t family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(selected, &family_count, NULL);
+    VkQueueFamilyProperties * families =
+        (VkQueueFamilyProperties *) malloc((size_t) family_count * sizeof(*families));
+    if (families == NULL) {
+        vkmesh_set_error(VKMESH_ERROR_OUT_OF_MEMORY);
+        free(physical);
+        return 0;
+    }
+    vkGetPhysicalDeviceQueueFamilyProperties(selected, &family_count, families);
+    for (uint32_t q = 0; q < family_count; ++q) {
+        if ((families[q].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0) {
+            vk->physical_device = selected;
+            vk->queue_family = q;
+            found = 1;
+            break;
+        }
+    }
+    free(families);
+    free(physical);
+    if (!found) {
+        vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
+        fprintf(stderr, "vkmesh: Vulkan device %d has no compute queue\n", g_vkmesh_device_index);
+        return 0;
+    }
+
+    VkPhysicalDeviceProperties device_props;
+    vkGetPhysicalDeviceProperties(vk->physical_device, &device_props);
+    fprintf(stderr, "vkmesh: using Vulkan device %d: %s\n", g_vkmesh_device_index, device_props.deviceName);
 
     float priority = 1.0f;
     VkDeviceQueueCreateInfo queue_info;
@@ -718,8 +806,9 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
     device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     device_info.queueCreateInfoCount = 1;
     device_info.pQueueCreateInfos = &queue_info;
-    if (vkCreateDevice(vk->physical_device, &device_info, NULL, &vk->device) != VK_SUCCESS) {
-        fprintf(stderr, "vkmesh: failed to create Vulkan device\n");
+    result = vkCreateDevice(vk->physical_device, &device_info, NULL, &vk->device);
+    if (!vkmesh_check_vk_result("vkCreateDevice", result)) {
+        vkmesh_set_error(VKMESH_ERROR_VULKAN_UNAVAILABLE);
         return 0;
     }
     vkGetDeviceQueue(vk->device, vk->queue_family, 0, &vk->queue);
@@ -729,7 +818,8 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
     pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pool_info.queueFamilyIndex = vk->queue_family;
-    if (vkCreateCommandPool(vk->device, &pool_info, NULL, &vk->command_pool) != VK_SUCCESS) return 0;
+    result = vkCreateCommandPool(vk->device, &pool_info, NULL, &vk->command_pool);
+    if (!vkmesh_check_vk_result("vkCreateCommandPool", result)) return 0;
 
     VkDescriptorSetLayoutBinding bindings[4];
     memset(bindings, 0, sizeof(bindings));
@@ -744,7 +834,8 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
     layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layout_info.bindingCount = 4;
     layout_info.pBindings = bindings;
-    if (vkCreateDescriptorSetLayout(vk->device, &layout_info, NULL, &vk->descriptor_set_layout) != VK_SUCCESS) return 0;
+    result = vkCreateDescriptorSetLayout(vk->device, &layout_info, NULL, &vk->descriptor_set_layout);
+    if (!vkmesh_check_vk_result("vkCreateDescriptorSetLayout", result)) return 0;
 
     VkPushConstantRange push_range;
     memset(&push_range, 0, sizeof(push_range));
@@ -758,7 +849,8 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
     pipeline_layout_info.pSetLayouts = &vk->descriptor_set_layout;
     pipeline_layout_info.pushConstantRangeCount = 1;
     pipeline_layout_info.pPushConstantRanges = &push_range;
-    if (vkCreatePipelineLayout(vk->device, &pipeline_layout_info, NULL, &vk->pipeline_layout) != VK_SUCCESS) return 0;
+    result = vkCreatePipelineLayout(vk->device, &pipeline_layout_info, NULL, &vk->pipeline_layout);
+    if (!vkmesh_check_vk_result("vkCreatePipelineLayout", result)) return 0;
 
     for (uint32_t i = 0; i < VKMESH_PIPE_COUNT; ++i) {
         if (!vkmesh_create_compute_pipeline(vk, &vkmesh_shaders[i], &vk->pipelines[i])) return 0;
@@ -767,14 +859,16 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
     VkDescriptorPoolSize pool_size;
     memset(&pool_size, 0, sizeof(pool_size));
     pool_size.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    pool_size.descriptorCount = 4;
+    pool_size.descriptorCount = 12;
     VkDescriptorPoolCreateInfo descriptor_pool_info;
     memset(&descriptor_pool_info, 0, sizeof(descriptor_pool_info));
     descriptor_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    descriptor_pool_info.maxSets = 1;
+    descriptor_pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    descriptor_pool_info.maxSets = 3;
     descriptor_pool_info.poolSizeCount = 1;
     descriptor_pool_info.pPoolSizes = &pool_size;
-    if (vkCreateDescriptorPool(vk->device, &descriptor_pool_info, NULL, &vk->descriptor_pool) != VK_SUCCESS) return 0;
+    result = vkCreateDescriptorPool(vk->device, &descriptor_pool_info, NULL, &vk->descriptor_pool);
+    if (!vkmesh_check_vk_result("vkCreateDescriptorPool", result)) return 0;
 
     VkDescriptorSetAllocateInfo set_alloc;
     memset(&set_alloc, 0, sizeof(set_alloc));
@@ -782,7 +876,8 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
     set_alloc.descriptorPool = vk->descriptor_pool;
     set_alloc.descriptorSetCount = 1;
     set_alloc.pSetLayouts = &vk->descriptor_set_layout;
-    if (vkAllocateDescriptorSets(vk->device, &set_alloc, &vk->descriptor_set) != VK_SUCCESS) return 0;
+    result = vkAllocateDescriptorSets(vk->device, &set_alloc, &vk->descriptor_set);
+    if (!vkmesh_check_vk_result("vkAllocateDescriptorSets", result)) return 0;
 
     VkCommandBufferAllocateInfo cmd_alloc;
     memset(&cmd_alloc, 0, sizeof(cmd_alloc));
@@ -790,11 +885,37 @@ static int vkmesh_vk_init(vkmesh_vk * vk) {
     cmd_alloc.commandPool = vk->command_pool;
     cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cmd_alloc.commandBufferCount = 1;
-    if (vkAllocateCommandBuffers(vk->device, &cmd_alloc, &vk->command_buffer) != VK_SUCCESS) return 0;
+    result = vkAllocateCommandBuffers(vk->device, &cmd_alloc, &vk->command_buffer);
+    if (!vkmesh_check_vk_result("vkAllocateCommandBuffers", result)) return 0;
+
+    VkFenceCreateInfo fence_info;
+    memset(&fence_info, 0, sizeof(fence_info));
+    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    result = vkCreateFence(vk->device, &fence_info, NULL, &vk->completion_fence);
+    if (!vkmesh_check_vk_result("vkCreateFence", result)) return 0;
     return 1;
 }
 
-static void vkmesh_update_descriptor_set(vkmesh_vk * vk, vkmesh_vk_buffer buffers[4]) {
+static int vkmesh_submit_and_wait(vkmesh_vk * vk, const VkSubmitInfo * submit) {
+    VkResult result = vkResetFences(vk->device, 1, &vk->completion_fence);
+    if (result == VK_SUCCESS) {
+        result = vkQueueSubmit(vk->queue, 1, submit, vk->completion_fence);
+    }
+    if (result == VK_SUCCESS) {
+        result = vkWaitForFences(vk->device, 1, &vk->completion_fence, VK_TRUE, UINT64_MAX);
+    }
+    if (result != VK_SUCCESS) {
+        vkmesh_set_error(VKMESH_ERROR_VULKAN);
+        fprintf(stderr, "vkmesh: Vulkan submit/wait failed: VkResult=%d\n", (int) result);
+        return 0;
+    }
+    return 1;
+}
+
+static void vkmesh_update_descriptor_set_handle(
+    vkmesh_vk * vk,
+    VkDescriptorSet descriptor_set,
+    vkmesh_vk_buffer buffers[4]) {
     VkDescriptorBufferInfo infos[4];
     VkWriteDescriptorSet writes[4];
     memset(infos, 0, sizeof(infos));
@@ -804,13 +925,17 @@ static void vkmesh_update_descriptor_set(vkmesh_vk * vk, vkmesh_vk_buffer buffer
         infos[i].offset = 0;
         infos[i].range = (VkDeviceSize) buffers[i].bytes;
         writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = vk->descriptor_set;
+        writes[i].dstSet = descriptor_set;
         writes[i].dstBinding = i;
         writes[i].descriptorCount = 1;
         writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[i].pBufferInfo = &infos[i];
     }
     vkUpdateDescriptorSets(vk->device, 4, writes, 0, NULL);
+}
+
+static void vkmesh_update_descriptor_set(vkmesh_vk * vk, vkmesh_vk_buffer buffers[4]) {
+    vkmesh_update_descriptor_set_handle(vk, vk->descriptor_set, buffers);
 }
 
 static int vkmesh_dispatch(
@@ -847,9 +972,86 @@ static int vkmesh_dispatch(
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &vk->command_buffer;
-    if (vkQueueSubmit(vk->queue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS) return 0;
-    vkQueueWaitIdle(vk->queue);
-    return 1;
+    return vkmesh_submit_and_wait(vk, &submit);
+}
+
+static int vkmesh_dispatch_pair(
+    vkmesh_vk * vk,
+    vkmesh_pipeline_kind first_kind,
+    vkmesh_vk_buffer first_buffers[4],
+    const vkmesh_push * first_push,
+    uint32_t first_groups,
+    vkmesh_pipeline_kind second_kind,
+    vkmesh_vk_buffer second_buffers[4],
+    uint32_t second_n,
+    uint32_t second_groups) {
+    VkDescriptorSetLayout layouts[2] = { vk->descriptor_set_layout, vk->descriptor_set_layout };
+    VkDescriptorSetAllocateInfo alloc;
+    memset(&alloc, 0, sizeof(alloc));
+    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    alloc.descriptorPool = vk->descriptor_pool;
+    alloc.descriptorSetCount = 2;
+    alloc.pSetLayouts = layouts;
+    VkDescriptorSet sets[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
+    VkResult result = vkAllocateDescriptorSets(vk->device, &alloc, sets);
+    if (!vkmesh_check_vk_result("vkAllocateDescriptorSets(batch)", result)) return 0;
+    vkmesh_update_descriptor_set_handle(vk, sets[0], first_buffers);
+    vkmesh_update_descriptor_set_handle(vk, sets[1], second_buffers);
+
+    int ok = 0;
+    if (vkResetCommandBuffer(vk->command_buffer, 0) == VK_SUCCESS) {
+        VkCommandBufferBeginInfo begin;
+        memset(&begin, 0, sizeof(begin));
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        if (vkBeginCommandBuffer(vk->command_buffer, &begin) == VK_SUCCESS) {
+            vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipelines[first_kind]);
+            vkCmdBindDescriptorSets(
+                vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &sets[0], 0, NULL);
+            vkCmdPushConstants(
+                vk->command_buffer, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*first_push), first_push);
+            vkCmdDispatch(vk->command_buffer, first_groups, 1, 1);
+
+            VkMemoryBarrier barrier;
+            memset(&barrier, 0, sizeof(barrier));
+            barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            vkCmdPipelineBarrier(
+                vk->command_buffer,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 1, &barrier, 0, NULL, 0, NULL);
+
+            vkmesh_push second_push;
+            memset(&second_push, 0, sizeof(second_push));
+            second_push.n = second_n;
+            vkCmdBindPipeline(vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipelines[second_kind]);
+            vkCmdBindDescriptorSets(
+                vk->command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &sets[1], 0, NULL);
+            vkCmdPushConstants(
+                vk->command_buffer, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(second_push), &second_push);
+            vkCmdDispatch(vk->command_buffer, second_groups, 1, 1);
+
+            barrier.dstAccessMask =
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+            vkCmdPipelineBarrier(
+                vk->command_buffer,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                0, 1, &barrier, 0, NULL, 0, NULL);
+            if (vkEndCommandBuffer(vk->command_buffer) == VK_SUCCESS) {
+                VkSubmitInfo submit;
+                memset(&submit, 0, sizeof(submit));
+                submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                submit.commandBufferCount = 1;
+                submit.pCommandBuffers = &vk->command_buffer;
+                ok = vkmesh_submit_and_wait(vk, &submit);
+            }
+        }
+    }
+    result = vkFreeDescriptorSets(vk->device, vk->descriptor_pool, 2, sets);
+    if (!vkmesh_check_vk_result("vkFreeDescriptorSets(batch)", result)) ok = 0;
+    return ok;
 }
 
 static size_t next_power_of_two_size(size_t n) {
@@ -914,9 +1116,7 @@ static int vkmesh_sort_records_vulkan(
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &vk->command_buffer;
-    if (vkQueueSubmit(vk->queue, 1, &submit, VK_NULL_HANDLE) != VK_SUCCESS) return 0;
-    vkQueueWaitIdle(vk->queue);
-    return 1;
+    return vkmesh_submit_and_wait(vk, &submit);
 }
 
 static int expand_edges_vulkan(const vkmesh_mesh * mesh, vkmesh_edge ** edges_out, int64_t * edge_count_out) {
@@ -1721,10 +1921,9 @@ static int vkmesh_device_remove_small_connected_components(
         memset(&push, 0, sizeof(push));
         push.n = (uint32_t) edge_count;
         push.aux0 = dm->n_faces;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_UNION_FACE_EDGES, union_buffers, &push, edge_groups)) goto cleanup;
-        memset(&push, 0, sizeof(push));
-        push.n = dm->n_faces;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPRESS_PARENTS, compress_buffers, &push, face_groups)) goto cleanup;
+        if (!vkmesh_dispatch_pair(
+                vk, VKMESH_PIPE_UNION_FACE_EDGES, union_buffers, &push, edge_groups,
+                VKMESH_PIPE_COMPRESS_PARENTS, compress_buffers, dm->n_faces, face_groups)) goto cleanup;
         if (((const uint32_t *) changed.mapped)[0] == 0u) {
             converged = 1;
             break;
@@ -1857,10 +2056,9 @@ static int vkmesh_device_repair_non_manifold_edges(
         memset(&push, 0, sizeof(push));
         push.n = (uint32_t) edge_count;
         push.aux0 = face_count;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_UNION_CORNER_EDGES, union_buffers, &push, edge_groups)) goto cleanup;
-        memset(&push, 0, sizeof(push));
-        push.n = corner_count;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPRESS_PARENTS, compress_buffers, &push, corner_groups)) goto cleanup;
+        if (!vkmesh_dispatch_pair(
+                vk, VKMESH_PIPE_UNION_CORNER_EDGES, union_buffers, &push, edge_groups,
+                VKMESH_PIPE_COMPRESS_PARENTS, compress_buffers, corner_count, corner_groups)) goto cleanup;
         if (((const uint32_t *) changed.mapped)[0] == 0u) {
             converged = 1;
             break;
@@ -2014,11 +2212,9 @@ static int vkmesh_device_unify_face_orientations(vkmesh_device_mesh * dm, uint32
         memset(&push, 0, sizeof(push));
         push.n = (uint32_t) edge_count;
         push.aux0 = face_count;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_UNION_ORIENTATION_EDGES, union_buffers, &push, edge_groups)) goto cleanup;
-
-        memset(&push, 0, sizeof(push));
-        push.n = face_count;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPRESS_ORIENTATION_STATE, compress_buffers, &push, face_groups)) goto cleanup;
+        if (!vkmesh_dispatch_pair(
+                vk, VKMESH_PIPE_UNION_ORIENTATION_EDGES, union_buffers, &push, edge_groups,
+                VKMESH_PIPE_COMPRESS_ORIENTATION_STATE, compress_buffers, face_count, face_groups)) goto cleanup;
 
         if (((const uint32_t *) changed.mapped)[0] == 0u) {
             converged = 1;
@@ -2671,10 +2867,9 @@ static int vkmesh_repair_non_manifold_edges_vulkan(vkmesh_mesh * mesh, int * old
         memset(&push, 0, sizeof(push));
         push.n = (uint32_t) edge_count;
         push.aux0 = face_count;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_UNION_CORNER_EDGES, union_buffers, &push, edge_groups)) goto cleanup;
-        memset(&push, 0, sizeof(push));
-        push.n = corner_count;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPRESS_PARENTS, compress_buffers, &push, corner_groups)) goto cleanup;
+        if (!vkmesh_dispatch_pair(
+                vk, VKMESH_PIPE_UNION_CORNER_EDGES, union_buffers, &push, edge_groups,
+                VKMESH_PIPE_COMPRESS_PARENTS, compress_buffers, corner_count, corner_groups)) goto cleanup;
         if (((const uint32_t *) changed.mapped)[0] == 0u) {
             converged = 1;
             break;
@@ -2929,10 +3124,10 @@ static int vkmesh_remove_small_connected_components(vkmesh_mesh * mesh, float mi
                             memset(&push, 0, sizeof(push));
                             push.n = (uint32_t) edge_count;
                             push.aux0 = (uint32_t) mesh->n_faces;
-                            if (!vkmesh_dispatch(vk, VKMESH_PIPE_UNION_FACE_EDGES, union_buffers, &push, edge_groups)) break;
-                            memset(&push, 0, sizeof(push));
-                            push.n = (uint32_t) mesh->n_faces;
-                            if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPRESS_PARENTS, compress_buffers, &push, face_groups)) break;
+                            if (!vkmesh_dispatch_pair(
+                                    vk, VKMESH_PIPE_UNION_FACE_EDGES, union_buffers, &push, edge_groups,
+                                    VKMESH_PIPE_COMPRESS_PARENTS, compress_buffers,
+                                    (uint32_t) mesh->n_faces, face_groups)) break;
                             if (((const uint32_t *) changed.mapped)[0] == 0u) {
                                 converged = 1;
                                 break;
@@ -3139,11 +3334,9 @@ static int vkmesh_unify_face_orientations_vulkan(vkmesh_mesh * mesh, int * flipp
         memset(&push, 0, sizeof(push));
         push.n = (uint32_t) edge_count;
         push.aux0 = face_count;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_UNION_ORIENTATION_EDGES, union_buffers, &push, edge_groups)) goto cleanup;
-
-        memset(&push, 0, sizeof(push));
-        push.n = face_count;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPRESS_ORIENTATION_STATE, compress_buffers, &push, face_groups)) goto cleanup;
+        if (!vkmesh_dispatch_pair(
+                vk, VKMESH_PIPE_UNION_ORIENTATION_EDGES, union_buffers, &push, edge_groups,
+                VKMESH_PIPE_COMPRESS_ORIENTATION_STATE, compress_buffers, face_count, face_groups)) goto cleanup;
 
         if (((const uint32_t *) changed.mapped)[0] == 0u) {
             converged = 1;
@@ -4741,7 +4934,7 @@ static int vkmesh_uv_unwrap(vkmesh_mesh * mesh, int texture_size, int * old_vert
     if (indices == NULL) return 0;
     for (int64_t i = 0; i < mesh->n_faces * 3; ++i) indices[i] = (uint32_t) mesh->faces[i];
 
-    /* CuMesh accelerates chart clustering on GPU, then hands CPU chart meshes to xatlas. */
+    /* Standalone meshbin UV unwrap uses xatlas directly on the CPU. */
     xatlasSetPrint(NULL, false);
     xatlasAtlas * atlas = xatlasCreate();
     if (atlas == NULL) {
@@ -6120,10 +6313,9 @@ static int compute_hole_components_vulkan(
         memset(&push, 0, sizeof(push));
         push.n = boundary_count;
         push.aux0 = vertex_count;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_UNION_BOUNDARY_EDGES, union_buffers, &push, boundary_groups)) goto cleanup;
-        memset(&push, 0, sizeof(push));
-        push.n = boundary_count;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPRESS_PARENTS, compress_buffers, &push, boundary_groups)) goto cleanup;
+        if (!vkmesh_dispatch_pair(
+                vk, VKMESH_PIPE_UNION_BOUNDARY_EDGES, union_buffers, &push, boundary_groups,
+                VKMESH_PIPE_COMPRESS_PARENTS, compress_buffers, boundary_count, boundary_groups)) goto cleanup;
         if (((const uint32_t *) counter_buffer.mapped)[0] == 0u) {
             converged = 1;
             break;
@@ -6485,10 +6677,9 @@ static int vkmesh_fill_holes_vulkan(vkmesh_mesh * mesh, float max_hole_perimeter
         memset(&push, 0, sizeof(push));
         push.n = boundary_count;
         push.aux0 = vertex_count;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_UNION_BOUNDARY_EDGES, union_buffers, &push, boundary_groups)) goto cleanup;
-        memset(&push, 0, sizeof(push));
-        push.n = boundary_count;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPRESS_PARENTS, compress_buffers, &push, boundary_groups)) goto cleanup;
+        if (!vkmesh_dispatch_pair(
+                vk, VKMESH_PIPE_UNION_BOUNDARY_EDGES, union_buffers, &push, boundary_groups,
+                VKMESH_PIPE_COMPRESS_PARENTS, compress_buffers, boundary_count, boundary_groups)) goto cleanup;
         if (((const uint32_t *) counter_buffer.mapped)[0] == 0u) {
             converged = 1;
             break;
@@ -6776,10 +6967,9 @@ static int vkmesh_device_fill_holes(
         memset(&push, 0, sizeof(push));
         push.n = boundary_count;
         push.aux0 = vertex_count;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_UNION_BOUNDARY_EDGES, union_buffers, &push, boundary_groups)) goto cleanup;
-        memset(&push, 0, sizeof(push));
-        push.n = boundary_count;
-        if (!vkmesh_dispatch(vk, VKMESH_PIPE_COMPRESS_PARENTS, compress_buffers, &push, boundary_groups)) goto cleanup;
+        if (!vkmesh_dispatch_pair(
+                vk, VKMESH_PIPE_UNION_BOUNDARY_EDGES, union_buffers, &push, boundary_groups,
+                VKMESH_PIPE_COMPRESS_PARENTS, compress_buffers, boundary_count, boundary_groups)) goto cleanup;
         if (((const uint32_t *) counter_buffer.mapped)[0] == 0u) {
             converged = 1;
             break;
@@ -7853,6 +8043,12 @@ static trellis_status vkmesh_from_trellis_mesh(const trellis_mesh_host * src, vk
     }
     memcpy(out.vertices, src->vertices, vertex_count * sizeof(float));
     memcpy(out.faces, src->faces, face_count * sizeof(int32_t));
+    for (size_t i = 0; i < vertex_count; ++i) {
+        if (!isfinite(out.vertices[i])) {
+            mesh_free(&out);
+            return TRELLIS_STATUS_INVALID_ARGUMENT;
+        }
+    }
     for (size_t i = 0; i < face_count; ++i) {
         if (out.faces[i] < 0 || out.faces[i] >= src->n_vertices) {
             mesh_free(&out);
@@ -7887,7 +8083,23 @@ trellis_status trellis_vkmesh_postprocess(
     trellis_mesh_host * mesh_out,
     trellis_mesh_host * projection_mesh_out,
     const trellis_vkmesh_postprocess_options * options) {
-    if (mesh == NULL || mesh_out == NULL) {
+    if (mesh == NULL || mesh_out == NULL || mesh_out == mesh ||
+        projection_mesh_out == mesh || projection_mesh_out == mesh_out) {
+        return TRELLIS_STATUS_INVALID_ARGUMENT;
+    }
+    if (options != NULL &&
+        (options->device < 0 || options->decimation_target < 0 ||
+         options->simplify_steps < 0 || options->remesh_resolution < 0 ||
+         options->max_hole_perimeter < 0.0f || options->degenerate_abs < 0.0f ||
+         options->degenerate_rel < 0.0f || options->min_component_area < 0.0f ||
+         options->lambda_edge_length < 0.0f || options->lambda_skinny < 0.0f ||
+         options->simplify_threshold < 0.0f || options->remesh_band < 0.0f ||
+         options->remesh_project < 0.0f ||
+         !isfinite(options->max_hole_perimeter) || !isfinite(options->degenerate_abs) ||
+         !isfinite(options->degenerate_rel) || !isfinite(options->min_component_area) ||
+         !isfinite(options->lambda_edge_length) || !isfinite(options->lambda_skinny) ||
+         !isfinite(options->simplify_threshold) || !isfinite(options->remesh_band) ||
+         !isfinite(options->remesh_project))) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     memset(mesh_out, 0, sizeof(*mesh_out));
@@ -7935,6 +8147,9 @@ trellis_status trellis_vkmesh_postprocess(
         options != NULL && options->remesh_band > 0.0f ? options->remesh_band : 1.0f;
     const float remesh_project =
         options != NULL && options->remesh_project > 0.0f ? options->remesh_project : 0.0f;
+    const int previous_device = g_vkmesh_device_index;
+    g_vkmesh_device_index = options != NULL ? options->device : 0;
+    g_vkmesh_last_error = VKMESH_ERROR_NONE;
 
     if (!vkmesh_trellis_postprocess(
             &work,
@@ -7954,7 +8169,20 @@ trellis_status trellis_vkmesh_postprocess(
             remesh_resolution,
             remesh_band,
             remesh_project)) {
-        status = TRELLIS_STATUS_ERROR;
+        switch (g_vkmesh_last_error) {
+            case VKMESH_ERROR_INVALID_ARGUMENT:
+                status = TRELLIS_STATUS_INVALID_ARGUMENT;
+                break;
+            case VKMESH_ERROR_OUT_OF_MEMORY:
+                status = TRELLIS_STATUS_OUT_OF_MEMORY;
+                break;
+            case VKMESH_ERROR_VULKAN_UNAVAILABLE:
+                status = TRELLIS_STATUS_CUDA_UNAVAILABLE;
+                break;
+            default:
+                status = TRELLIS_STATUS_ERROR;
+                break;
+        }
         goto cleanup;
     }
 
@@ -7970,6 +8198,7 @@ trellis_status trellis_vkmesh_postprocess(
     }
 
 cleanup:
+    g_vkmesh_device_index = previous_device;
     if (status != TRELLIS_STATUS_OK) {
         trellis_mesh_free(mesh_out);
         if (projection_mesh_out != NULL) {
@@ -8020,6 +8249,7 @@ static void print_usage(const char * argv0) {
         "  --remesh-band X               Narrow-band size in voxels, default 1\n"
         "  --remesh-project X            Project remesh vertices back to source, default 0\n"
         "  --texture-size N              xatlas pack resolution, default 1024\n"
+        "  --device N                    Vulkan physical-device index, default 0\n"
         "  --unsigned-distance pts.txt   Compute UDF for text points: x y z per line\n"
         "  --distance-output out.txt     Required with --unsigned-distance unless --output is enough for mesh only\n"
         "  --projection-mesh-output FILE With --postprocess, write post-fill source meshbin for texture projection\n"
@@ -8046,6 +8276,7 @@ int main(int argc, char ** argv) {
     int simplify_steps = 0;
     int remesh_resolution = 1024;
     int texture_size = 1024;
+    int device = 0;
     int trellis_postprocess = 0;
     int fill_holes = 1;
     int remove_duplicate_faces = 0;
@@ -8080,34 +8311,78 @@ int main(int argc, char ** argv) {
             remove_small_components = 1;
             unify_face_orientations = 1;
         } else if (strcmp(argv[i], "--max-hole-perimeter") == 0 && i + 1 < argc) {
-            max_hole_perimeter = (float) atof(argv[++i]);
+            if (!parse_float_arg(argv[++i], &max_hole_perimeter)) {
+                fprintf(stderr, "vkmesh: invalid --max-hole-perimeter\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--degenerate-abs") == 0 && i + 1 < argc) {
-            degenerate_abs = (float) atof(argv[++i]);
+            if (!parse_float_arg(argv[++i], &degenerate_abs)) {
+                fprintf(stderr, "vkmesh: invalid --degenerate-abs\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--degenerate-rel") == 0 && i + 1 < argc) {
-            degenerate_rel = (float) atof(argv[++i]);
+            if (!parse_float_arg(argv[++i], &degenerate_rel)) {
+                fprintf(stderr, "vkmesh: invalid --degenerate-rel\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--min-component-area") == 0 && i + 1 < argc) {
-            min_component_area = (float) atof(argv[++i]);
+            if (!parse_float_arg(argv[++i], &min_component_area)) {
+                fprintf(stderr, "vkmesh: invalid --min-component-area\n");
+                return 2;
+            }
         } else if ((strcmp(argv[i], "--target-faces") == 0 || strcmp(argv[i], "--decimation-target") == 0) && i + 1 < argc) {
-            target_faces = atoi(argv[++i]);
+            if (!parse_int_arg(argv[++i], &target_faces)) {
+                fprintf(stderr, "vkmesh: invalid face target\n");
+                return 2;
+            }
             simplify = 1;
             disable_simplify = 0;
             simplify_option_seen = 1;
         } else if (strcmp(argv[i], "--simplify-steps") == 0 && i + 1 < argc) {
-            simplify_steps = atoi(argv[++i]);
+            if (!parse_int_arg(argv[++i], &simplify_steps)) {
+                fprintf(stderr, "vkmesh: invalid --simplify-steps\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--simplify-threshold") == 0 && i + 1 < argc) {
-            simplify_threshold = (float) atof(argv[++i]);
+            if (!parse_float_arg(argv[++i], &simplify_threshold)) {
+                fprintf(stderr, "vkmesh: invalid --simplify-threshold\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--lambda-edge-length") == 0 && i + 1 < argc) {
-            lambda_edge_length = (float) atof(argv[++i]);
+            if (!parse_float_arg(argv[++i], &lambda_edge_length)) {
+                fprintf(stderr, "vkmesh: invalid --lambda-edge-length\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--lambda-skinny") == 0 && i + 1 < argc) {
-            lambda_skinny = (float) atof(argv[++i]);
+            if (!parse_float_arg(argv[++i], &lambda_skinny)) {
+                fprintf(stderr, "vkmesh: invalid --lambda-skinny\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--remesh-resolution") == 0 && i + 1 < argc) {
-            remesh_resolution = atoi(argv[++i]);
+            if (!parse_int_arg(argv[++i], &remesh_resolution)) {
+                fprintf(stderr, "vkmesh: invalid --remesh-resolution\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--remesh-band") == 0 && i + 1 < argc) {
-            remesh_band = (float) atof(argv[++i]);
+            if (!parse_float_arg(argv[++i], &remesh_band)) {
+                fprintf(stderr, "vkmesh: invalid --remesh-band\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--remesh-project") == 0 && i + 1 < argc) {
-            remesh_project = (float) atof(argv[++i]);
+            if (!parse_float_arg(argv[++i], &remesh_project)) {
+                fprintf(stderr, "vkmesh: invalid --remesh-project\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--texture-size") == 0 && i + 1 < argc) {
-            texture_size = atoi(argv[++i]);
+            if (!parse_int_arg(argv[++i], &texture_size)) {
+                fprintf(stderr, "vkmesh: invalid --texture-size\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
+            if (!parse_int_arg(argv[++i], &device)) {
+                fprintf(stderr, "vkmesh: invalid --device\n");
+                return 2;
+            }
         } else if (strcmp(argv[i], "--unsigned-distance") == 0 && i + 1 < argc) {
             points_path = argv[++i];
         } else if (strcmp(argv[i], "--distance-output") == 0 && i + 1 < argc) {
@@ -8159,10 +8434,15 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "vkmesh: --distance-output is required with --unsigned-distance\n");
         return 2;
     }
-    if (remesh && (remesh_resolution <= 0 || remesh_band <= 0.0f || remesh_project < 0.0f)) {
-        fprintf(stderr, "vkmesh: invalid remesh parameters\n");
+    if (device < 0 || texture_size <= 0 || max_hole_perimeter < 0.0f ||
+        degenerate_abs < 0.0f || degenerate_rel < 0.0f || min_component_area < 0.0f ||
+        simplify_steps < 0 || simplify_threshold < 0.0f || lambda_edge_length < 0.0f ||
+        lambda_skinny < 0.0f || target_faces < 0 ||
+        (remesh && (remesh_resolution <= 0 || remesh_band <= 0.0f || remesh_project < 0.0f))) {
+        fprintf(stderr, "vkmesh: invalid numeric parameter range\n");
         return 2;
     }
+    g_vkmesh_device_index = device;
 
     vkmesh_mesh mesh;
     memset(&mesh, 0, sizeof(mesh));
@@ -8195,10 +8475,6 @@ int main(int argc, char ** argv) {
             return 1;
         }
     } else {
-        if (fill_holes && !vkmesh_log_fill_holes(&mesh, max_hole_perimeter, "stage")) {
-            mesh_free(&mesh);
-            return 1;
-        }
         if (remove_duplicate_faces && !vkmesh_log_remove_duplicate_faces(&mesh, "stage")) {
             mesh_free(&mesh);
             return 1;
@@ -8212,6 +8488,11 @@ int main(int argc, char ** argv) {
             return 1;
         }
         if (remove_small_components && !vkmesh_log_remove_small_connected_components(&mesh, min_component_area, "stage")) {
+            mesh_free(&mesh);
+            return 1;
+        }
+        /* Build hole boundaries only after malformed topology no longer pollutes adjacency. */
+        if (fill_holes && !vkmesh_log_fill_holes(&mesh, max_hole_perimeter, "stage")) {
             mesh_free(&mesh);
             return 1;
         }

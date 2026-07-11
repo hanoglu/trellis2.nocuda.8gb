@@ -251,6 +251,7 @@ trellis_status trellis_pipeline_write_gltf(
     const trellis_mesh_host * mesh,
     const trellis_mesh_host * sample_mesh,
     const trellis_pbr_voxels * voxels,
-    int texture_size);
+    int texture_size,
+    int device);
 
 #endif

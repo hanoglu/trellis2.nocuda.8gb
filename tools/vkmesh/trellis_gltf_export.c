@@ -225,7 +225,7 @@ static trellis_status unwrap_mesh_xatlas_direct(
         input_indices[i] = (uint32_t) mesh->faces[i];
     }
 
-    /* CuMesh accelerates chart clustering on GPU, then hands CPU chart meshes to xatlas. */
+    /* Small meshes use a single direct CPU xatlas input. */
     xatlasSetPrint(NULL, false);
     xatlasAtlas * atlas = xatlasCreate();
     if (atlas == NULL) {
@@ -961,7 +961,7 @@ static int gltf_vk_create_graphics_pipeline(trellis_gltf_vk * vk) {
     return result == VK_SUCCESS;
 }
 
-static int gltf_vk_init(trellis_gltf_vk * vk) {
+static int gltf_vk_init(trellis_gltf_vk * vk, int device_index) {
     memset(vk, 0, sizeof(*vk));
     VkApplicationInfo app_info;
     memset(&app_info, 0, sizeof(app_info));
@@ -990,13 +990,27 @@ static int gltf_vk_init(trellis_gltf_vk * vk) {
         gltf_vk_destroy(vk);
         return 0;
     }
+    if (device_index < 0 || (uint32_t) device_index >= physical_count) {
+        TRELLIS_ERROR(
+            "glTF export: Vulkan device index %d is out of range (available devices: %u)",
+            device_index,
+            physical_count);
+        free(physicals);
+        gltf_vk_destroy(vk);
+        return 0;
+    }
     int found = 0;
-    for (uint32_t p = 0; p < physical_count && !found; ++p) {
+    uint32_t p = (uint32_t) device_index;
+    {
         uint32_t queue_count = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(physicals[p], &queue_count, NULL);
         VkQueueFamilyProperties * queues =
             (VkQueueFamilyProperties *) malloc((size_t) queue_count * sizeof(VkQueueFamilyProperties));
-        if (queues == NULL) continue;
+        if (queues == NULL) {
+            free(physicals);
+            gltf_vk_destroy(vk);
+            return 0;
+        }
         vkGetPhysicalDeviceQueueFamilyProperties(physicals[p], &queue_count, queues);
         for (uint32_t q = 0; q < queue_count; ++q) {
             if ((queues[q].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) !=
@@ -1024,6 +1038,11 @@ static int gltf_vk_init(trellis_gltf_vk * vk) {
             }
         }
         free(queues);
+    }
+    if (found) {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(vk->physical_device, &props);
+        TRELLIS_INFO("glTF export: using Vulkan device %d: %s", device_index, props.deviceName);
     }
     free(physicals);
     if (!found) {
@@ -1141,16 +1160,13 @@ static int gltf_vk_allocate_descriptor_set(
     return 1;
 }
 
-static int gltf_vk_dispatch(
+static int gltf_vk_texture_postprocess(
     trellis_gltf_vk * vk,
-    trellis_gltf_vk_compute_pipeline pipeline,
     trellis_gltf_vk_buffer * buffers[10],
-    const trellis_gltf_vk_push * push,
-    uint32_t groups_x,
-    uint32_t groups_y) {
-    VkDescriptorSet set = VK_NULL_HANDLE;
-    if (!gltf_vk_allocate_descriptor_set(vk, buffers, &set)) return 0;
-
+    const trellis_gltf_vk_push * initial_push,
+    trellis_gltf_vk_buffer ** base_out,
+    trellis_gltf_vk_buffer ** mr_out) {
+    if (vk == NULL || buffers == NULL || initial_push == NULL || base_out == NULL || mr_out == NULL) return 0;
     VkCommandBufferAllocateInfo cmd_alloc;
     memset(&cmd_alloc, 0, sizeof(cmd_alloc));
     cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -1165,11 +1181,102 @@ static int gltf_vk_dispatch(
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     int ok = 0;
     if (vkBeginCommandBuffer(cmd, &begin_info) == VK_SUCCESS) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->compute_pipelines[pipeline]);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &set, 0, NULL);
-        vkCmdPushConstants(cmd, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(*push), push);
-        vkCmdDispatch(cmd, groups_x, groups_y, 1);
-        if (vkEndCommandBuffer(cmd) == VK_SUCCESS) {
+        trellis_gltf_vk_push push = *initial_push;
+        trellis_gltf_vk_buffer * cur_base = buffers[6];
+        trellis_gltf_vk_buffer * cur_mr = buffers[7];
+        trellis_gltf_vk_buffer * next_base = buffers[8];
+        trellis_gltf_vk_buffer * next_mr = buffers[9];
+        const uint32_t image_groups = (push.texture_size + 15u) / 16u;
+        int recorded = 1;
+        uint32_t fill_step = 1u;
+        while (fill_step < push.texture_size) fill_step <<= 1u;
+        fill_step >>= 1u;
+
+        for (int pass = 0; pass < 32 && recorded; ++pass) {
+            trellis_gltf_vk_buffer * desc[10];
+            for (int i = 0; i < 10; ++i) desc[i] = buffers[i];
+            desc[6] = cur_base;
+            desc[7] = cur_mr;
+            desc[8] = next_base;
+            desc[9] = next_mr;
+            VkDescriptorSet set = VK_NULL_HANDLE;
+            if (!gltf_vk_allocate_descriptor_set(vk, desc, &set)) {
+                recorded = 0;
+                break;
+            }
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->compute_pipelines[TRELLIS_GLTF_COMPUTE_DILATE]);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &set, 0, NULL);
+            vkCmdPushConstants(cmd, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            vkCmdDispatch(cmd, image_groups, image_groups, 1);
+
+            VkBufferMemoryBarrier barriers[2];
+            memset(barriers, 0, sizeof(barriers));
+            trellis_gltf_vk_buffer * written[2] = { next_base, next_mr };
+            for (uint32_t i = 0; i < 2; ++i) {
+                barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                barriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].buffer = written[i]->buffer;
+                barriers[i].offset = 0;
+                barriers[i].size = (VkDeviceSize) written[i]->bytes;
+            }
+            vkCmdPipelineBarrier(
+                cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0, 0, NULL, 2, barriers, 0, NULL);
+            trellis_gltf_vk_buffer * tmp = cur_base;
+            cur_base = next_base;
+            next_base = tmp;
+            tmp = cur_mr;
+            cur_mr = next_mr;
+            next_mr = tmp;
+        }
+
+        for (; fill_step > 0u && recorded; fill_step >>= 1u) {
+            push.pad0 = fill_step;
+            trellis_gltf_vk_buffer * desc[10];
+            for (int i = 0; i < 10; ++i) desc[i] = buffers[i];
+            desc[6] = cur_base;
+            desc[7] = cur_mr;
+            desc[8] = next_base;
+            desc[9] = next_mr;
+            VkDescriptorSet set = VK_NULL_HANDLE;
+            if (!gltf_vk_allocate_descriptor_set(vk, desc, &set)) {
+                recorded = 0;
+                break;
+            }
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->compute_pipelines[TRELLIS_GLTF_COMPUTE_FILL_EMPTY]);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipeline_layout, 0, 1, &set, 0, NULL);
+            vkCmdPushConstants(cmd, vk->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+            vkCmdDispatch(cmd, image_groups, image_groups, 1);
+
+            VkBufferMemoryBarrier barriers[2];
+            memset(barriers, 0, sizeof(barriers));
+            trellis_gltf_vk_buffer * written[2] = { next_base, next_mr };
+            for (uint32_t i = 0; i < 2; ++i) {
+                barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                barriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barriers[i].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+                barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].buffer = written[i]->buffer;
+                barriers[i].offset = 0;
+                barriers[i].size = (VkDeviceSize) written[i]->bytes;
+            }
+            vkCmdPipelineBarrier(
+                cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
+                0, 0, NULL, 2, barriers, 0, NULL);
+            trellis_gltf_vk_buffer * tmp = cur_base;
+            cur_base = next_base;
+            next_base = tmp;
+            tmp = cur_mr;
+            cur_mr = next_mr;
+            next_mr = tmp;
+        }
+
+        if (recorded && vkEndCommandBuffer(cmd) == VK_SUCCESS) {
             VkSubmitInfo submit;
             memset(&submit, 0, sizeof(submit));
             submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1177,6 +1284,10 @@ static int gltf_vk_dispatch(
             submit.pCommandBuffers = &cmd;
             ok = vkQueueSubmit(vk->queue, 1, &submit, VK_NULL_HANDLE) == VK_SUCCESS &&
                 vkQueueWaitIdle(vk->queue) == VK_SUCCESS;
+        }
+        if (ok) {
+            *base_out = cur_base;
+            *mr_out = cur_mr;
         }
     }
     vkFreeCommandBuffers(vk->device, vk->command_pool, 1, &cmd);
@@ -1444,7 +1555,7 @@ static int gltf_compute_chart_records_connected(
     return 1;
 }
 
-static trellis_status unwrap_mesh_xatlas_charted_vulkan(
+static trellis_status unwrap_mesh_xatlas_charted(
     const trellis_mesh_host * mesh,
     int texture_size,
     trellis_gltf_mesh * out) {
@@ -1879,6 +1990,7 @@ static trellis_status bake_textures_vulkan(
     const trellis_mesh_host * sample_mesh,
     const trellis_pbr_voxels * voxels,
     int texture_size,
+    int device,
     uint8_t ** base_out,
     uint8_t ** mr_out) {
     if (mesh == NULL || voxels == NULL || base_out == NULL || mr_out == NULL ||
@@ -1944,7 +2056,7 @@ static trellis_status bake_textures_vulkan(
     memset(buffers, 0, sizeof(buffers));
     memset(&base_image, 0, sizeof(base_image));
     memset(&mr_image, 0, sizeof(mr_image));
-    if (!gltf_vk_init(&vk)) {
+    if (!gltf_vk_init(&vk, device)) {
         free(projection_words);
         free(hash_entries);
         free(base);
@@ -2024,49 +2136,10 @@ static trellis_status bake_textures_vulkan(
 
     trellis_gltf_vk_buffer * cur_base = &buffers[6];
     trellis_gltf_vk_buffer * cur_mr = &buffers[7];
-    trellis_gltf_vk_buffer * next_base = &buffers[8];
-    trellis_gltf_vk_buffer * next_mr = &buffers[9];
-    const uint32_t image_groups = ((uint32_t) texture_size + 15u) / 16u;
-    for (int it = 0; it < 32; ++it) {
-        desc[6] = cur_base;
-        desc[7] = cur_mr;
-        desc[8] = next_base;
-        desc[9] = next_mr;
-        if (!gltf_vk_dispatch(&vk, TRELLIS_GLTF_COMPUTE_DILATE, desc, &push, image_groups, image_groups)) {
-            status = TRELLIS_STATUS_ERROR;
-            goto cleanup;
-        }
-        trellis_gltf_vk_buffer * tmp = cur_base;
-        cur_base = next_base;
-        next_base = tmp;
-        tmp = cur_mr;
-        cur_mr = next_mr;
-        next_mr = tmp;
+    if (!gltf_vk_texture_postprocess(&vk, desc, &push, &cur_base, &cur_mr)) {
+        status = TRELLIS_STATUS_ERROR;
+        goto cleanup;
     }
-
-    uint32_t fill_step = 1u;
-    while (fill_step < (uint32_t) texture_size) {
-        fill_step <<= 1u;
-    }
-    fill_step >>= 1u;
-    for (; fill_step > 0u; fill_step >>= 1u) {
-        push.pad0 = fill_step;
-        desc[6] = cur_base;
-        desc[7] = cur_mr;
-        desc[8] = next_base;
-        desc[9] = next_mr;
-        if (!gltf_vk_dispatch(&vk, TRELLIS_GLTF_COMPUTE_FILL_EMPTY, desc, &push, image_groups, image_groups)) {
-            status = TRELLIS_STATUS_ERROR;
-            goto cleanup;
-        }
-        trellis_gltf_vk_buffer * tmp = cur_base;
-        cur_base = next_base;
-        next_base = tmp;
-        tmp = cur_mr;
-        cur_mr = next_mr;
-        next_mr = tmp;
-    }
-    push.pad0 = 0u;
 
     memcpy(base, cur_base->mapped, image_bytes);
     memcpy(mr, cur_mr->mapped, image_bytes);
@@ -2095,12 +2168,12 @@ static trellis_status unwrap_mesh_xatlas(
     trellis_gltf_mesh * out) {
 #if TRELLIS_HAS_GLTF_VULKAN_BAKE
     if (mesh != NULL && mesh->n_faces >= (int64_t) gltf_uv_chart_target_faces() * 2) {
-        trellis_status status = unwrap_mesh_xatlas_charted_vulkan(mesh, texture_size, out);
+        trellis_status status = unwrap_mesh_xatlas_charted(mesh, texture_size, out);
         if (status == TRELLIS_STATUS_OK) {
             return status;
         }
         if (status != TRELLIS_STATUS_NOT_IMPLEMENTED) {
-            TRELLIS_INFO("glTF export: Vulkan charted UV unwrap failed, falling back to direct xatlas");
+            TRELLIS_INFO("glTF export: connected CPU charted UV unwrap failed, falling back to direct xatlas");
         }
     }
 #endif
@@ -2433,10 +2506,11 @@ trellis_status trellis_pipeline_write_gltf(
     const trellis_mesh_host * mesh,
     const trellis_mesh_host * sample_mesh,
     const trellis_pbr_voxels * voxels,
-    int texture_size) {
+    int texture_size,
+    int device) {
     if (path == NULL || mesh == NULL || voxels == NULL || mesh->vertices == NULL ||
         mesh->faces == NULL || mesh->n_vertices <= 0 || mesh->n_faces <= 0 ||
-        voxels->attrs == NULL || voxels->coords_bxyz == NULL || voxels->n_coords <= 0) {
+        voxels->attrs == NULL || voxels->coords_bxyz == NULL || voxels->n_coords <= 0 || device < 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     if (texture_size <= 0) {
@@ -2478,7 +2552,7 @@ trellis_status trellis_pipeline_write_gltf(
     trellis_status status = unwrap_mesh_xatlas(mesh, texture_size, &gltf_mesh);
     if (status == TRELLIS_STATUS_OK) {
 #if TRELLIS_HAS_GLTF_VULKAN_BAKE
-        status = bake_textures_vulkan(&gltf_mesh, sample_mesh, voxels, texture_size, &base, &mr);
+        status = bake_textures_vulkan(&gltf_mesh, sample_mesh, voxels, texture_size, device, &base, &mr);
 #else
         (void) sample_mesh;
         TRELLIS_ERROR("glTF export: texture bake requires a Vulkan build");

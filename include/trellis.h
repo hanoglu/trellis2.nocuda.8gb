@@ -719,6 +719,7 @@ typedef struct trellis_vkmesh_postprocess_options {
     float simplify_threshold;    /* default 1e-8 */
     float remesh_band;           /* default 1.0 */
     float remesh_project;        /* default 0.0 for TRELLIS.2 examples */
+    int device;                  /* Vulkan physical-device index, default 0 */
 } trellis_vkmesh_postprocess_options;
 
 trellis_status trellis_vkmesh_postprocess(

@@ -17,7 +17,8 @@ static void usage(FILE * out, const char * argv0) {
         "\n"
         "Options:\n"
         "  --sample projection_source.meshbin Optional source mesh for CuMesh-style texture projection\n"
-        "  --texture-size N                Texture size, default 1024\n",
+        "  --texture-size N                Texture size, default 1024\n"
+        "  --device N                      Vulkan physical-device index, default 0\n",
         argv0);
 }
 
@@ -194,6 +195,7 @@ int main(int argc, char ** argv) {
     const char * voxels_path = NULL;
     const char * gltf_path = NULL;
     int texture_size = 1024;
+    int device = 0;
 
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--mesh") == 0) {
@@ -208,6 +210,12 @@ int main(int argc, char ** argv) {
             const char * value = arg_value(argc, argv, &i);
             if (!parse_int_arg(value, &texture_size)) {
                 fprintf(stderr, "trellis-rebake-gltf: invalid --texture-size\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--device") == 0) {
+            const char * value = arg_value(argc, argv, &i);
+            if (!parse_int_arg(value, &device) || device < 0) {
+                fprintf(stderr, "trellis-rebake-gltf: invalid --device\n");
                 return 2;
             }
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -242,7 +250,7 @@ int main(int argc, char ** argv) {
     if (status == TRELLIS_STATUS_OK) {
         const trellis_mesh_host * sample =
             sample_mesh.vertices != NULL && sample_mesh.faces != NULL ? &sample_mesh : NULL;
-        status = trellis_pipeline_write_gltf(gltf_path, &mesh, sample, &voxels, texture_size);
+        status = trellis_pipeline_write_gltf(gltf_path, &mesh, sample, &voxels, texture_size, device);
     }
 
     trellis_mesh_free(&sample_mesh);

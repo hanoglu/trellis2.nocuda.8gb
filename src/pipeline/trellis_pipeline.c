@@ -974,15 +974,18 @@ static int run_vkmesh_postprocess_command(
     int remesh,
     int remesh_resolution,
     float remesh_band,
-    float remesh_project) {
+    float remesh_project,
+    int device) {
     char target[64];
     char remesh_resolution_buf[64];
     char remesh_band_buf[64];
     char remesh_project_buf[64];
+    char device_buf[64];
     snprintf(target, sizeof(target), "%d", decimation_target > 0 ? decimation_target : 1000000);
     snprintf(remesh_resolution_buf, sizeof(remesh_resolution_buf), "%d", remesh_resolution > 0 ? remesh_resolution : 1024);
     snprintf(remesh_band_buf, sizeof(remesh_band_buf), "%.9g", remesh_band > 0.0f ? remesh_band : 1.0f);
     snprintf(remesh_project_buf, sizeof(remesh_project_buf), "%.9g", remesh_project > 0.0f ? remesh_project : 0.0f);
+    snprintf(device_buf, sizeof(device_buf), "%d", device >= 0 ? device : 0);
     char sibling_vkmesh[PATH_MAX];
     const char * exe = vkmesh_path != NULL && vkmesh_path[0] != '\0' ? vkmesh_path : NULL;
     if (exe == NULL) {
@@ -1006,7 +1009,7 @@ static int run_vkmesh_postprocess_command(
         exe = "vkmesh";
     }
     TRELLIS_INFO("mesh postprocess: using vkmesh executable %s", exe);
-    char * argv[28];
+    char * argv[30];
     int argc = 0;
     argv[argc++] = (char *) exe;
     argv[argc++] = (char *) "--input";
@@ -1018,6 +1021,8 @@ static int run_vkmesh_postprocess_command(
         argv[argc++] = (char *) projection_mesh;
     }
     argv[argc++] = (char *) "--postprocess";
+    argv[argc++] = (char *) "--device";
+    argv[argc++] = device_buf;
     if (remesh) {
         argv[argc++] = (char *) "--remesh";
         argv[argc++] = (char *) "--remesh-resolution";
@@ -1050,7 +1055,8 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     int remesh,
     int remesh_resolution,
     float remesh_band,
-    float remesh_project) {
+    float remesh_project,
+    int device) {
     if (mesh == NULL || mesh->vertices == NULL || mesh->faces == NULL ||
         mesh->n_vertices <= 0 || mesh->n_faces <= 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
@@ -1069,6 +1075,7 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     vkmesh_options.remesh_resolution = remesh_resolution > 0 ? remesh_resolution : 1024;
     vkmesh_options.remesh_band = remesh_band > 0.0f ? remesh_band : 1.0f;
     vkmesh_options.remesh_project = remesh_project > 0.0f ? remesh_project : 0.0f;
+    vkmesh_options.device = device >= 0 ? device : 0;
 
     trellis_mesh_host processed;
     trellis_mesh_host projection;
@@ -1076,7 +1083,8 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     memset(&projection, 0, sizeof(projection));
 
     TRELLIS_INFO(
-        "mesh postprocess: running vkmesh C API target=%d no_simplify=%d remesh=%d resolution=%d band=%.9g project=%.9g input_faces=%lld",
+        "mesh postprocess: running vkmesh C API device=%d target=%d no_simplify=%d remesh=%d resolution=%d band=%.9g project=%.9g input_faces=%lld",
+        vkmesh_options.device,
         vkmesh_options.decimation_target,
         no_simplify ? 1 : 0,
         vkmesh_options.remesh,
@@ -1134,7 +1142,8 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
     }
 
     TRELLIS_INFO(
-        "mesh postprocess: running vkmesh target=%d no_simplify=%d remesh=%d resolution=%d band=%.9g project=%.9g input_faces=%lld",
+        "mesh postprocess: running vkmesh device=%d target=%d no_simplify=%d remesh=%d resolution=%d band=%.9g project=%.9g input_faces=%lld",
+        device >= 0 ? device : 0,
         decimation_target > 0 ? decimation_target : 1000000,
         no_simplify ? 1 : 0,
         remesh ? 1 : 0,
@@ -1152,7 +1161,8 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
             remesh,
             remesh_resolution,
             remesh_band,
-            remesh_project)) {
+            remesh_project,
+            device)) {
         TRELLIS_ERROR("mesh postprocess: vkmesh failed; pass --vkmesh /path/to/vkmesh if it is not in PATH");
         unlink_if_set(input_mesh);
         unlink_if_set(output_mesh);
@@ -1197,7 +1207,7 @@ static trellis_status trellis_pipeline_postprocess_mesh_with_vkmesh(
 
 trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_options * options) {
     if (options == NULL || options->model_dir == NULL || options->dino_dir == NULL ||
-        options->image_path == NULL) {
+        options->image_path == NULL || options->device < 0) {
         return TRELLIS_STATUS_INVALID_ARGUMENT;
     }
     const char * output_gltf_path =
@@ -1629,7 +1639,8 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
             options->mesh_remesh,
             options->mesh_remesh_resolution > 0 ? options->mesh_remesh_resolution : shape_latent.resolution,
             options->mesh_remesh_band > 0.0f ? options->mesh_remesh_band : 1.0f,
-            options->mesh_remesh_project > 0.0f ? options->mesh_remesh_project : 0.0f);
+            options->mesh_remesh_project > 0.0f ? options->mesh_remesh_project : 0.0f,
+            options->device);
         if (status != TRELLIS_STATUS_OK) {
             goto cleanup;
         }
@@ -1725,7 +1736,7 @@ trellis_status trellis_pipeline_image_to_gltf(const trellis_image_to_gltf_option
         gltf_projection_mesh.vertices != NULL && gltf_projection_mesh.faces != NULL ?
             &gltf_projection_mesh :
             NULL;
-    status = trellis_pipeline_write_gltf(output_gltf_path, &mesh, sample_mesh, &pbr_voxels, texture_size);
+    status = trellis_pipeline_write_gltf(output_gltf_path, &mesh, sample_mesh, &pbr_voxels, texture_size, options->device);
     if (status != TRELLIS_STATUS_OK) {
         TRELLIS_ERROR("pipeline: glTF export failed: %s", trellis_status_string(status));
         goto cleanup;
