@@ -719,7 +719,7 @@ trellis_status trellis_sparse_unet_vae_decoder_forward_backend_f32_host(
             cur_n = next_n;
             cur_channels = weights->channels[level + 1];
             if (ops->trim != NULL) {
-                ops->trim(backend, TRELLIS_SPARSE_TRIM_FREE_BUFFERS, NULL);
+                status = ops->trim(backend, TRELLIS_SPARSE_TRIM_FREE_BUFFERS, NULL);
             }
             if (options->return_subs != NULL && weights->pred_subdiv && options->return_subs->n_levels < level + 1) {
                 options->return_subs->n_levels = level + 1;
